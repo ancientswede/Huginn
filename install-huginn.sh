@@ -2,7 +2,7 @@
 # install-huginn.sh — install Huginn on a LAN machine (part of Huginn, AGPL-3.0-or-later).
 #
 # Run as root on Debian 12/13 (VM or LXC) on your normal LAN, AFTER install-honeypot.sh:
-#   git clone <huginn repo> && cd Huginn && ./install-huginn.sh --honeypot 192.0.2.10
+#   git clone https://github.com/ancientswede/Huginn.git && cd Huginn && ./install-huginn.sh --honeypot 192.0.2.10
 #
 # It installs Huginn, creates a key, shows the one command to run on the honeypot,
 # waits until the honeypot answers, starts the service and asks for a login password.

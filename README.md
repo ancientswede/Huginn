@@ -69,7 +69,7 @@ Run each script as root from a clone of this repository. Both scripts can be run
 **1. On the honeypot machine**
 
 ```bash
-apt-get install -y git && git clone <this repository> Huginn && cd Huginn
+apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
 ./install-honeypot.sh
 ```
 
@@ -83,7 +83,7 @@ From now on, log in with `ssh -p 22022 root@honeypot`.
 **2. On the Huginn machine**
 
 ```bash
-apt-get install -y git && git clone <this repository> Huginn && cd Huginn
+apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
 ./install-huginn.sh --honeypot <honeypot IP>
 ```
 

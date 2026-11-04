@@ -2,7 +2,7 @@
 # install-honeypot.sh — set up the honeypot side for Huginn (part of Huginn, AGPL-3.0-or-later).
 #
 # Run as root on a fresh Debian 12/13 VM or LXC that sits on an ISOLATED network (no route to your LAN):
-#   git clone <huginn repo> && cd Huginn && ./install-honeypot.sh
+#   git clone https://github.com/ancientswede/Huginn.git && cd Huginn && ./install-honeypot.sh
 #
 # What it does (each optional part asks first, or use the flags):
 #   1. Moves your admin SSH to another port (default 22022) — checked BEFORE anything takes port 22
