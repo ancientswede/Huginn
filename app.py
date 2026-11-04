@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.4.0"
+HUGINN_VERSION = "0.4.1"
 CHANGELOG = [
+    ("0.4.1", "2026-11-04", "Hardening: size caps on everything read from the honeypot, one bad file record no longer stops the sync."),
     ("0.4.0", "2026-11-04", "Time wasted: tarpit and fake-shell time per attacker, who is stuck right now. All site-specific settings moved to environment variables."),
     ("0.3.1", "2026-11-04", "Reads hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, SOCKS5) as decoy services."),
     ("0.3.0", "2026-11-04", "Session replay, file analysis with IOCs and a C2 blocklist feed, bait detection (read/took the bait), persona per session (server/camera), ntfy alerts."),
@@ -55,32 +56,35 @@ ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
-os.environ["TZ"] = os.environ.get("HUGINN_TZ", "UTC")  # SQLite "localtime" (dagsgrupperingen) följer processens TZ
+os.environ["TZ"] = os.environ.get("HUGINN_TZ", "UTC")  # SQLite "localtime" (per-day grouping) follows the process TZ
 time.tzset()
 UA = "huginn/" + HUGINN_VERSION + " (homelab honeypot)"
 SESSION_DAYS = 14
-NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # t.ex. http://ntfy.lan:2586/huginn — tomt = inga notiser
-PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # länk i notiserna
+# The honeypot may be fully compromised one day: never read more than this from it.
+MAX_EXPORT = int(os.environ.get("HUGINN_MAX_EXPORT_MB", "256")) * 1024 * 1024
+MAX_TTY = 64 * 1024 * 1024
+NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan:2586/huginn — empty = no notifications
+PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
 TTY_DIR = os.path.join(DATA, "tty")
-# Persona per intern Cowrie-port, t.ex. HUGINN_PERSONAS="2225=server,2323=camera" (flera Cowrie-instanser).
+# Persona per internal Cowrie port, e.g. HUGINN_PERSONAS="2225=server,2323=camera" (several Cowrie instances).
 PERSONA = {}
 for _x in os.environ.get("HUGINN_PERSONAS", "").split(","):
     if "=" in _x and _x.split("=")[0].strip().isdigit():
         PERSONA[int(_x.split("=")[0])] = _x.split("=", 1)[1].strip()[:20]
-# Betet: fejkade uppgifter som bara finns i honeypotens betesfiler (bait.json bredvid app.py).
+# Bait: fake credentials that only exist in the honeypot's bait files (bait.json next to app.py).
 try:
     BAIT = [v for v in json.load(open(os.environ.get("HUGINN_BAIT_FILE", os.path.join(BASE, "bait.json")))).values() if isinstance(v, str) and len(v) >= 8]
 except Exception:
     BAIT = []
 BAIT_FILES_RE = re.compile(r"\.env\b|\.my\.cnf|\.aws/credentials|\.bash_history|backup\.sh|Account1|network\.conf|wpa_supplicant|\.ssh/config")
-# Vanliga ofarliga adresser i malware (anslutningstester, dokumentation) — hamnar inte i C2-listan.
+# Common harmless addresses found in malware (connectivity checks, docs) — never put on the C2 list.
 BENIGN_IOC = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "208.67.222.222", "208.67.220.220", "4.2.2.2"}
 
 PORTNAME = {22: "ssh", 2222: "ssh", 2223: "ssh", 23: "telnet", 2323: "telnet", 21: "ftp", 2121: "ftp",
             80: "http", 8080: "http", 3306: "mysql", 6379: "redis", 5900: "vnc"}
 
-# Kända forsknings-/internetskannrar (rDNS/org/taggar). Hamnar inte i blocklistan som standard.
+# Known research/internet scanners (rDNS/org/tags). Left out of the blocklist by default.
 RESEARCH_RE = re.compile(
     r"shodan|censys|binaryedge|shadowserver|internet-measurement|stretchoid|onyphe|criminalip|leakix|"
     r"netsystemsresearch|recyber|alphastrike|bitsight|paloaltonetworks|expanse|driftnet|rapid7|"
@@ -113,7 +117,7 @@ CREATE TABLE IF NOT EXISTS files(sha TEXT PRIMARY KEY, src TEXT, size INTEGER, t
 """
 
 
-# ---------------------------------------------------------------- databas
+# ---------------------------------------------------------------- database
 
 def connect():
     con = sqlite3.connect(DB_PATH, timeout=30)
@@ -157,7 +161,7 @@ def db():
     return c
 
 
-# ---------------------------------------------------------------- tolkning av exporten
+# ---------------------------------------------------------------- parsing the export
 
 def norm_ip(s):
     if not s:
@@ -171,7 +175,7 @@ def norm_ip(s):
         return None
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
-    if not a.is_global:  # våra egna/privata adresser hamnar aldrig i databasen
+    if not a.is_global:  # our own / private addresses never enter the database
         return None
     return str(a)
 
@@ -260,7 +264,7 @@ RE_ENDLESSH_OPEN = re.compile(r"^(\S+) ACCEPT host=(\S+) port=(\d+) ")
 
 
 def p_endlessh(line):
-    # CLOSE = en avslutad fångst (tid i sekunder), ACCEPT = någon fastnade (för "fast just nu").
+    # CLOSE = a finished catch (time in seconds), ACCEPT = someone got stuck (for "stuck right now").
     m = RE_ENDLESSH.match(line)
     if m:
         ip = norm_ip(m.group(2))
@@ -273,7 +277,7 @@ def p_endlessh(line):
 
 
 def p_traps(line):
-    # hp-traps (egen tjänst på honeypoten): lagras som "canary"-händelser, a = tjänst, b = sammanfattning.
+    # hp-traps (our own service on the honeypot): stored as "canary" events, a = service, b = summary.
     if not line.startswith("{"):
         return None
     ev = json.loads(line)
@@ -332,18 +336,25 @@ def parse_export(text, skip):
 def store_files(con, files):
     now = time.time()
     with con:
-        for f in files:
-            sha = str(f.get("sha") or "")
-            if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        for f in files[:100000]:
+            try:
+                if not isinstance(f, dict):
+                    continue
+                sha = str(f.get("sha") or "")
+                if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                    continue
+                iocs = f.get("iocs") if isinstance(f.get("iocs"), list) else []
+                iocs = [str(x)[:300] for x in iocs][:60]
+                size, mtime = int(f.get("size") or 0), float(f.get("mtime") or 0)
+            except (TypeError, ValueError):
                 continue
-            iocs = [str(x)[:300] for x in (f.get("iocs") or [])][:60]
             con.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?,?)",
-                        (sha, str(f.get("src") or "")[:20], int(f.get("size") or 0), str(f.get("type") or "")[:80],
-                         str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), float(f.get("mtime") or 0), now))
+                        (sha, str(f.get("src") or "")[:20], size, str(f.get("type") or "")[:80],
+                         str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now))
 
 
 def fetch_tty(sha):
-    # Hämtar en sessionsinspelning via samma låsta nyckel ("tty <sha>"), cachas lokalt.
+    # Fetches a session recording through the same locked key ("tty <sha>"), cached locally.
     if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
         return None
     path = os.path.join(TTY_DIR, sha)
@@ -352,14 +363,14 @@ def fetch_tty(sha):
     cmd = ["ssh", "-T", "-i", HP_KEY, "-p", str(HP_PORT), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
            "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + HP_KNOWN,
            "root@" + HP_HOST, "tty " + sha]
-    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-    if p.returncode != 0:
+    rc, out, _err = run_capped(cmd, 60, MAX_TTY * 4 // 3 + 16)
+    if rc != 0:
         return None
     try:
-        data = base64.b64decode(p.stdout.strip(), validate=True)
+        data = base64.b64decode(out.strip(), validate=True)
     except Exception:
         return None
-    # Cowries "shasum" för tty-loggar är inte sha256 av innehållet (verifierat 2026-11-04), så bara rimlighetskontroll.
+    # Cowrie's "shasum" for tty logs is not the sha256 of the content (verified 2026-11-04), so only a sanity check.
     if not data or len(data) > 50 * 1024 * 1024:
         return None
     tmp = path + ".tmp"
@@ -370,7 +381,7 @@ def fetch_tty(sha):
 
 
 def tty_frames(data):
-    # Cowrie ttylog: block med header "<iLiiLL" (op, tty, längd, riktning, sek, usek) + data. Riktning 2 = utdata, 3 = exec.
+    # Cowrie ttylog: records with header "<iLiiLL" (op, tty, length, direction, sec, usec) + data. Direction 2 = output, 3 = exec.
     import struct as _st
     hs = _st.calcsize("<iLiiLL")
     frames, i, t0 = [], 0, None
@@ -396,14 +407,37 @@ def fetch_export():
            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=15",
            "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + HP_KNOWN,
            "-o", "ServerAliveInterval=15", "root@" + HP_HOST]
-    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=240)
-    out = p.stdout.decode("utf-8", "replace")
-    if p.returncode != 0 or "##END" not in out:
-        raise RuntimeError("export failed (rc=%s): %s" % (p.returncode, p.stderr.decode("utf-8", "replace")[-300:].strip()))
+    rc, raw, err = run_capped(cmd, 240, MAX_EXPORT)
+    out = raw.decode("utf-8", "replace")
+    if rc != 0 or "##END" not in out:
+        raise RuntimeError("export failed (rc=%s): %s" % (rc, err.decode("utf-8", "replace")[-300:].strip()))
     return out
 
 
-# ---------------------------------------------------------------- aggregering
+def run_capped(cmd, timeout, limit):
+    # Like subprocess.run(capture_output=True) but stops reading (and kills ssh) after `limit` bytes.
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timer = threading.Timer(timeout, p.kill)
+    timer.start()
+    try:
+        chunks, total = [], 0
+        while True:
+            b = p.stdout.read(1 << 20)
+            if not b:
+                break
+            total += len(b)
+            if total > limit:
+                p.kill()
+                p.wait()
+                return 1, b"", b"output larger than %d MB, refused" % (limit // 1048576)
+            chunks.append(b)
+        err = p.stderr.read(65536)
+        return p.wait(), b"".join(chunks), err
+    finally:
+        timer.cancel()
+
+
+# ---------------------------------------------------------------- aggregation
 
 def recompute_session(con, sid):
     rows = con.execute("SELECT ts,ip,kind,a,b FROM events WHERE session=? ORDER BY ts", (sid,)).fetchall()
@@ -559,7 +593,7 @@ def retention(con):
     con.execute("PRAGMA optimize")
 
 
-# ---------------------------------------------------------------- bakgrundstrådar
+# ---------------------------------------------------------------- background threads
 
 def collector_loop():
     con = connect()
@@ -572,7 +606,7 @@ def collector_loop():
             rows, hashes = parse_export(text, skip)
             n = store(con, rows)
             store_files(con, parse_export.files)
-            skip = hashes  # sätts först när allt sparats
+            skip = hashes  # only set once everything is stored
             set_meta(con, "last_ingest", t0)
             set_meta(con, "last_ingest_new", n)
             set_meta(con, "last_ingest_secs", round(time.time() - t0, 1))
@@ -601,7 +635,7 @@ def human_like(con, sid):
 
 
 def notify(con):
-    # Max en ntfy-sammanfattning i timmen om något ovanligt hänt sedan förra: bete, nya filer, människolika sessioner, exploits.
+    # At most one ntfy summary per hour, only if something notable happened since the last one: bait, new files, human-like sessions, exploits.
     if not NTFY_URL:
         return
     now = time.time()
@@ -699,7 +733,7 @@ def enrich_loop():
                 "ORDER BY (e.ip IS NULL) DESC, i.last DESC LIMIT 25", (now - ENRICH_TTL,))]
             for ip in todo:
                 d, ok, research = enrich_ip(ip)
-                fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # misslyckat: nytt försök om ett dygn
+                fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:
                     con.execute("INSERT OR REPLACE INTO enrich VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (ip, fetched, ok, d["cc"], d["country"], d["city"], d["asn"], d["org"], d["isp"],
@@ -710,7 +744,7 @@ def enrich_loop():
         time.sleep(60)
 
 
-# ---------------------------------------------------------------- inloggning
+# ---------------------------------------------------------------- login
 
 def hash_pw(pw, salt=None):
     salt = salt or secrets.token_bytes(16)
@@ -744,7 +778,7 @@ def note_fail(ip):
         _fails.setdefault(ip, []).append(time.time())
 
 
-# ---------------------------------------------------------------- formatering
+# ---------------------------------------------------------------- formatting
 
 def esc(s):
     return html.escape("" if s is None else str(s), quote=True)
@@ -873,7 +907,7 @@ def page(title, body, active="/"):
                                                   HUGINN_VERSION, " on" if active == "/account" else "", body)
 
 
-# ---------------------------------------------------------------- sidor
+# ---------------------------------------------------------------- pages
 
 def v_overview():
     con = db()
@@ -938,7 +972,7 @@ def v_overview():
 
 
 def time_wasted(con, since):
-    # Tid angriparna lagt i tarpitten (endlessh) och i de falska skalen (Cowrie-sessioner med kommandon).
+    # Time attackers spent in the tarpit (endlessh) and in the fake shells (Cowrie sessions with commands).
     tar = {r[0]: (r[1], r[2]) for r in con.execute(
         "SELECT ip, SUM(CAST(a AS REAL)), MAX(CAST(a AS REAL)) FROM events WHERE kind='tarpit' AND ts>=? GROUP BY ip", (since,))}
     sh = {r[0]: (r[1], r[2]) for r in con.execute(
@@ -953,7 +987,7 @@ def time_wasted(con, since):
         cc = {r[0]: r[1] for r in con.execute("SELECT ip, cc FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(top)), [r["ip"] for r in top])}
         for r in top:
             r["cc"] = cc.get(r["ip"])
-    # Fast just nu: ACCEPT utan matchande CLOSE (samma IP och källport) senaste 2 dygnen.
+    # Stuck right now: ACCEPT without a matching CLOSE (same IP and source port) in the last 2 days.
     opens = con.execute("SELECT ip, a FROM events WHERE kind='tarpit_open' AND ts>=?", (time.time() - 2 * 86400,)).fetchall()
     closed = {(r[0], r[1]) for r in con.execute("SELECT ip, b FROM events WHERE kind='tarpit' AND b IS NOT NULL AND ts>=?", (time.time() - 2 * 86400,))}
     stuck = sum(1 for ip, port in opens if (ip, port) not in closed)
@@ -1050,7 +1084,7 @@ def v_ip(ip):
     if f:
         tags += "," + f["flag"]
 
-    # Översikt
+    # Summary
     links = " · ".join([ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
                         ext("https://ipinfo.io/" + ip, "ipinfo")])
@@ -1074,12 +1108,12 @@ def v_ip(ip):
                  '<input name=note maxlength=200 placeholder="Note" value="%s"><button>Save</button></form>'
                  % (esc(urllib.parse.quote(ip)), " selected" if not fl else "", " selected" if fl == "block" else "", " selected" if fl == "allow" else "", esc(f["note"] if f else "")))
 
-    # Aktivitet 30 dagar
+    # Activity, 30 days
     days = [datetime.fromtimestamp(now - i * 86400, TZ).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
     q = {x[0]: x[1] for x in con.execute("SELECT date(ts,'unixepoch','localtime') d, COUNT(*) FROM events WHERE ip=? AND ts>=? AND kind IN ('connect','canary','tarpit') GROUP BY d", (ip, now - 31 * 86400))}
     act = '<div class="card"><h3>Activity, 30 days</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>' % (bars([q.get(d, 0) for d in days], days, 60), esc(days[0]))
 
-    # Inloggningsuppgifter
+    # Credentials
     creds = con.execute("SELECT a,b,SUM(kind='login_ok') ok, COUNT(*) n, MAX(ts) l FROM events WHERE ip=? AND kind IN ('login_ok','login_fail') GROUP BY a,b ORDER BY n DESC, l DESC LIMIT 200", (ip,)).fetchall()
     ccount = con.execute("SELECT COUNT(DISTINCT a||char(0)||COALESCE(b,'')) FROM events WHERE ip=? AND kind IN ('login_ok','login_fail')", (ip,)).fetchone()[0]
     crows = "".join("<tr><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td><td>%s</td></tr>" % (esc(clean(c["a"], 80)), esc(clean(c["b"], 80)), num(c["n"]), "accepted" if c["ok"] else "<span class=muted>rejected</span>") for c in creds)
@@ -1087,7 +1121,7 @@ def v_ip(ip):
                   '<div class="scroll"><table id="t-creds"><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th><th>Result</th></tr></thead><tbody>%s</tbody></table></div></div>'
                   % (num(ccount), crows or "<tr><td colspan=4 class=muted>None</td></tr>"))
 
-    # Filer + URL:er
+    # Files + URLs
     files = con.execute("SELECT a,b,MAX(ts) l,COUNT(*) n,kind FROM events WHERE ip=? AND kind IN ('file','file_fail') GROUP BY kind,a,b ORDER BY l DESC LIMIT 100", (ip,)).fetchall()
     frows = ""
     for x in files:
@@ -1097,7 +1131,7 @@ def v_ip(ip):
             esc(clean(x["a"], 200)), esc(sha[:16] + "…" if sha else ("download failed" if x["kind"] == "file_fail" else "")), esc(ago(x["l"])), num(x["n"]), links_f)
     files_html = ('<div class="card span2"><h3>Files and URLs</h3><table><thead><tr><th>Name / URL</th><th>SHA-256</th><th>Last</th><th>Count</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>' % frows) if frows else ""
 
-    # Relaterade IP:n
+    # Related IPs
     rel = []
     for label, sql, a in [
         ("Same SSH client (HASSH)", "SELECT DISTINCT s2.ip FROM sessions s1 JOIN sessions s2 ON s1.hassh=s2.hassh AND s2.ip!=s1.ip WHERE s1.ip=? AND s1.hassh IS NOT NULL LIMIT 40", (ip,)),
@@ -1117,7 +1151,7 @@ def v_ip(ip):
         rel_html = '<div class="card span2"><h3>Related attackers</h3>%s</div>' % "".join(
             '<div class="rel"><div class="rel-l">%s <span class=muted>%s</span></div><div class="rel-ips">%s</div></div>' % (esc(l), len(x), " ".join(ip_link(i) for i in x)) for l, x in rel)
 
-    # Sessioner
+    # Sessions
     sess = con.execute("SELECT * FROM sessions WHERE ip=? ORDER BY start DESC LIMIT 150", (ip,)).fetchall()
     sids = [s["session"] for s in sess]
     evs = {}
@@ -1167,7 +1201,7 @@ def v_ip(ip):
     sess_html = ('<div class="card span2"><h3>Sessions <span class=muted>%s total%s</span></h3>%s</div>'
                  % (num(r["sessions"]), ", latest 150 shown" if r["sessions"] > 150 else "", "".join(sblocks) or "<p class=muted>No SSH/Telnet sessions.</p>"))
 
-    # Andra tjänster (OpenCanary) + tarpit
+    # Other services (OpenCanary, hp-traps) + tarpit
     can = con.execute("SELECT ts,a,b FROM events WHERE ip=? AND kind='canary' ORDER BY ts DESC LIMIT 200", (ip,)).fetchall()
     can_html = ""
     if can:
@@ -1309,7 +1343,7 @@ def blocklist_ips(con, min_score, days, research, v6):
 
 
 def c2_list(con):
-    # IP-adresser till angriparnas servrar: inbäddade i fångade filer + värdar i nedladdnings-URL:er. Ofarliga tas bort.
+    # IP addresses of the attackers' servers: embedded in captured files + hosts in download URLs. Harmless ones removed.
     out = {}
     def add(host, why):
         host = (host or "").strip().strip("[]")
@@ -1496,7 +1530,7 @@ def v_login(err=""):
             "<button>Log in</button></form></body></html>") % (HUGINN_VERSION, '<p class=err>%s</p>' % esc(err) if err else "")
 
 
-# ---------------------------------------------------------------- statiska filer
+# ---------------------------------------------------------------- static files
 
 CSS = r"""
 :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f8f9fb;--line:#e3e6ea;--text:#1b1f24;--muted:#6b7480;--accent:#3b6fd8;--accent2:#e9effb;
@@ -1880,8 +1914,8 @@ def ingest_once():
 
 
 def import_files(paths):
-    # Engångsimport av hela loggfiler (cowrie.json*, opencanary.log*). Samma tolkning och dedupe som hämtningen,
-    # så överlapp med redan sparad data hoppas över. Läser i block för att hålla minnet nere.
+    # One-off import of whole log files (cowrie.json*, opencanary.log*). Same parsing and dedupe as the sync,
+    # so overlap with stored data is skipped. Reads in blocks to keep memory low.
     init_db()
     con = connect()
     total_rows = total_new = 0

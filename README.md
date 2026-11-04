@@ -73,6 +73,7 @@ COWRIE_DIRS="/home/cowrie/cowrie"
 OPENCANARY_LOG="/home/opencanary/opencanary.log"
 ENDLESSH_UNIT="endlessh"
 TRAPS_LOG_DIR="/var/log/hp-traps"
+FILEINFO_USER="cowrie"   # captured files are analysed as this user, never as root
 ```
 
 Run `hp-export | grep '^##'` once. It should print `##COWRIE ##CANARY ##ENDLESSH ##NFT ##TRAPS ##FILES ##END`.

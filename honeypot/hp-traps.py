@@ -9,10 +9,11 @@ LOGDIR = os.environ.get("LOGS_DIRECTORY", "/var/log/hp-traps")
 HOST = os.environ.get("TRAPS_HOST", "0.0.0.0")
 PORTS = {"smtp": 2525, "submission": 2587, "pop3": 2110, "imap": 2143, "postgres": 5432, "socks5": 1080}
 MAX_CONN = 300
-IDLE = 90          # sekunder utan data -> stäng
+IDLE = 90          # seconds without data -> close
 MAX_LINE = 4096
 MAX_DATA = 1024 * 1024
 KEEP_DAYS = 30
+MAX_LOG_DAY = 200 * 1024 * 1024  # stop logging for the day past this size, so a flood cannot fill the disk
 HOSTNAME = os.environ.get("TRAPS_HOSTNAME", "mail.example.com")
 _active = 0
 
@@ -27,6 +28,11 @@ def log(peer, service, event, **kw):
             v = v[:600]
         rec[k] = v
     path = os.path.join(LOGDIR, "traps-%s.json" % dt.date.today().isoformat())
+    try:
+        if os.path.getsize(path) > MAX_LOG_DAY:
+            return
+    except OSError:
+        pass
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -63,7 +69,7 @@ def qid():
     return "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(10))
 
 
-# ---------------------------------------------------------------- SMTP (öppet relä-bete)
+# ---------------------------------------------------------------- SMTP (open relay bait)
 async def smtp(r, w, peer, service):
     w.write(b"220 %s ESMTP Postfix (Ubuntu)\r\n" % HOSTNAME.encode()); await w.drain()
     mail_from, rcpts, helo = "", [], ""
@@ -128,7 +134,7 @@ async def smtp(r, w, peer, service):
             subj = next((l[8:].strip() for l in text.splitlines() if l.lower().startswith("subject:")), "")
             log(peer, service, "mail", mail_from=mail_from, rcpts=rcpts[:20], rcpt_count=len(rcpts), subject=subj,
                 size=size, helo=helo, sample=text[:1500])
-            # Låtsas köa — skickas aldrig vidare (honeypoten har inget utgående internet, och koden har ingen leverans).
+            # Pretend to queue — never delivered (the honeypot has no outbound internet, and there is no delivery code).
             w.write(b"250 2.0.0 Ok: queued as %s\r\n" % qid().encode())
         elif cmd == b"RSET":
             mail_from, rcpts = "", []; w.write(b"250 2.0.0 Ok\r\n")
@@ -138,7 +144,7 @@ async def smtp(r, w, peer, service):
             w.write(b"252 2.0.0 Cannot VRFY user\r\n")
         elif cmd == b"QUIT":
             w.write(b"221 2.0.0 Bye\r\n"); await w.drain(); return
-        elif cmd == b"STAR":  # STARTTLS: inget certifikat, säg nej
+        elif cmd == b"STAR":  # STARTTLS: no certificate, say no
             w.write(b"454 4.7.0 TLS not available due to local problem\r\n")
         else:
             w.write(b"502 5.5.2 Error: command not recognized\r\n")
@@ -245,7 +251,7 @@ async def postgres(r, w, peer, service):
             return
         body = await readexactly(r, n - 4)
         code = struct.unpack("!I", body[:4])[0]
-        if code in (80877103, 80877104):  # SSLRequest / GSSENCRequest -> nej
+        if code in (80877103, 80877104):  # SSLRequest / GSSENCRequest -> no
             w.write(b"N"); await w.drain(); continue
         break
     else:
@@ -269,7 +275,7 @@ async def postgres(r, w, peer, service):
     w.write(b"E" + struct.pack("!I", len(msg) + 4) + msg); await w.drain()
 
 
-# ---------------------------------------------------------------- SOCKS5 (och SOCKS4)
+# ---------------------------------------------------------------- SOCKS5 (and SOCKS4)
 async def socks(r, w, peer, service):
     ver = (await readexactly(r, 1))[0]
     if ver == 4:
@@ -277,7 +283,7 @@ async def socks(r, w, peer, service):
         port, ip = struct.unpack("!H", hdr[1:3])[0], ".".join(str(b) for b in hdr[3:7])
         uid = await asyncio.wait_for(r.readuntil(b"\x00"), IDLE)
         target = ip
-        if ip.startswith("0.0.0.") and ip != "0.0.0.0":  # SOCKS4a: värdnamn efter userid
+        if ip.startswith("0.0.0.") and ip != "0.0.0.0":  # SOCKS4a: hostname after userid
             target = (await asyncio.wait_for(r.readuntil(b"\x00"), IDLE))[:-1].decode("utf-8", "replace")
         log(peer, service, "proxy", version=4, target="%s:%d" % (target, port), username=uid[:-1])
         w.write(b"\x00\x5b" + b"\x00" * 6); await w.drain(); return
@@ -310,7 +316,7 @@ async def socks(r, w, peer, service):
     port = struct.unpack("!H", await readexactly(r, 2))[0]
     log(peer, service, "proxy", version=5, command=req[1], target="%s:%d" % (host, port), username=user)
     await asyncio.sleep(2)
-    # 0x05 = connection refused. Vi ansluter ALDRIG vidare.
+    # 0x05 = connection refused. We NEVER connect onwards.
     w.write(b"\x05\x05\x00\x01" + b"\x00" * 6); await w.drain()
 
 

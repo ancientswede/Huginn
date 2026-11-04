@@ -8,6 +8,7 @@ COWRIE_DIRS="/home/cowrie/cowrie"            # one or more Cowrie install dirs (
 OPENCANARY_LOG="/home/opencanary/opencanary.log"
 ENDLESSH_UNIT="endlessh"
 TRAPS_LOG_DIR="/var/log/hp-traps"
+FILEINFO_USER="cowrie"                         # unprivileged user that may read the Cowrie downloads
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
 FIRST_COWRIE="${COWRIE_DIRS%% *}"
 export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downloads}"
@@ -34,5 +35,10 @@ nft list chain ip nat prerouting 2>/dev/null | grep -o "dport [^c]*counter packe
 echo "##TRAPS"
 catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000
 echo "##FILES"
-timeout 120 python3 /usr/local/bin/hp-fileinfo 2>/dev/null
+# The captured files are attacker data: analyse them as the Cowrie user (who already owns them), never as root.
+FILEINFO_USER="${FILEINFO_USER:-cowrie}"
+install -d -m 700 -o "$FILEINFO_USER" -g "$FILEINFO_USER" /var/lib/hp-export 2>/dev/null
+chown "$FILEINFO_USER:$FILEINFO_USER" /var/lib/hp-export/fileinfo.json 2>/dev/null
+timeout 120 setpriv --reuid="$FILEINFO_USER" --regid="$FILEINFO_USER" --clear-groups --no-new-privs \
+  env HP_DOWNLOAD_DIRS="$HP_DOWNLOAD_DIRS" python3 -I /usr/local/bin/hp-fileinfo 2>/dev/null
 echo "##END"
