@@ -1,0 +1,21 @@
+[Unit]
+Description=Huginn - honeypot attacker intelligence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=huginn
+Group=huginn
+WorkingDirectory=/opt/huginn
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/huginn/.env
+ExecStart=/usr/bin/python3 /opt/huginn/app.py serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/huginn/data
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

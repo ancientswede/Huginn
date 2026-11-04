@@ -1,0 +1,23 @@
+[Unit]
+Description=hp-traps - fake SMTP/POP3/IMAP/PostgreSQL/SOCKS5 services (honeypot)
+After=network.target
+
+[Service]
+DynamicUser=yes
+LogsDirectory=hp-traps
+LogsDirectoryMode=0750
+# Environment=TRAPS_HOSTNAME=mail.example.com
+ExecStart=/usr/bin/python3 /opt/hp-traps/hp-traps.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=256M
+TasksMax=64
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

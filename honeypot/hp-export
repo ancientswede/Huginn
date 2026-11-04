@@ -1,0 +1,38 @@
+#!/bin/bash
+# hp-export — read-only log export for Huginn (part of Huginn, AGPL-3.0-or-later).
+# Runs as a forced command in /root/.ssh/authorized_keys on the honeypot:
+#   restrict,command="/usr/local/bin/hp-export" ssh-ed25519 AAAA... huginn
+# No command: prints all logs in sections. "tty <sha256>": one Cowrie session recording as base64.
+# Settings (optional) in /etc/default/hp-export:
+COWRIE_DIRS="/home/cowrie/cowrie"            # one or more Cowrie install dirs (several = several personas)
+OPENCANARY_LOG="/home/opencanary/opencanary.log"
+ENDLESSH_UNIT="endlessh"
+TRAPS_LOG_DIR="/var/log/hp-traps"
+[ -r /etc/default/hp-export ] && . /etc/default/hp-export
+FIRST_COWRIE="${COWRIE_DIRS%% *}"
+export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downloads}"
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "") ;;
+  tty\ *)
+    sha="${SSH_ORIGINAL_COMMAND#tty }"
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "bad request" >&2; exit 2; }
+    f="$FIRST_COWRIE/var/lib/cowrie/tty/$sha"
+    [ -f "$f" ] && [ ! -L "$f" ] || { echo "not found" >&2; exit 3; }
+    base64 -w0 "$f"; echo; exit 0 ;;
+  *) ;;  # any other command gets the normal export
+esac
+# Print the files matching a pattern, oldest first. No match -> no output (cat must never wait on stdin).
+catfiles() { local f; f=( $(ls -tr $1 2>/dev/null) ); [ ${#f[@]} -gt 0 ] && cat "${f[@]}" 2>/dev/null; return 0; }
+echo "##COWRIE"
+for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000; done
+echo "##CANARY"
+catfiles "$OPENCANARY_LOG*" | tail -n 10000
+echo "##ENDLESSH"
+journalctl -u "$ENDLESSH_UNIT" --no-pager -o cat --since "30 days ago" 2>/dev/null | grep -E " (ACCEPT|CLOSE) host=" | tail -n 20000
+echo "##NFT"
+nft list chain ip nat prerouting 2>/dev/null | grep -o "dport [^c]*counter packets [0-9]*"
+echo "##TRAPS"
+catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000
+echo "##FILES"
+timeout 120 python3 /usr/local/bin/hp-fileinfo 2>/dev/null
+echo "##END"

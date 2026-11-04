@@ -1,0 +1,5 @@
+{
+  "mysql_backup": "replace-with-a-unique-random-string-1",
+  "redis": "replace-with-a-unique-random-string-2",
+  "aws_secret": "replace-with-a-unique-random-string-3"
+}
