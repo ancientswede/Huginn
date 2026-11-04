@@ -1,5 +1,7 @@
 # Huginn
 
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/ancientswede)
+
 **Attacker intelligence for a homelab honeypot.** Huginn pulls the logs from your honeypot, keeps the history, shows everything about every attacker IP on its own page, and turns it into blocklists your firewalls can fetch.
 
 In Norse myth Huginn is one of Odin's ravens. It flies out over the world every day and comes back to tell what it saw.
@@ -202,6 +204,10 @@ app.py set-password          # set or reset the login password (logs out every s
 app.py ingest-once           # one sync, for testing
 app.py import FILE...        # import full cowrie.json* / opencanary.log* files
 ```
+
+## Support
+
+If Huginn is useful in your homelab, you can [buy me a coffee](https://buymeacoffee.com/ancientswede). ☕
 
 ## License
 
