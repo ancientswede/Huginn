@@ -26,6 +26,28 @@ In Norse myth Huginn is one of Odin's ravens. It flies out over the world every 
    └───────────────────────────────┘
 ```
 
+## ⚠️ Read this before you open any ports
+
+A honeypot **invites attacks on purpose**. Port forwarding from the internet into your home network is not something to try just to see what happens. Done wrong, you give strangers a way into the network your family's laptops, phones, NAS and cameras live on. **If you are not sure what the steps below mean, stop here and read up first.**
+
+Only open ports when **all** of this is true:
+
+- **The honeypot is truly isolated.** It is on its own VLAN or network, and your firewall blocks every connection from it to your LAN, your router's admin page, your NAS and your other VLANs. "Different subnet" alone is not isolation. **Test it** from the honeypot. Every one of these must fail:
+  ```bash
+  ping -c1 <a LAN machine>      # must time out
+  nc -zv -w3 <your router> 80   # must fail
+  nc -zv -w3 <your NAS> 445     # must fail
+  ```
+- **You forward only to the honeypot**, and only the ports the installer lists. Never forward its admin SSH port. Never forward anything to Huginn: Huginn stays on your LAN or VPN.
+- **You keep it up to date.** Patch the honeypot (`apt upgrade`) and Cowrie (`git pull`). Rebuild it if anything looks wrong. Consider blocking its outbound internet once it is installed.
+- **You are allowed to.** Some internet providers forbid running servers or block port 25. In many countries, IP addresses are personal data (GDPR), so keep the retention short.
+- **You accept the risk.** Huginn comes with **no warranty** (see sections 15–16 of the [license](LICENSE)). You are responsible for your own network.
+
+**About the blocklists:**
+- They only help where you **apply** them, on the firewall in front of your *real* services.
+- They do not make it safe to expose services you could keep private. A VPN (WireGuard and the like) is still the better answer.
+- Many attacking addresses are shared or recycled: home routers, CGNAT, cloud servers. Start with a short window (7–30 days), and use "Never block" when a real user gets caught.
+
 ## What you get
 
 - **Overview:** attackers per day, top attackers, latest shell sessions, top passwords, countries, how many took the bait, and **time wasted** (hours attackers spent stuck in the tarpit and in the fake shells, and who is stuck right now).
@@ -42,6 +64,7 @@ In Norse myth Huginn is one of Odin's ravens. It flies out over the world every 
 - **Bait detection:** put fake credentials in the honeypot's files. Huginn tags anyone who reads them (`read-bait`) or later tries one of them anywhere (`took-bait`).
 - **Blocklists** as plain text, nftables, ipset, MikroTik or CSV, filtered by score and age. There is also a separate **C2 list**: the servers attackers download from and the addresses found inside their malware.
 - **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt).
+- **Your way:** light, dark or automatic theme, six accent colours, a compact layout, a 12- or 24-hour clock, the columns and overview cards you want, and countries or networks you never want to see (they are still blocklisted). Every attacker can be exported as JSON or CSV. Keyboard shortcuts: press `?`.
 
 Huginn uses only the Python standard library and SQLite. There are no dependencies, no build step and no JavaScript framework. It runs comfortably in a 1 core / 512 MB LXC.
 
@@ -95,7 +118,7 @@ The script:
    ```
 3. Waits until the honeypot accepts the key, starts Huginn and asks for the password for the web page.
 
-**3. Forward the ports** listed at the end of step 1 from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
+**3. Forward the ports**, but only after you have read [the warning above](#️-read-this-before-you-open-any-ports) and **tested the isolation**. Forward the ports listed at the end of step 1 from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
 
 **Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
 

@@ -434,7 +434,10 @@ cat <<EOF
   Next:
   1. On your Huginn machine run ./install-huginn.sh — it prints a key line.
   2. Back here:  hp-add-huginn-key '<that line>'
-  3. In your router, forward these TCP ports from the internet to this machine:
+  3. FIRST prove this machine is isolated: from here, these must all FAIL:
+       ping -c1 <a LAN machine>   /   nc -zv -w3 <your router> 80
+     Read "Read this before you open any ports" in README.md.
+  4. Only then, in your router, forward these TCP ports from the internet to this machine:
        $FWD
      (never forward $ADMIN_PORT)
 EOF

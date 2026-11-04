@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.6.1"
+HUGINN_VERSION = "0.7.0"
 CHANGELOG = [
+    ("0.7.0", "2026-11-05", "12/24-hour clock, choose the columns of the Attackers list, hide countries/networks from the views (never from the blocklist), export everything about an IP as JSON or CSV, keyboard shortcuts (press ?)."),
     ("0.6.1", "2026-11-05", "Fix: Shodan's \"scanner\" tag no longer marks attackers as research scanners, and anyone who logged in, ran commands or dropped files is always blocklisted. Header wraps on phones."),
     ("0.6.0", "2026-11-05", "Settings page: light/dark/auto theme (quick toggle in the header), accent colour, compact layout, page title, overview cards, list and blocklist defaults, notification events and a test notification."),
     ("0.5.0", "2026-11-05", "Install scripts for the honeypot and Huginn. HUGINN_ALLOW_PRIVATE=1 for testing from your own LAN."),
@@ -811,13 +812,13 @@ def clean(s, n=3000):
 def fmt_ts(ts):
     if not ts:
         return "–"
-    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %I:%M %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M")
 
 
 def fmt_tss(ts):
     if not ts:
         return "–"
-    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %I:%M:%S %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M:%S")
 
 
 def ago(ts):
@@ -905,7 +906,14 @@ def kv(rows):
 
 SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
                     "cards": ["chart", "countries", "top", "shells", "creds", "timewasted"], "ips_days": "30",
-                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit"]}
+                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit"],
+                    "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
+                    "hide_cc": [], "hide_asn": []}
+# Optional columns of the Attackers list: key -> (header, sort key, css class)
+IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "ASN", None, ""), ("rdns", "Reverse DNS", None, ""),
+            ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
+            ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
+            ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
 CARDS = [("chart", "Unique attackers per day"), ("countries", "Countries"), ("top", "Top attackers"),
          ("shells", "Latest shell sessions"), ("creds", "Top credentials"), ("timewasted", "Time wasted")]
 # accent: (light accent, light tint, dark accent, dark tint)
@@ -926,6 +934,18 @@ def settings(con=None):
     out = dict(SETTINGS_DEFAULT)
     out.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULT})
     return out
+
+
+def hidden_sql(st, alias="e"):
+    # SQL that leaves out hidden countries/networks (views only — the blocklist never uses this).
+    parts, args = [], []
+    if st["hide_cc"]:
+        parts.append("COALESCE(%s.cc,'') NOT IN (%s)" % (alias, ",".join("?" * len(st["hide_cc"]))))
+        args += st["hide_cc"]
+    if st["hide_asn"]:
+        parts.append("COALESCE(%s.asn,'') NOT IN (%s)" % (alias, ",".join("?" * len(st["hide_asn"]))))
+        args += st["hide_asn"]
+    return (" AND " + " AND ".join(parts)) if parts else "", args
 
 
 def html_attrs(st):
@@ -956,6 +976,7 @@ def page(title, body, active="/"):
             "<script src='/static/app.js?v=%s' defer></script></head><body>"
             "<header><div class=brand><a href='/'>%s</a></div><nav>%s</nav>"
             "<div class=hdr-right>%s<span class=muted>v%s</span>%s"
+            "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
             "<main>%s</main></body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
@@ -975,6 +996,7 @@ def v_overview():
     files = con.execute("SELECT COUNT(DISTINCT b) FROM events WHERE kind='file'").fetchone()[0]
     st = settings(con)
     bl = len(blocklist_ips(con, int(st["bl_min"]), int(st["bl_days"]), False, True))
+    st = settings(con)
     tw = time_wasted(con, now - 7 * 86400)
     bait7 = con.execute("SELECT SUM(','||tags||',' LIKE '%,took-bait,%'), SUM(','||tags||',' LIKE '%,read-bait,%') FROM ips WHERE last>=?", (d7,)).fetchone()
     kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"])), ("Attackers 7d", num(k["b"]), "%s total" % num(k["c"])),
@@ -993,15 +1015,16 @@ def v_overview():
     chart = ('<div class="card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
              % (bars([q.get(d, (0, 0))[1] for d in days], days), esc(days[0])))
 
+    hs, ha = hidden_sql(st)
     top = con.execute("SELECT i.*, e.cc, e.org, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
-                      "LEFT JOIN flags f USING(ip) WHERE i.last>=? ORDER BY i.score DESC, i.last DESC LIMIT 15", (d7,)).fetchall()
+                      "LEFT JOIN flags f USING(ip) WHERE i.last>=?" + hs + " ORDER BY i.score DESC, i.last DESC LIMIT 15", [d7] + ha).fetchall()
     trows = "".join("<tr><td>%s</td><td>%s</td><td class=trunc>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td class=num><b>%s</b></td></tr>"
                     % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["org"] or ""), num(r["sessions"]), num(r["cmds"]),
                        tag_html(ip_tags(r)), r["score"]) for r in top)
     top_html = ('<div class="card span2"><h3>Top attackers, 7 days <a class=more href="/ips?days=7">all →</a></h3>'
                 '<table><thead><tr><th>IP</th><th>CC</th><th>Network</th><th class=num>Sess.</th><th class=num>Cmds</th><th>Tags</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table></div>' % trows)
 
-    shells = con.execute("SELECT s.*, e.cc FROM sessions s LEFT JOIN enrich e USING(ip) WHERE s.cmds>0 ORDER BY s.start DESC LIMIT 10").fetchall()
+    shells = con.execute("SELECT s.*, e.cc FROM sessions s LEFT JOIN enrich e USING(ip) WHERE s.cmds>0" + hs + " ORDER BY s.start DESC LIMIT 10", ha).fetchall()
     srows = ""
     for s in shells:
         first = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts LIMIT 1", (s["session"],)).fetchone()
@@ -1014,7 +1037,7 @@ def v_overview():
     crows = "".join("<tr><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td></tr>" % (esc(clean(r["a"], 60)), esc(clean(r["b"], 60)), num(r["n"])) for r in creds)
     creds_html = '<div class="card"><h3>Top credentials, 7 days <a class=more href="/creds">all →</a></h3><table><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th></tr></thead><tbody>%s</tbody></table></div>' % crows
 
-    ccs = con.execute("SELECT COALESCE(e.cc,'??') cc, MAX(e.country) country, COUNT(*) n FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=? GROUP BY cc ORDER BY n DESC LIMIT 10", (d7,)).fetchall()
+    ccs = con.execute("SELECT COALESCE(e.cc,'??') cc, MAX(e.country) country, COUNT(*) n FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=?" + hs + " GROUP BY cc ORDER BY n DESC LIMIT 10", [d7] + ha).fetchall()
     ccrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td></tr>" % (cc_html(r["cc"]), esc(r["country"] or ""), num(r["n"])) for r in ccs)
     cc_html_ = '<div class="card"><h3>Countries, 7 days</h3><table><thead><tr><th>CC</th><th>Country</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>' % ccrows
 
@@ -1040,7 +1063,13 @@ def time_wasted(con, since):
         t, tl = tar.get(ip, (0, 0)); s_, sl = sh.get(ip, (0, 0))
         rows.append({"ip": ip, "tarpit": t or 0, "shell": s_ or 0, "total": (t or 0) + (s_ or 0), "longest": max(tl or 0, sl or 0)})
     rows.sort(key=lambda r: -r["total"])
-    top = rows[:10]
+    st = settings(con)
+    if st["hide_cc"] or st["hide_asn"]:
+        en = {r[0]: (r[1] or "", r[2] or "") for r in con.execute("SELECT ip, cc, asn FROM enrich")}
+        hcc, has = set(st["hide_cc"]), set(st["hide_asn"])
+        top = [r for r in rows if en.get(r["ip"], ("", ""))[0] not in hcc and en.get(r["ip"], ("", ""))[1] not in has][:10]
+    else:
+        top = rows[:10]
     if top:
         cc = {r[0]: r[1] for r in con.execute("SELECT ip, cc FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(top)), [r["ip"] for r in top])}
         for r in top:
@@ -1088,26 +1117,47 @@ def v_ips(qs):
     elif tag:
         where.append("(','||i.tags||',') LIKE ?")
         args.append("%," + tag + ",%")
+    st = settings(con)
+    show_hidden = qs.get("hidden") == "1"
+    nhidden = 0
+    hs, ha = hidden_sql(st)
+    if hs:
+        w0 = ("WHERE " + " AND ".join(where)) if where else ""
+        allc = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) " + w0, args).fetchone()[0]
+        if not show_hidden:
+            where.append(hs[5:])
+            args += ha
     w = ("WHERE " + " AND ".join(where)) if where else ""
     total = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) " + w, args).fetchone()[0]
-    rows = con.execute("SELECT i.*, e.cc, e.org, e.rdns, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
+    if hs:
+        nhidden = allc - total if not show_hidden else 0
+    rows = con.execute("SELECT i.*, e.cc, e.org, e.rdns, e.asn, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
                        "LEFT JOIN flags f USING(ip) %s ORDER BY %s LIMIT 100 OFFSET ?" % (w, SORTS[sort]), args + [pg * 100]).fetchall()
 
     def link(**kw):
-        p = {"q": q, "days": days, "tag": tag, "sort": sort}
+        p = {"q": q, "days": days, "tag": tag, "sort": sort, "hidden": "1" if show_hidden else ""}
         p.update(kw)
         return "/ips?" + urllib.parse.urlencode({k: v for k, v in p.items() if v not in ("", None)})
 
-    hdr = "".join('<th class="%s"><a href="%s">%s</a></th>' % (cls, esc(link(sort=key, p=0)) if key else "#", esc(lab)) if key else '<th class="%s">%s</th>' % (cls, esc(lab))
-                  for lab, key, cls in [("IP", None, ""), ("CC", None, ""), ("Network", None, ""), ("First seen", "first", ""),
-                                        ("Last seen", "last", ""), ("Sess.", "sessions", "num"), ("Logins", "logins", "num"),
-                                        ("Cmds", "cmds", "num"), ("Files", None, "num"), ("Tags", None, ""), ("Score", "score", "num")])
-    trs = "".join(
-        "<tr><td>%s</td><td>%s</td><td class=trunc title='%s'>%s</td><td>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td>"
-        "<td class=num>%s</td><td class=num>%s</td><td>%s</td><td class=num><b>%s</b></td></tr>"
-        % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["rdns"] or ""), esc(r["org"] or ""), esc(fmt_ts(r["first"])), esc(ago(r["last"])),
-           num(r["sessions"]), num(r["logins_ok"] + r["logins_fail"]), num(r["cmds"]), num(r["files"]), tag_html(ip_tags(r)), r["score"])
-        for r in rows)
+    cols = [c for c in IPS_COLS if c[0] in st["ips_cols"]]
+    hdr = '<th>IP</th>' + "".join(('<th class="%s"><a href="%s">%s</a></th>' % (cls, esc(link(sort=key, p=0)), esc(lab))) if key
+                                  else '<th class="%s">%s</th>' % (cls, esc(lab)) for _k, lab, key, cls in cols)
+    cell = {
+        "cc": lambda r: "<td>%s</td>" % cc_html(r["cc"]),
+        "network": lambda r: "<td class=trunc title='%s'>%s</td>" % (esc(r["rdns"] or ""), esc(r["org"] or "")),
+        "asn": lambda r: "<td class=mono>%s</td>" % (esc("AS" + r["asn"]) if r["asn"] else "–"),
+        "rdns": lambda r: "<td class='mono trunc'>%s</td>" % esc(r["rdns"] or "–"),
+        "first": lambda r: "<td>%s</td>" % esc(fmt_ts(r["first"])),
+        "last": lambda r: "<td>%s</td>" % esc(ago(r["last"])),
+        "sessions": lambda r: "<td class=num>%s</td>" % num(r["sessions"]),
+        "logins": lambda r: "<td class=num>%s</td>" % num(r["logins_ok"] + r["logins_fail"]),
+        "cmds": lambda r: "<td class=num>%s</td>" % num(r["cmds"]),
+        "files": lambda r: "<td class=num>%s</td>" % num(r["files"]),
+        "tarpit": lambda r: "<td class=num>%s</td>" % (esc(dur(r["tarpit_s"])) if r["tarpit_s"] else "–"),
+        "tags": lambda r: "<td>%s</td>" % tag_html(ip_tags(r)),
+        "score": lambda r: "<td class=num><b>%s</b></td>" % r["score"],
+    }
+    trs = "".join("<tr><td>%s</td>%s</tr>" % (ip_link(r["ip"]), "".join(cell[c[0]](r) for c in cols)) for r in rows)
     opts = lambda cur, vals: "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(l)) for v, l in vals)
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s"><button>Filter</button></form>'
@@ -1119,8 +1169,13 @@ def v_ips(qs):
             '<a href="%s">← Prev</a>' % esc(link(p=pg - 1)) if pg > 0 else "<span></span>",
             num(pg * 100 + 1), num(min(total, pg * 100 + 100)), num(total),
             '<a href="%s">Next →</a>' % esc(link(p=pg + 1)) if (pg + 1) * 100 < total else "<span></span>")
-    body = ('<h1>Attackers <span class=muted>%s</span></h1>%s<div class="card"><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
-            % (num(total), form, hdr, trs or "<tr><td colspan=11 class=muted>No matches</td></tr>", pager))
+    hidden_note = ""
+    if nhidden:
+        hidden_note = '<p class="muted small">%s hidden by your settings · <a href="%s">show them</a></p>' % (num(nhidden), esc(link(hidden="1", p=0)))
+    elif show_hidden and hs:
+        hidden_note = '<p class="muted small">Showing hidden networks too · <a href="%s">hide them again</a></p>' % esc(link(hidden="", p=0))
+    body = ('<h1>Attackers <span class=muted>%s</span></h1>%s%s<div class="card"><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
+            % (num(total), form, hidden_note, hdr, trs or "<tr><td colspan=%d class=muted>No matches</td></tr>" % (len(cols) + 1), pager))
     return page("Attackers", body, "/ips")
 
 
@@ -1143,7 +1198,9 @@ def v_ip(ip):
         tags += "," + f["flag"]
 
     # Summary
-    links = " · ".join([ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
+    links = " · ".join(['<a href="/ip/%s/export.json">Export JSON</a>' % esc(urllib.parse.quote(ip)),
+                        '<a href="/ip/%s/export.csv">Export CSV</a>' % esc(urllib.parse.quote(ip)),
+                        ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
                         ext("https://ipinfo.io/" + ip, "ipinfo")])
     left = kv([("First seen", esc(fmt_tss(r["first"]))), ("Last seen", "%s <span class=muted>(%s)</span>" % (esc(fmt_tss(r["last"])), esc(ago(r["last"])))),
@@ -1272,6 +1329,42 @@ def v_ip(ip):
             '<div class="card span2">%s</div>%s%s%s%s%s%s</div>'
             % (esc(ip), tag_html(tags.strip(",")), r["score"], links, left, right, flag_form, act, creds_html, rel_html, files_html, sess_html, can_html))
     return page(ip, body, "/ips")
+
+
+def export_ip(ip):
+    # Everything Huginn knows about one IP, for JSON/CSV download.
+    con = db()
+    r = con.execute("SELECT * FROM ips WHERE ip=?", (ip,)).fetchone()
+    if not r:
+        return None
+    e = con.execute("SELECT * FROM enrich WHERE ip=?", (ip,)).fetchone()
+    f = con.execute("SELECT * FROM flags WHERE ip=?", (ip,)).fetchone()
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ") if t else None
+    evs = con.execute("SELECT ts, src, kind, session, a, b FROM events WHERE ip=? ORDER BY ts", (ip,)).fetchall()
+    sess = con.execute("SELECT * FROM sessions WHERE ip=? ORDER BY start", (ip,)).fetchall()
+    return {
+        "ip": ip, "exported": iso(time.time()), "huginn_version": HUGINN_VERSION,
+        "summary": {k: r[k] for k in r.keys() if k not in ("first", "last")} | {"first_seen": iso(r["first"]), "last_seen": iso(r["last"])},
+        "network": ({k: e[k] for k in e.keys() if k not in ("ip", "fetched", "ok")} | {"looked_up": iso(e["fetched"])}) if e else None,
+        "manual_rule": {"rule": f["flag"], "note": f["note"]} if f else None,
+        "sessions": [{k: s[k] for k in s.keys() if k not in ("start", "end")} | {"start": iso(s["start"]), "end": iso(s["end"]),
+                      "persona": PERSONA.get(s["port"] or 0)} for s in sess],
+        "events": [{"time": iso(x["ts"]), "source": x["src"], "kind": x["kind"], "session": x["session"], "a": x["a"], "b": x["b"]} for x in evs],
+    }
+
+
+def export_csv(data):
+    import csv, io
+    def safe(v):
+        # Attacker text must not become a spreadsheet formula (CSV injection).
+        v = "" if v is None else str(v)
+        return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["time", "ip", "source", "kind", "session", "value", "detail"])
+    for x in data["events"]:
+        w.writerow([x["time"], data["ip"], x["source"], x["kind"], safe(x["session"]), safe(x["a"]), safe(x["b"])])
+    return out.getvalue()
 
 
 def v_files():
@@ -1602,23 +1695,31 @@ def v_settings(ok="", err=""):
             '<div class="row"><div class="rl">Theme</div><div>%s%s%s</div></div>'
             '<div class="row"><div class="rl">Accent</div><div class="sws">%s</div></div>'
             '<div class="row"><div class="rl">Layout</div><div>%s%s</div></div>'
-            '<div class="row"><div class="rl">Page title</div><div><input name=title maxlength=40 value="%s"></div></div></div>'
+            '<div class="row"><div class="rl">Page title</div><div><input name=title maxlength=40 value="%s"></div></div>'
+            '<div class="row"><div class="rl">Clock</div><div>%s%s</div></div></div>'
             '<div class="card"><h3>Overview cards</h3><div class="col">%s</div></div>'
             '<div class="card"><h3>Defaults</h3>'
             '<div class="row"><div class="rl">Attackers list</div><div>%s</div></div>'
             '<div class="row"><div class="rl">Blocklist min score</div><div>%s</div></div>'
             '<div class="row"><div class="rl">Blocklist window</div><div>%s</div></div>'
             '<p class="muted small">Used by the Overview count, the Blocklist page and feed URLs without parameters.</p></div>'
+            '<div class="card"><h3>Attackers list columns</h3><div class="cols2">%s</div></div>'
+            '<div class="card"><h3>Hide from views</h3><p class="muted small">Countries (two letters) and networks (AS numbers) to leave out of the '
+            'Overview and the Attackers list, for example your own VPS provider. They are still recorded and still blocklisted.</p>'
+            '<input name=hidden_nets class="wide-input" maxlength=500 placeholder="e.g. CN, RU, AS14061" value="%s"></div>'
             '<div class="card"><h3>Notifications</h3><p class="muted small">%s At most one summary per hour.</p>'
             '<div class="col">%s<div class="sub">%s</div></div></div>'
             '</div><div class="actions"><button>Save</button></div></form>'
             '<form method=post action="/settings/test-ntfy" class="actions"><button class="btn-s"%s>Send a test notification</button></form>'
             % (note, radio("theme", "auto", "Auto (follow the system)"), radio("theme", "light", "Light"), radio("theme", "dark", "Dark"),
                accents, radio("density", "comfortable", "Comfortable"), radio("density", "compact", "Compact"), esc(st["title"]),
+               radio("clock", "24", "24-hour"), radio("clock", "12", "12-hour (AM/PM)"),
                "".join(check("cards", k, l, k in st["cards"]) for k, l in CARDS),
                sel("ips_days", [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
                sel("bl_min", [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
                sel("bl_days", [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
+               "".join(check("ips_cols", k, lab, k in st["ips_cols"]) for k, lab, _s, _c in IPS_COLS),
+               esc(", ".join(st["hide_cc"] + ["AS" + a for a in st["hide_asn"]])),
                ntfy_line, check("notify", "1", "Send ntfy notifications", st["notify"]),
                "".join(check("notify_events", k, l, k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
                "" if NTFY_URL else " disabled"))
@@ -1642,6 +1743,16 @@ def save_settings(f, lists):
         st["bl_min"] = int(f["bl_min"])
     if f.get("bl_days") in ("1", "7", "30", "90", "365"):
         st["bl_days"] = int(f["bl_days"])
+    if f.get("clock") in ("24", "12"):
+        st["clock"] = f["clock"]
+    st["ips_cols"] = [k for k, *_ in IPS_COLS if k in lists.get("ips_cols", [])]
+    cc, asn = [], []
+    for tok in re.split(r"[\s,;]+", (f.get("hidden_nets") or "").upper())[:100]:
+        if re.fullmatch(r"[A-Z]{2}", tok):
+            cc.append(tok)
+        elif re.fullmatch(r"(AS)?\d{1,10}", tok):
+            asn.append(tok.lstrip("AS"))
+    st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
     st["notify"] = f.get("notify") == "1"
     st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
     set_meta(db(), "settings", json.dumps(st))
@@ -1744,6 +1855,25 @@ document.addEventListener('click',function(e){var b=e.target.closest('[data-copy
 copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=t},1200)})});
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
+(function(){
+var keys=[['g o','Overview'],['g a','Attackers'],['g c','Campaigns'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
+['/','Search / filter'],['t','Switch theme'],['Space','Play / pause a replay'],['?','This help'],['Esc','Close']];
+var box=null;function hide(){if(box){box.remove();box=null}}
+function show(){if(box){hide();return}box=document.createElement('div');box.className='kbd-help';var c=document.createElement('div');c.className='card';
+var h=document.createElement('h3');h.textContent='Keyboard shortcuts';c.appendChild(h);keys.forEach(function(k){var r=document.createElement('div');r.className='kr';
+var a=document.createElement('kbd');a.textContent=k[0];var b=document.createElement('span');b.textContent=k[1];r.appendChild(a);r.appendChild(b);c.appendChild(r)});
+box.appendChild(c);box.addEventListener('click',function(e){if(e.target===box)hide()});document.body.appendChild(box)}
+var hb=document.getElementById('kbdHelp');if(hb)hb.addEventListener('click',function(e){e.preventDefault();show()});
+var g=false,gt=null,map={o:'/',a:'/ips',c:'/campaigns',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
+document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.metaKey||e.altKey)return;
+if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
+var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
+if(k==='g'){g=true;gt=setTimeout(function(){g=false},1500);return}
+if(k==='/'){var i=document.querySelector('input[name=q],input.qf');if(i){i.focus();e.preventDefault()}return}
+if(k==='t'){var f=document.querySelector('form[action="/settings/theme"]');if(f)f.submit();return}
+if(k===' '){var p=document.getElementById('pPlay');if(p){p.click();e.preventDefault()}return}
+if(k==='?'){show();e.preventDefault();return}
+if(k==='Escape')hide()})})();
 (function(){var pl=document.getElementById('player');if(!pl)return;var fr=[],i=0,t=0,timer=null,buf='',playing=false;
 var bt=document.getElementById('pPlay'),sp=document.getElementById('pSpeed'),idle=document.getElementById('pIdle'),tm=document.getElementById('pTime');
 function feed(s){s=s.replace(/\x1b\][^\x07]*\x07/g,'').replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'').replace(/\x1b[()][A-Z0-9]/g,'').replace(/\r\n/g,'\n');
@@ -1769,6 +1899,11 @@ CSS += ("[data-density=compact] th,[data-density=compact] td{padding:3px 6px}[da
         "[data-density=compact] .kpi{padding:9px 12px}[data-density=compact] .kpi-v{font-size:21px}[data-density=compact] .grid,"
         "[data-density=compact] .kpis,[data-density=compact] .grid3{gap:9px}[data-density=compact] main{padding-top:14px}"
         "[data-density=compact] body{font-size:13px}")
+CSS += (".kbd-btn{font-weight:600;width:22px;height:22px;border:1px solid var(--line)!important;border-radius:50%;display:inline-grid;place-items:center;padding:0!important}"
+        ".kbd-help{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50}.kbd-help .card{width:340px}"
+        ".kr{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line)}.kr:last-child{border:0}"
+        "kbd{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:1px 6px}"
+        ".cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 12px}.cols2 .opt{display:flex}.wide-input{width:100%}")
 CSS += (".theme-btn{display:flex;align-items:center;gap:6px}.ti{display:inline-block;width:12px;height:12px;border-radius:50%;border:1.5px solid currentColor}"
         ".ti-light{background:transparent}.ti-dark{background:currentColor}.ti-auto{background:linear-gradient(90deg,currentColor 50%,transparent 50%)}"
         ".settings .row{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:start;padding:8px 0;border-bottom:1px solid var(--line)}"
@@ -1891,6 +2026,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500, "Internal error", "text/plain")
 
     def route_get(self):
+        _local.h12 = settings().get("clock") == "12"
         u = urllib.parse.urlsplit(self.path)
         path = u.path
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
@@ -1923,6 +2059,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_overview())
         if path == "/ips":
             return self.send(200, v_ips(qs))
+        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/export\.(json|csv)", path)
+        if m:
+            try:
+                xip = str(ipaddress.ip_address(urllib.parse.unquote(m.group(1))))
+            except ValueError:
+                return self.send(400, "Bad IP", "text/plain")
+            data = export_ip(xip)
+            if not data:
+                return self.send(404, "Not found", "text/plain")
+            fn = "huginn-%s.%s" % (xip.replace(":", "_"), m.group(2))
+            if m.group(2) == "json":
+                return self.send(200, json.dumps(data, indent=1, ensure_ascii=False), "application/json; charset=utf-8",
+                                 headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
+            return self.send(200, export_csv(data), "text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})", path)
         if m:
             out = v_ip(urllib.parse.unquote(m.group(1)))
@@ -1958,6 +2108,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(404, page("Not found", "<h1>Not found</h1>"))
 
     def route_post(self):
+        _local.h12 = settings().get("clock") == "12"
         path = urllib.parse.urlsplit(self.path).path
         if not self.same_origin():
             return self.send(403, "Forbidden", "text/plain")
