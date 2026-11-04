@@ -74,17 +74,17 @@ apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git &
 ```
 
 The script asks before each optional part: OpenCanary, the endlessh tarpit and hp-traps. Then it:
-- Moves your admin SSH to **port 22022** and asks you to prove you can log in there **before** port 22 goes to the honeypot, so you cannot lock yourself out.
+- Asks which port your own admin SSH should move to (suggests 22022, any free port above 1024 works), and asks you to prove you can log in there **before** port 22 goes to the honeypot, so you cannot lock yourself out.
 - Installs Cowrie and redirects the public ports to the honeypot services.
 - Ends with the list of ports to forward in your router.
 
-From now on, log in with `ssh -p 22022 root@honeypot`.
+From now on, log in with `ssh -p <your admin port> root@honeypot`.
 
 **2. On the Huginn machine**
 
 ```bash
 apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
-./install-huginn.sh --honeypot <honeypot IP>
+./install-huginn.sh --honeypot <honeypot IP>     # add --honeypot-port N if you did not use 22022
 ```
 
 The script:
@@ -199,7 +199,7 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 
 **Before you block anything:**
 - Most attackers are infected home routers and cheap VPSs whose addresses change hands. That is why the feeds only include IPs seen in the last N days.
-- Research scanners (Shodan, Censys and others) are detected from reverse DNS and network names and left out by default.
+- Research scanners (Censys, Shadowserver, BinaryEdge and others) are detected from reverse DNS and network names and left out by default. Anyone who logged in, ran commands, dropped files or tried an exploit is always blocklisted, research network or not.
 - "Never block" always wins.
 
 ## Making the honeypot more convincing

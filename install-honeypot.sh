@@ -15,7 +15,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ADMIN_PORT=22022
+ADMIN_PORT=""
 PERSONA_HOSTNAME="srv01"
 WITH_CANARY=ask
 WITH_TARPIT=ask
@@ -33,7 +33,7 @@ CANARY_HTTP=8080
 usage() {
   cat <<EOF
 Usage: $0 [options]
-  --admin-port N        your admin SSH port after install (default $ADMIN_PORT)
+  --admin-port N        your admin SSH port after install (asked if not given; suggestion 22022)
   --hostname NAME       hostname the fake shell shows (default $PERSONA_HOSTNAME)
   --opencanary | --no-opencanary
   --tarpit     | --no-tarpit       (endlessh on public port 2222)
@@ -86,6 +86,14 @@ start_svc() {  # start_svc unit -> enable, restart and verify it stays up
 }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
+if [ -z "$ADMIN_PORT" ]; then
+  if [ "$YES" = 1 ]; then ADMIN_PORT=22022; else
+    echo
+    echo "    Port 22 will belong to the honeypot, so your own (admin) SSH needs another port."
+    read -r -p "    Admin SSH port [22022]: " ADMIN_PORT </dev/tty || true
+    ADMIN_PORT="${ADMIN_PORT:-22022}"
+  fi
+fi
 [ -r /etc/debian_version ] || die "This script supports Debian 12/13 (and derivatives) only."
 command -v systemctl >/dev/null || die "systemd is required."
 [[ "$ADMIN_PORT" =~ ^[0-9]+$ ]] && [ "$ADMIN_PORT" -gt 1024 ] && [ "$ADMIN_PORT" -lt 65536 ] || die "--admin-port must be 1025-65535."

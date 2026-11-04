@@ -5,8 +5,10 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.5.0"
+HUGINN_VERSION = "0.6.1"
 CHANGELOG = [
+    ("0.6.1", "2026-11-05", "Fix: Shodan's \"scanner\" tag no longer marks attackers as research scanners, and anyone who logged in, ran commands or dropped files is always blocklisted. Header wraps on phones."),
+    ("0.6.0", "2026-11-05", "Settings page: light/dark/auto theme (quick toggle in the header), accent colour, compact layout, page title, overview cards, list and blocklist defaults, notification events and a test notification."),
     ("0.5.0", "2026-11-05", "Install scripts for the honeypot and Huginn. HUGINN_ALLOW_PRIVATE=1 for testing from your own LAN."),
     ("0.4.1", "2026-11-04", "Hardening: size caps on everything read from the honeypot, one bad file record no longer stops the sync."),
     ("0.4.0", "2026-11-04", "Time wasted: tarpit and fake-shell time per attacker, who is stuck right now. All site-specific settings moved to environment variables."),
@@ -91,7 +93,7 @@ PORTNAME = {22: "ssh", 2222: "ssh", 2223: "ssh", 23: "telnet", 2323: "telnet", 2
 RESEARCH_RE = re.compile(
     r"shodan|censys|binaryedge|shadowserver|internet-measurement|stretchoid|onyphe|criminalip|leakix|"
     r"netsystemsresearch|recyber|alphastrike|bitsight|paloaltonetworks|expanse|driftnet|rapid7|"
-    r"internettl|quadmetrics|intrinsec|zoomeye|natlas|ipip\.net|academic|research|scanner|"
+    r"internettl|quadmetrics|intrinsec|zoomeye|natlas|ipip\.net|academic|research|"
     r"probe-?net|projectdiscovery|modat|hadrian|cyber\.casa|securitytrails|fofa", re.I)
 
 SCHEMA = """
@@ -134,6 +136,10 @@ def init_db():
     os.makedirs(DATA, exist_ok=True)
     con = connect()
     con.executescript(SCHEMA)
+    # Re-evaluate the research flag with the current rules (cheap, runs at start).
+    for ip, rd, org, isp, hn in con.execute("SELECT ip, rdns, org, isp, hostnames FROM enrich").fetchall():
+        hay = " ".join(str(v) for v in (rd, org, isp, hn) if v)
+        con.execute("UPDATE enrich SET research=? WHERE ip=?", (1 if RESEARCH_RE.search(hay) else 0, ip))
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
     if "tty" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
@@ -639,8 +645,10 @@ def human_like(con, sid):
 
 def notify(con):
     # At most one ntfy summary per hour, only if something notable happened since the last one: bait, new files, human-like sessions, exploits.
-    if not NTFY_URL:
+    st = settings(con)
+    if not NTFY_URL or not st["notify"]:
         return
+    ev = set(st["notify_events"])
     now = time.time()
     last = float(get_meta(con, "ntfy_last", "0") or 0)
     if not last:
@@ -657,19 +665,21 @@ def notify(con):
             took.add(ip)
         if r:
             read.add(ip)
+    if "bait" not in ev:
+        took, read = set(), set()
     if took:
         prio = 4
         lines.append("Took the bait: " + ", ".join(sorted(took)[:5]) + (" +%d" % (len(took) - 5) if len(took) > 5 else ""))
     if read - took:
         lines.append("Read bait files: %d IP(s)" % len(read - took))
     newf = con.execute("SELECT COUNT(*) FROM (SELECT b, MIN(ts) f FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b) WHERE f>?", (last,)).fetchone()[0]
-    if newf:
+    if newf and "files" in ev:
         lines.append("New files captured: %d" % newf)
-    hum = [r[0] for r in con.execute("SELECT session FROM sessions WHERE start>? AND cmds>=3", (last,)) if human_like(con, r[0])]
+    hum = [r[0] for r in con.execute("SELECT session FROM sessions WHERE start>? AND cmds>=3", (last,)) if human_like(con, r[0])] if "human" in ev else []
     if hum:
         lines.append("Human-like sessions: %d" % len(hum))
     ex = con.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>? AND kind='exploit'", (last,)).fetchone()[0]
-    if ex:
+    if ex and "exploit" in ev:
         lines.append("Exploit attempts from %d IP(s)" % ex)
     set_meta(con, "ntfy_last", now)
     if not lines:
@@ -720,7 +730,8 @@ def enrich_ip(ip):
         d["rdns"] = _rdns_pool.submit(lambda: socket.gethostbyaddr(ip)[0]).result(timeout=4)
     except Exception:
         pass
-    hay = " ".join(str(v) for v in (d["rdns"], d["org"], d["isp"], d["hostnames"], d["tags"]) if v)
+    # Only names count: Shodan's "scanner" tag just means "seen scanning", which every attacker is.
+    hay = " ".join(str(v) for v in (d["rdns"], d["org"], d["isp"], d["hostnames"]) if v)
     research = 1 if RESEARCH_RE.search(hay) else 0
     return d, ok, research
 
@@ -892,26 +903,64 @@ def kv(rows):
     return '<dl class="kv">' + "".join("<dt>%s</dt><dd>%s</dd>" % (esc(k), v) for k, v in rows) + "</dl>"
 
 
+SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
+                    "cards": ["chart", "countries", "top", "shells", "creds", "timewasted"], "ips_days": "30",
+                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit"]}
+CARDS = [("chart", "Unique attackers per day"), ("countries", "Countries"), ("top", "Top attackers"),
+         ("shells", "Latest shell sessions"), ("creds", "Top credentials"), ("timewasted", "Time wasted")]
+# accent: (light accent, light tint, dark accent, dark tint)
+ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d4fc7", "#f1ebfb", "#b394f0", "#2a2140"),
+           "green": ("#2e8b57", "#e6f4ec", "#5fc28a", "#17302a"), "orange": ("#c46a12", "#fbefe3", "#f0a050", "#352616"),
+           "red": ("#c73a3a", "#fbe9e9", "#f07070", "#3a1d1f"), "teal": ("#178a8a", "#e3f4f4", "#4cc6c6", "#15302f")}
+NOTIFY_EVENTS = [("bait", "Someone took or read the bait"), ("files", "New files captured"),
+                 ("human", "Human-like sessions"), ("exploit", "Exploit attempts")]
+THEMES = ["auto", "light", "dark"]
+
+
+def settings(con=None):
+    con = con or db()
+    try:
+        saved = json.loads(get_meta(con, "settings", "{}") or "{}")
+    except ValueError:
+        saved = {}
+    out = dict(SETTINGS_DEFAULT)
+    out.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULT})
+    return out
+
+
+def html_attrs(st):
+    a = ' data-accent="%s" data-density="%s"' % (esc(st["accent"]), esc(st["density"]))
+    if st["theme"] in ("light", "dark"):
+        a += ' data-theme="%s"' % st["theme"]
+    return a
+
+
 NAV = [("/", "Overview"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/files", "Files"),
        ("/creds", "Credentials"), ("/blocklist", "Blocklist")]
 
 
 def page(title, body, active="/"):
     con = db()
+    st = settings(con)
+    nxt = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
+    theme_btn = ("<form method=post action='/settings/theme'><button class='link theme-btn' title='Theme: %s (click for %s)'>"
+                 "<span class='ti ti-%s'></span>%s</button></form>" % (st["theme"], nxt, st["theme"], st["theme"].capitalize()))
     li = float(get_meta(con, "last_ingest", "0") or 0)
     err = get_meta(con, "last_error", "")
     stale = (time.time() - li) > POLL * 3
     status = '<span class="sync %s" title="%s">synced %s</span>' % ("bad" if (err or stale) else "ok", esc(err or ""), esc(ago(li)))
     nav = "".join('<a href="%s"%s>%s</a>' % (h, ' class="on"' if h == active else "", esc(t)) for h, t in NAV)
-    return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+    return ("<!doctype html><html lang=en%s><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s · Huginn</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'>"
+            "<title>%s · %s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'>"
             "<script src='/static/app.js?v=%s' defer></script></head><body>"
-            "<header><div class=brand><a href='/'>Huginn</a></div><nav>%s</nav>"
-            "<div class=hdr-right>%s<span class=muted>v%s</span>"
+            "<header><div class=brand><a href='/'>%s</a></div><nav>%s</nav>"
+            "<div class=hdr-right>%s<span class=muted>v%s</span>%s"
+            "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
-            "<main>%s</main></body></html>") % (esc(title), HUGINN_VERSION, HUGINN_VERSION, nav, status,
-                                                  HUGINN_VERSION, " on" if active == "/account" else "", body)
+            "<main>%s</main></body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
+                                                  esc(st["title"]), nav, status, HUGINN_VERSION, theme_btn,
+                                                  " on" if active == "/settings" else "", " on" if active == "/account" else "", body)
 
 
 # ---------------------------------------------------------------- pages
@@ -924,14 +973,15 @@ def v_overview():
     s24 = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=?", (d1,)).fetchone()[0]
     sh24 = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND cmds>0", (d1,)).fetchone()[0]
     files = con.execute("SELECT COUNT(DISTINCT b) FROM events WHERE kind='file'").fetchone()[0]
-    bl = len(blocklist_ips(con, 3, 30, False, True))
+    st = settings(con)
+    bl = len(blocklist_ips(con, int(st["bl_min"]), int(st["bl_days"]), False, True))
     tw = time_wasted(con, now - 7 * 86400)
     bait7 = con.execute("SELECT SUM(','||tags||',' LIKE '%,took-bait,%'), SUM(','||tags||',' LIKE '%,read-bait,%') FROM ips WHERE last>=?", (d7,)).fetchone()
     kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"])), ("Attackers 7d", num(k["b"]), "%s total" % num(k["c"])),
             ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24)), ("Files captured", num(files), "unique SHA-256"),
             ("Took the bait 7d", num(bait7[0]), "%s read bait files" % num(bait7[1])),
             ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else "")),
-            ("On blocklist", num(bl), "score ≥3, 30 days")]
+            ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]))]
     kp = "".join('<div class="kpi"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (esc(a), b, esc(c)) for a, b, c in kpis)
 
     days = []
@@ -974,7 +1024,8 @@ def v_overview():
     tw_html = ('<div class="card"><h3>Time wasted, 7 days <span class=muted>%s total%s</span></h3><table><thead><tr><th>IP</th><th>CC</th><th class=num>Tarpit</th>'
                '<th class=num>Fake shell</th><th class=num>Total</th><th class=num>Longest</th></tr></thead><tbody>%s</tbody></table></div>'
                % (esc(dur(tw["total"])), " · %d stuck in the tarpit right now" % tw["stuck"] if tw["stuck"] else "", twrows or "<tr><td colspan=6 class=muted>Nothing yet</td></tr>"))
-    body = '<div class="kpis">%s</div><div class="grid">%s%s%s%s%s%s</div>' % (kp, chart, cc_html_, top_html, shells_html, creds_html, tw_html)
+    parts = {"chart": chart, "countries": cc_html_, "top": top_html, "shells": shells_html, "creds": creds_html, "timewasted": tw_html}
+    body = '<div class="kpis">%s</div><div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"]))
     return page("Overview", body, "/")
 
 
@@ -1009,7 +1060,7 @@ SORTS = {"score": "i.score DESC, i.last DESC", "last": "i.last DESC", "first": "
 def v_ips(qs):
     con = db()
     q = (qs.get("q") or "").strip()[:100]
-    days = qs.get("days") or "30"
+    days = qs.get("days") or str(settings()["ips_days"])
     tag = (qs.get("tag") or "").strip()[:30]
     sort = qs.get("sort") if qs.get("sort") in SORTS else "last"
     try:
@@ -1337,7 +1388,8 @@ def blocklist_ips(con, min_score, days, research, v6):
     since = time.time() - days * 86400
     rows = con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
-        "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=? AND (?=1 OR COALESCE(e.research,0)=0)))",
+        "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=? AND (?=1 OR COALESCE(e.research,0)=0 "
+        "OR (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) > 0)))",
         (since, min_score, 1 if research else 0)).fetchall()
     out = []
     for (ip,) in rows:
@@ -1374,12 +1426,13 @@ def c2_list(con):
 
 
 def bl_params(qs):
+    st = settings()
     def gi(k, d, lo, hi):
         try:
             return max(lo, min(hi, int(qs.get(k) or d)))
         except ValueError:
             return d
-    return gi("min", 3, 1, 1000), gi("days", 30, 1, 3650), qs.get("research") == "1", qs.get("v6", "1") != "0"
+    return gi("min", int(st["bl_min"]), 1, 1000), gi("days", int(st["bl_days"]), 1, 3650), qs.get("research") == "1", qs.get("v6", "1") != "0"
 
 
 def render_feed(fmt, ips):
@@ -1529,12 +1582,79 @@ def v_replay(sha, ip):
     return page("Replay", body, "/ips")
 
 
+def v_settings(ok="", err=""):
+    st = settings()
+    def radio(name, val, label):
+        return '<label class="opt"><input type=radio name=%s value="%s"%s> %s</label>' % (name, val, " checked" if str(st[name]) == str(val) else "", esc(label))
+    def check(name, val, label, on):
+        return '<label class="opt"><input type=checkbox name=%s value="%s"%s> %s</label>' % (name, val, " checked" if on else "", esc(label))
+    def sel(name, vals):
+        return '<select name=%s>%s</select>' % (name, "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(st[name]) == str(v) else "", esc(l)) for v, l in vals))
+    msg = {"1": "Saved.", "test": "Test notification sent."}.get(ok, "")
+    note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
+    note += ('<p class="err">%s</p>' % esc(err)) if err else ""
+    accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
+                      % (a, " checked" if st["accent"] == a else "", a, a.capitalize()) for a in ACCENTS)
+    ntfy_host = urllib.parse.urlsplit(NTFY_URL).netloc if NTFY_URL else ""
+    ntfy_line = ("Sends to <span class=mono>%s</span> (HUGINN_NTFY_URL)." % esc(ntfy_host)) if NTFY_URL else "HUGINN_NTFY_URL is not set in .env, so nothing is sent."
+    body = ('<h1>Settings</h1>%s<form method=post action="/settings" class="settings"><div class="grid">'
+            '<div class="card"><h3>Appearance</h3>'
+            '<div class="row"><div class="rl">Theme</div><div>%s%s%s</div></div>'
+            '<div class="row"><div class="rl">Accent</div><div class="sws">%s</div></div>'
+            '<div class="row"><div class="rl">Layout</div><div>%s%s</div></div>'
+            '<div class="row"><div class="rl">Page title</div><div><input name=title maxlength=40 value="%s"></div></div></div>'
+            '<div class="card"><h3>Overview cards</h3><div class="col">%s</div></div>'
+            '<div class="card"><h3>Defaults</h3>'
+            '<div class="row"><div class="rl">Attackers list</div><div>%s</div></div>'
+            '<div class="row"><div class="rl">Blocklist min score</div><div>%s</div></div>'
+            '<div class="row"><div class="rl">Blocklist window</div><div>%s</div></div>'
+            '<p class="muted small">Used by the Overview count, the Blocklist page and feed URLs without parameters.</p></div>'
+            '<div class="card"><h3>Notifications</h3><p class="muted small">%s At most one summary per hour.</p>'
+            '<div class="col">%s<div class="sub">%s</div></div></div>'
+            '</div><div class="actions"><button>Save</button></div></form>'
+            '<form method=post action="/settings/test-ntfy" class="actions"><button class="btn-s"%s>Send a test notification</button></form>'
+            % (note, radio("theme", "auto", "Auto (follow the system)"), radio("theme", "light", "Light"), radio("theme", "dark", "Dark"),
+               accents, radio("density", "comfortable", "Comfortable"), radio("density", "compact", "Compact"), esc(st["title"]),
+               "".join(check("cards", k, l, k in st["cards"]) for k, l in CARDS),
+               sel("ips_days", [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
+               sel("bl_min", [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
+               sel("bl_days", [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
+               ntfy_line, check("notify", "1", "Send ntfy notifications", st["notify"]),
+               "".join(check("notify_events", k, l, k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
+               "" if NTFY_URL else " disabled"))
+    return page("Settings", body, "/settings")
+
+
+def save_settings(f, lists):
+    st = settings()
+    if f.get("theme") in THEMES:
+        st["theme"] = f["theme"]
+    if f.get("accent") in ACCENTS:
+        st["accent"] = f["accent"]
+    if f.get("density") in ("comfortable", "compact"):
+        st["density"] = f["density"]
+    title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
+    st["title"] = title or "Huginn"
+    st["cards"] = [k for k, _ in CARDS if k in lists.get("cards", [])]
+    if f.get("ips_days") in ("1", "7", "30", "90", "all"):
+        st["ips_days"] = f["ips_days"]
+    if f.get("bl_min") in ("1", "3", "5", "10", "15", "25"):
+        st["bl_min"] = int(f["bl_min"])
+    if f.get("bl_days") in ("1", "7", "30", "90", "365"):
+        st["bl_days"] = int(f["bl_days"])
+    st["notify"] = f.get("notify") == "1"
+    st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
+    set_meta(db(), "settings", json.dumps(st))
+
+
 def v_login(err=""):
-    return ("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>Huginn</title><link rel=stylesheet href='/static/app.css?v=%s'></head><body class=login>"
-            "<form method=post action='/login' class='card loginbox'><h1>Huginn</h1>%s"
+    st = settings()
+    return ("<!doctype html><html lang=en%s><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>%s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'></head><body class=login>"
+            "<form method=post action='/login' class='card loginbox'><h1>%s</h1>%s"
             "<input type=password name=password placeholder=Password autofocus autocomplete=current-password required>"
-            "<button>Log in</button></form></body></html>") % (HUGINN_VERSION, '<p class=err>%s</p>' % esc(err) if err else "")
+            "<button>Log in</button></form></body></html>") % (html_attrs(st), esc(st["title"]), HUGINN_VERSION, esc(st["title"]),
+                                                              '<p class=err>%s</p>' % esc(err) if err else "")
 
 
 # ---------------------------------------------------------------- static files
@@ -1543,9 +1663,12 @@ CSS = r"""
 :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f8f9fb;--line:#e3e6ea;--text:#1b1f24;--muted:#6b7480;--accent:#3b6fd8;--accent2:#e9effb;
 --red:#c73a3a;--orange:#c46a12;--yellow:#9a7b00;--green:#2e8b57;--blue:#3b6fd8;--purple:#7d4fc7;--teal:#178a8a;--grey:#6b7480;
 --term:#11151a;--termtext:#d6dde6;--shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04)}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--panel2:#1b212a;--line:#262d37;--text:#e4e8ee;--muted:#8b95a3;
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0e1116;--panel:#161b22;--panel2:#1b212a;--line:#262d37;--text:#e4e8ee;--muted:#8b95a3;
 --accent:#7aa2f7;--accent2:#1d2a44;--red:#f07070;--orange:#f0a050;--yellow:#e0c050;--green:#5fc28a;--blue:#7aa2f7;--purple:#b394f0;--teal:#4cc6c6;--grey:#8b95a3;
---term:#0a0d11;--termtext:#cdd6e0;--shadow:none}}
+--term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#0e1116;--panel:#161b22;--panel2:#1b212a;--line:#262d37;--text:#e4e8ee;--muted:#8b95a3;
+--accent:#7aa2f7;--accent2:#1d2a44;--red:#f07070;--orange:#f0a050;--yellow:#e0c050;--green:#5fc28a;--blue:#7aa2f7;--purple:#b394f0;--teal:#4cc6c6;--grey:#8b95a3;
+--term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
@@ -1637,6 +1760,23 @@ fr=d.frames||[];pl.textContent=fr.length?'':'Empty recording.';if(fr.length){pla
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
 """
 CSS += ".offscreen{position:fixed;left:-9999px;top:0}"
+# Accent colours: light first, then dark (higher specificity wins in dark mode), then compact layout and settings page.
+CSS += ":root{color-scheme:light}" + "".join(":root[data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[0], v[1]) for k, v in ACCENTS.items())
+CSS += "@media (prefers-color-scheme:dark){" + "".join(":root:not([data-theme=light])[data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[2], v[3]) for k, v in ACCENTS.items()) + "}"
+CSS += "".join(":root[data-theme=dark][data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[2], v[3]) for k, v in ACCENTS.items())
+CSS += "".join(".dot-%s{background:%s}" % (k, v[0]) for k, v in ACCENTS.items())
+CSS += ("[data-density=compact] th,[data-density=compact] td{padding:3px 6px}[data-density=compact] .card{padding:11px}"
+        "[data-density=compact] .kpi{padding:9px 12px}[data-density=compact] .kpi-v{font-size:21px}[data-density=compact] .grid,"
+        "[data-density=compact] .kpis,[data-density=compact] .grid3{gap:9px}[data-density=compact] main{padding-top:14px}"
+        "[data-density=compact] body{font-size:13px}")
+CSS += (".theme-btn{display:flex;align-items:center;gap:6px}.ti{display:inline-block;width:12px;height:12px;border-radius:50%;border:1.5px solid currentColor}"
+        ".ti-light{background:transparent}.ti-dark{background:currentColor}.ti-auto{background:linear-gradient(90deg,currentColor 50%,transparent 50%)}"
+        ".settings .row{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:start;padding:8px 0;border-bottom:1px solid var(--line)}"
+        ".settings .row:last-of-type{border:0}.settings .rl{color:var(--muted);padding-top:2px}.opt{display:inline-flex;align-items:center;gap:6px;margin:0 16px 6px 0;cursor:pointer}"
+        ".col .opt{display:flex}.sub{margin:6px 0 0 24px}.sws{display:flex;flex-wrap:wrap}.dot{width:14px;height:14px;border-radius:50%;display:inline-block}"
+        ".actions{margin-top:14px;display:flex;gap:10px}@media (max-width:1000px){.settings .row{grid-template-columns:1fr}}"
+        "@media (max-width:1000px){header{flex-wrap:wrap;height:auto;padding:8px 16px;row-gap:6px}header nav{order:3;width:100%}"
+        ".hdr-right{gap:10px}.theme-btn{font-size:0}.theme-btn .ti{font-size:14px}.sync{display:none}}")
 CSS += (".pctl{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.pctl label{display:flex;gap:6px;align-items:center;color:var(--muted)}"
         ".player{min-height:420px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0;border-radius:8px}"
         ".iocs{line-height:1.5;max-width:420px;overflow-wrap:anywhere}.replay{font-weight:600}")
@@ -1717,12 +1857,21 @@ class Handler(BaseHTTPRequestHandler):
             o = ref
         return urllib.parse.urlsplit(o).netloc == (self.headers.get("Host") or "")
 
-    def form(self):
+    def form(self, lists=None):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 20000:
             return {}
         raw = self.rfile.read(n).decode("utf-8", "replace")
-        return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+        parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        if lists is not None:
+            lists.update(parsed)
+        return {k: v[0] for k, v in parsed.items()}
+
+    def back(self):
+        # Redirect to the page the form was posted from (same origin was already checked).
+        ref = urllib.parse.urlsplit(self.headers.get("Referer") or "/")
+        target = ref.path + ("?" + ref.query if ref.query else "")
+        return target if target.startswith("/") and not target.startswith("//") else "/"
 
     def do_HEAD(self):
         self.do_GET()
@@ -1804,6 +1953,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps({"frames": tty_frames(data)}), "application/json")
         if path == "/account":
             return self.send(200, v_account(self.authed(), qs.get("ok", "")))
+        if path == "/settings":
+            return self.send(200, v_settings(qs.get("ok", "")))
         return self.send(404, page("Not found", "<h1>Not found</h1>"))
 
     def route_post(self):
@@ -1829,6 +1980,26 @@ class Handler(BaseHTTPRequestHandler):
         cur = self.authed()
         if not cur:
             return self.send(401, "Unauthorized", "text/plain")
+        if path == "/settings":
+            lists = {}
+            f = self.form(lists)
+            save_settings(f, lists)
+            return self.redirect("/settings?ok=1")
+        if path == "/settings/theme":
+            st = settings(con)
+            st["theme"] = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
+            set_meta(con, "settings", json.dumps(st))
+            return self.redirect(self.back())
+        if path == "/settings/test-ntfy":
+            if not NTFY_URL:
+                return self.send(400, v_settings(err="HUGINN_NTFY_URL is not set."))
+            try:
+                req = urllib.request.Request(NTFY_URL, data=b"Test from Huginn. Notifications work.", method="POST",
+                                             headers={"Title": "Huginn: test", "Tags": "honey_pot", "User-Agent": UA})
+                urllib.request.urlopen(req, timeout=10).read()
+            except Exception as e:
+                return self.send(502, v_settings(err="Sending failed: %s" % str(e)[:150]))
+            return self.redirect("/settings?ok=test")
         if path == "/account/password":
             ip = self.client_ip()
             if too_many_fails(ip):

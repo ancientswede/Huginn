@@ -11,7 +11,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HP_HOST=""
-HP_PORT=22022
+HP_PORT=""
 WEB_PORT=8095
 TZ_NAME=""
 NTFY=""
@@ -23,7 +23,7 @@ usage() {
   cat <<EOF
 Usage: $0 --honeypot HOST [options]
   --honeypot HOST       honeypot address (required)
-  --honeypot-port N     honeypot admin SSH port (default $HP_PORT)
+  --honeypot-port N     the honeypot's admin SSH port chosen in install-honeypot.sh (asked if not given; default 22022)
   --port N              Huginn web port (default $WEB_PORT)
   --tz ZONE             time zone, e.g. Europe/Stockholm (default: this machine's)
   --ntfy URL            ntfy topic URL for alerts, e.g. http://ntfy.lan:2586/huginn
@@ -67,6 +67,12 @@ if [ -z "$HP_HOST" ]; then
   read -r -p "    Honeypot address (IP or hostname): " HP_HOST </dev/tty
 fi
 [[ "$HP_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid honeypot address."
+if [ -z "$HP_PORT" ]; then
+  if [ "$YES" = 1 ]; then HP_PORT=22022; else
+    read -r -p "    The honeypot's admin SSH port (chosen in install-honeypot.sh) [22022]: " HP_PORT </dev/tty || true
+    HP_PORT="${HP_PORT:-22022}"
+  fi
+fi
 [[ "$HP_PORT$WEB_PORT" =~ ^[0-9]+$ ]] || die "Ports must be numbers."
 if [ -z "$TZ_NAME" ]; then
   TZ_NAME="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo UTC)"
