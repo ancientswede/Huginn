@@ -5,8 +5,11 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.7.0"
+HUGINN_VERSION = "0.8.2"
 CHANGELOG = [
+    ("0.8.2", "2026-11-05", "Clicking a country on the map shows exactly that country (new country filter on the Attackers list)."),
+    ("0.8.1", "2026-11-05", "Map and chart cards line up."),
+    ("0.8.0", "2026-11-05", "Countries card: switch between a world map and the list. Click a country to see its attackers."),
     ("0.7.0", "2026-11-05", "12/24-hour clock, choose the columns of the Attackers list, hide countries/networks from the views (never from the blocklist), export everything about an IP as JSON or CSV, keyboard shortcuts (press ?)."),
     ("0.6.1", "2026-11-05", "Fix: Shodan's \"scanner\" tag no longer marks attackers as research scanners, and anyone who logged in, ran commands or dropped files is always blocklisted. Header wraps on phones."),
     ("0.6.0", "2026-11-05", "Settings page: light/dark/auto theme (quick toggle in the header), accent colour, compact layout, page title, overview cards, list and blocklist defaults, notification events and a test notification."),
@@ -73,6 +76,7 @@ NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan
 PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
 TTY_DIR = os.path.join(DATA, "tty")
+STATIC_DIR = os.environ.get("HUGINN_STATIC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
 # Persona per internal Cowrie port, e.g. HUGINN_PERSONAS="2225=server,2323=camera" (several Cowrie instances).
 PERSONA = {}
 for _x in os.environ.get("HUGINN_PERSONAS", "").split(","):
@@ -1012,7 +1016,7 @@ def v_overview():
     q = {r[0]: (r[1], r[2]) for r in con.execute(
         "SELECT date(start,'unixepoch','localtime') d, COUNT(*), COUNT(DISTINCT ip) FROM sessions WHERE start>=? GROUP BY d",
         (now - 15 * 86400,))}
-    chart = ('<div class="card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
+    chart = ('<div class="card chart-card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
              % (bars([q.get(d, (0, 0))[1] for d in days], days), esc(days[0])))
 
     hs, ha = hidden_sql(st)
@@ -1039,7 +1043,13 @@ def v_overview():
 
     ccs = con.execute("SELECT COALESCE(e.cc,'??') cc, MAX(e.country) country, COUNT(*) n FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=?" + hs + " GROUP BY cc ORDER BY n DESC LIMIT 10", [d7] + ha).fetchall()
     ccrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td></tr>" % (cc_html(r["cc"]), esc(r["country"] or ""), num(r["n"])) for r in ccs)
-    cc_html_ = '<div class="card"><h3>Countries, 7 days</h3><table><thead><tr><th>CC</th><th>Country</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>' % ccrows
+    allcc = {r[0]: r[1] for r in con.execute("SELECT e.cc, COUNT(*) FROM ips i JOIN enrich e USING(ip) WHERE i.last>=? AND e.cc IS NOT NULL" + hs + " GROUP BY e.cc", [d7] + ha)
+             if r[0] and re.fullmatch(r"[A-Z]{2}", r[0])}
+    cc_html_ = ('<div class="card"><h3>Countries, 7 days <span class="vtabs"><button type=button data-cview="map">Map</button>'
+                '<button type=button data-cview="list">List</button></span></h3>'
+                '<div data-cpanel="map"><div class="wm" id="wmap" data-counts="%s"></div><div class="wm-legend"><span>fewer</span><i></i><span>more IPs</span></div></div>'
+                '<div data-cpanel="list" hidden><table><thead><tr><th>CC</th><th>Country</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div></div>'
+                % (esc(json.dumps(allcc)), ccrows))
 
     twrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num><b>%s</b></td><td class=num>%s</td></tr>"
                      % (ip_link(r["ip"]), cc_html(r["cc"]), esc(dur(r["tarpit"]) if r["tarpit"] else "–"), esc(dur(r["shell"]) if r["shell"] else "–"),
@@ -1091,6 +1101,8 @@ def v_ips(qs):
     q = (qs.get("q") or "").strip()[:100]
     days = qs.get("days") or str(settings()["ips_days"])
     tag = (qs.get("tag") or "").strip()[:30]
+    ccf = (qs.get("cc") or "").strip().upper()
+    ccf = ccf if re.fullmatch(r"[A-Z]{2}", ccf) else ""
     sort = qs.get("sort") if qs.get("sort") in SORTS else "last"
     try:
         pg = max(0, int(qs.get("p") or 0))
@@ -1109,6 +1121,9 @@ def v_ips(qs):
         where.append("(i.ip LIKE ? OR e.org LIKE ? OR e.isp LIKE ? OR e.cc=? OR e.rdns LIKE ? OR e.asn=?)")
         like = "%" + q + "%"
         args += [like, like, like, q.upper(), like, q.lstrip("ASas")]
+    if ccf:
+        where.append("e.cc=?")
+        args.append(ccf)
     if tag == "research":
         where.append("e.research=1")
     elif tag in ("block", "allow"):
@@ -1135,7 +1150,7 @@ def v_ips(qs):
                        "LEFT JOIN flags f USING(ip) %s ORDER BY %s LIMIT 100 OFFSET ?" % (w, SORTS[sort]), args + [pg * 100]).fetchall()
 
     def link(**kw):
-        p = {"q": q, "days": days, "tag": tag, "sort": sort, "hidden": "1" if show_hidden else ""}
+        p = {"q": q, "days": days, "tag": tag, "cc": ccf, "sort": sort, "hidden": "1" if show_hidden else ""}
         p.update(kw)
         return "/ips?" + urllib.parse.urlencode({k: v for k, v in p.items() if v not in ("", None)})
 
@@ -1160,9 +1175,10 @@ def v_ips(qs):
     trs = "".join("<tr><td>%s</td>%s</tr>" % (ip_link(r["ip"]), "".join(cell[c[0]](r) for c in cols)) for r in rows)
     opts = lambda cur, vals: "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(l)) for v, l in vals)
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
-            '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s"><button>Filter</button></form>'
+            '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["shell", "dropper", "proxy", "exploit", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort)))
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["shell", "dropper", "proxy", "exploit", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
+               ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else ""))
     pager = ""
     if total > 100:
         pager = '<div class="pager">%s<span>%s–%s of %s</span>%s</div>' % (
@@ -1887,6 +1903,23 @@ bt.addEventListener('click',function(){if(playing){playing=false;clearTimeout(ti
 document.getElementById('pRestart').addEventListener('click',function(){restart();if(playing){clearTimeout(timer);step()}});
 fetch(pl.dataset.src,{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){if(d.error){pl.textContent=d.error;return}
 fr=d.frames||[];pl.textContent=fr.length?'':'Empty recording.';if(fr.length){playing=true;bt.textContent='Pause';step()}}).catch(function(){pl.textContent='Could not load the recording.'})})();
+(function(){var box=document.getElementById('wmap');if(!box)return;var card=box.closest('.card');var drawn=false;
+function view(v){card.querySelectorAll('[data-cview]').forEach(function(b){b.classList.toggle('on',b.dataset.cview===v)});
+card.querySelectorAll('[data-cpanel]').forEach(function(p){p.hidden=p.dataset.cpanel!==v});try{localStorage.setItem('hgCview',v)}catch(e){}if(v==='map')draw()}
+function draw(){if(drawn)return;drawn=true;fetch('/static/world-map.json').then(function(r){return r.json()}).then(function(w){
+var counts={};try{counts=JSON.parse(box.dataset.counts||'{}')}catch(e){}var max=1;for(var k in counts)max=Math.max(max,counts[k]);
+var NS='http://www.w3.org/2000/svg',svg=document.createElementNS(NS,'svg');svg.setAttribute('viewBox','0 0 '+w.w+' '+w.h);svg.setAttribute('class','wm-svg');
+svg.setAttribute('role','img');svg.setAttribute('aria-label','World map of attacker countries');
+Object.keys(w.c).forEach(function(id){var cc=id.toUpperCase(),n=counts[cc],p=document.createElementNS(NS,'path');p.setAttribute('d',w.c[id][1]);
+p.setAttribute('class','wm-land'+(n?' wm-hit':''));var t=document.createElementNS(NS,'title');t.textContent=w.c[id][0]+(n?': '+n+' IP'+(n===1?'':'s'):'');p.appendChild(t);
+if(n){p.setAttribute('fill-opacity',(0.28+0.72*Math.log(1+n)/Math.log(1+max)).toFixed(2));p.addEventListener('click',function(){location.href='/ips?days=7&cc='+cc})}
+svg.appendChild(p)});box.textContent='';box.appendChild(svg);
+svg.querySelectorAll('path.wm-hit').forEach(function(p){var bb=p.getBBox();if(Math.max(bb.width,bb.height)>=14)return;
+var d=document.createElementNS(NS,'circle');d.setAttribute('cx',bb.x+bb.width/2);d.setAttribute('cy',bb.y+bb.height/2);d.setAttribute('r',5);
+d.setAttribute('class','wm-dot');d.setAttribute('fill-opacity',p.getAttribute('fill-opacity'));var t=p.querySelector('title');if(t)d.appendChild(t.cloneNode(true));
+d.addEventListener('click',function(){p.dispatchEvent(new Event('click'))});svg.appendChild(d)})}).catch(function(){box.textContent='Map not available.'})}
+card.querySelectorAll('[data-cview]').forEach(function(b){b.addEventListener('click',function(){view(b.dataset.cview)})});
+var v='map';try{v=localStorage.getItem('hgCview')||'map'}catch(e){}view(v==='list'?'list':'map')})();
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
 """
 CSS += ".offscreen{position:fixed;left:-9999px;top:0}"
@@ -1899,6 +1932,12 @@ CSS += ("[data-density=compact] th,[data-density=compact] td{padding:3px 6px}[da
         "[data-density=compact] .kpi{padding:9px 12px}[data-density=compact] .kpi-v{font-size:21px}[data-density=compact] .grid,"
         "[data-density=compact] .kpis,[data-density=compact] .grid3{gap:9px}[data-density=compact] main{padding-top:14px}"
         "[data-density=compact] body{font-size:13px}")
+CSS += (".vtabs{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;text-transform:none;letter-spacing:0}"
+        ".vtabs button{background:none;color:var(--muted);border:0;border-radius:0;padding:3px 12px;font-size:12px}.vtabs button.on{background:var(--accent2);color:var(--accent)}"
+        ".wm-svg{width:100%;height:auto;max-height:420px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:90px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"
+        ".wm-hit{fill:var(--accent);cursor:pointer}.wm-hit:hover,.wm-dot:hover{fill-opacity:1}.wm-dot{fill:var(--accent);stroke:var(--panel);stroke-width:1.5;cursor:pointer}"
+        ".wm-legend{display:flex;align-items:center;gap:8px;justify-content:flex-end;font-size:11px;color:var(--muted);margin-top:6px}"
+        ".wm-legend i{display:inline-block;width:90px;height:8px;border-radius:4px;background:linear-gradient(90deg,var(--accent2),var(--accent))}")
 CSS += (".kbd-btn{font-weight:600;width:22px;height:22px;border:1px solid var(--line)!important;border-radius:50%;display:inline-grid;place-items:center;padding:0!important}"
         ".kbd-help{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50}.kbd-help .card{width:340px}"
         ".kr{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line)}.kr:last-child{border:0}"
@@ -2037,6 +2076,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None}), "application/json")
         if path == "/static/app.css":
             return self.send(200, CSS, "text/css; charset=utf-8", cache=True)
+        if path == "/static/world-map.json":
+            try:
+                with open(os.path.join(STATIC_DIR, "world-map.json"), "rb") as fh:
+                    return self.send(200, fh.read(), "application/json", cache=True)
+            except OSError:
+                return self.send(404, "{}", "application/json")
         if path in ("/favicon.ico", "/static/icon.svg"):
             return self.send(200, ICON, "image/svg+xml", cache=True)
         if path == "/static/app.js":

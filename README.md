@@ -78,7 +78,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
 
 ## What you get
 
-- **Overview:** attackers per day, top attackers, latest shell sessions, top passwords, countries, how many took the bait, and **time wasted** (hours attackers spent stuck in the tarpit and in the fake shells, and who is stuck right now).
+- **Overview:** attackers per day, top attackers, latest shell sessions, top passwords, countries as a world map or a list (click a country to see its attackers), how many took the bait, and **time wasted** (hours attackers spent stuck in the tarpit and in the fake shells, and who is stuck right now).
 - **A page per attacker IP:**
   - country, network, reverse DNS, open ports and known CVEs (from Shodan InternetDB)
   - every password they tried
@@ -313,4 +313,6 @@ If Huginn is useful in your homelab, you can [buy me a coffee](https://buymeacof
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). You may use, change and share Huginn. If you share a modified version, or run one as a service for others, you must publish your changes under the same license.
+[AGPL-3.0-or-later](LICENSE). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
+
+You may use, change and share Huginn. If you share a modified version, or run one as a service for others, you must publish your changes under the same license.

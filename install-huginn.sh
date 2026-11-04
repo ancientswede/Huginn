@@ -91,6 +91,8 @@ install -d -m 755 /opt/huginn
 install -d -m 750 -o huginn -g huginn /opt/huginn/data
 install -d -m 700 -o huginn -g huginn /opt/huginn/.ssh
 install -m 644 "$HERE/app.py" /opt/huginn/app.py
+install -d -m 755 /opt/huginn/static
+install -m 644 "$HERE"/static/* /opt/huginn/static/
 install -m 644 "$HERE/systemd/huginn.service" /etc/systemd/system/huginn.service
 if [ ! -f /opt/huginn/.env ]; then
   cat > /opt/huginn/.env <<EOF
