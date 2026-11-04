@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.4.1"
+HUGINN_VERSION = "0.5.0"
 CHANGELOG = [
+    ("0.5.0", "2026-11-05", "Install scripts for the honeypot and Huginn. HUGINN_ALLOW_PRIVATE=1 for testing from your own LAN."),
     ("0.4.1", "2026-11-04", "Hardening: size caps on everything read from the honeypot, one bad file record no longer stops the sync."),
     ("0.4.0", "2026-11-04", "Time wasted: tarpit and fake-shell time per attacker, who is stuck right now. All site-specific settings moved to environment variables."),
     ("0.3.1", "2026-11-04", "Reads hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, SOCKS5) as decoy services."),
@@ -54,6 +55,8 @@ POLL = max(30, int(os.environ.get("HUGINN_POLL", "120")))
 RETENTION_DAYS = max(7, int(os.environ.get("HUGINN_RETENTION_DAYS", "180")))
 ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
+# Testing only: also record private/LAN source addresses (normally dropped so you never block yourself).
+ALLOW_PRIVATE = os.environ.get("HUGINN_ALLOW_PRIVATE", "0") == "1"
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
 os.environ["TZ"] = os.environ.get("HUGINN_TZ", "UTC")  # SQLite "localtime" (per-day grouping) follows the process TZ
@@ -175,7 +178,7 @@ def norm_ip(s):
         return None
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
-    if not a.is_global:  # our own / private addresses never enter the database
+    if not a.is_global and not (ALLOW_PRIVATE and a.is_private and not a.is_loopback):  # private addresses are dropped unless testing
         return None
     return str(a)
 
@@ -732,6 +735,10 @@ def enrich_loop():
                 "SELECT i.ip FROM ips i LEFT JOIN enrich e USING(ip) WHERE e.ip IS NULL OR e.fetched < ? "
                 "ORDER BY (e.ip IS NULL) DESC, i.last DESC LIMIT 25", (now - ENRICH_TTL,))]
             for ip in todo:
+                if not ipaddress.ip_address(ip).is_global:  # test mode (HUGINN_ALLOW_PRIVATE): never send LAN addresses out
+                    with con:
+                        con.execute("INSERT OR REPLACE INTO enrich(ip,fetched,ok) VALUES(?,?,1)", (ip, time.time()))
+                    continue
                 d, ok, research = enrich_ip(ip)
                 fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:

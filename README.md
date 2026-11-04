@@ -47,15 +47,59 @@ Huginn uses only the Python standard library and SQLite. There are no dependenci
 
 ## Requirements
 
-- **A honeypot host:** a VM or LXC on an isolated network or VLAN that can **not** reach your LAN. It needs:
-  - [Cowrie](https://github.com/cowrie/cowrie), required
-  - [OpenCanary](https://github.com/thinkst/opencanary), optional
-  - [endlessh](https://github.com/skeeto/endlessh), optional
-  - hp-traps from this repo, optional
-- **A Huginn host** on your LAN with Python 3.11+ and `ssh`. Debian 12/13 works out of the box.
-- Your router or firewall forwarding the ports you want attacked to the honeypot.
+You need **two machines**, VMs or LXC containers. That is on purpose: the honeypot will be broken into sooner or later. If Huginn, with your history and your blocklists, ran on the same machine, an attacker who escaped the fake shell would get both.
 
-## Install
+| | Honeypot | Huginn |
+|---|---|---|
+| OS | Debian 12 or 13 | Debian 12 or 13 |
+| CPU / RAM / disk | 1 core, 1–2 GB, 8 GB | 1 core, 512 MB–1 GB, 8 GB |
+| Network | **isolated** network/VLAN, no route to your LAN; internet ports forwarded to it | your normal LAN |
+| Reaches | the internet while installing | the honeypot's admin SSH port |
+
+**Proxmox:** use unprivileged LXC containers from the Debian template, with **nesting enabled** (the default in recent versions). The services use systemd sandboxing, which needs it.
+
+**Outbound internet for the honeypot:** the installer needs it. Afterwards you choose:
+- **Blocked** (recommended): attackers' downloads fail, so you only see the URLs they tried.
+- **Allowed:** Cowrie captures the malware itself. Never allow traffic to your LAN either way.
+
+## Quick start (about 10 minutes)
+
+Run each script as root from a clone of this repository. Both scripts can be run again safely, and they keep what is already done.
+
+**1. On the honeypot machine**
+
+```bash
+apt-get install -y git && git clone <this repository> Huginn && cd Huginn
+./install-honeypot.sh
+```
+
+The script asks before each optional part: OpenCanary, the endlessh tarpit and hp-traps. Then it:
+- Moves your admin SSH to **port 22022** and asks you to prove you can log in there **before** port 22 goes to the honeypot, so you cannot lock yourself out.
+- Installs Cowrie and redirects the public ports to the honeypot services.
+- Ends with the list of ports to forward in your router.
+
+From now on, log in with `ssh -p 22022 root@honeypot`.
+
+**2. On the Huginn machine**
+
+```bash
+apt-get install -y git && git clone <this repository> Huginn && cd Huginn
+./install-huginn.sh --honeypot <honeypot IP>
+```
+
+The script:
+1. Shows the honeypot's key fingerprint and asks you to compare it.
+2. Prints **one line** to run on the honeypot:
+   ```bash
+   hp-add-huginn-key 'ssh-ed25519 AAAA... huginn@...'
+   ```
+3. Waits until the honeypot accepts the key, starts Huginn and asks for the password for the web page.
+
+**3. Forward the ports** listed at the end of step 1 from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
+
+**Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
+
+## Manual install (what the scripts do)
 
 ### 1. On the honeypot
 
@@ -185,6 +229,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Bait values to watch for |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_TRUSTED_PROXIES` | – | Reverse proxy IPs allowed to set `X-Forwarded-*` |
+| `HUGINN_ALLOW_PRIVATE` | `0` | `1` = also record LAN source addresses (testing only; never blocklisted) |
 
 ## Security model
 
@@ -196,6 +241,11 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io. Set `HUGINN_ENRICH=0` to turn it off.
 
 **Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS`. Pick a retention you can justify.
+
+## Uninstall
+
+- **Huginn:** `systemctl disable --now huginn`, then `rm -rf /opt/huginn /etc/systemd/system/huginn.service`, then `userdel huginn`.
+- **Honeypot:** `systemctl disable --now cowrie opencanary endlessh hp-traps`. Remove the `include "/etc/huginn-honeypot.nft"` line from `/etc/nftables.conf`, then `nft -f /etc/nftables.conf`. Delete the `restrict,command="/usr/local/bin/hp-export"` line in `/root/.ssh/authorized_keys`.
 
 ## Commands
 

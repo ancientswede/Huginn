@@ -31,7 +31,7 @@ catfiles "$OPENCANARY_LOG*" | tail -n 10000
 echo "##ENDLESSH"
 journalctl -u "$ENDLESSH_UNIT" --no-pager -o cat --since "30 days ago" 2>/dev/null | grep -E " (ACCEPT|CLOSE) host=" | tail -n 20000
 echo "##NFT"
-nft list chain ip nat prerouting 2>/dev/null | grep -o "dport [^c]*counter packets [0-9]*"
+nft list ruleset 2>/dev/null | grep -o "dport [0-9]* counter packets [0-9]*"
 echo "##TRAPS"
 catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000
 echo "##FILES"
