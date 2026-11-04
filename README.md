@@ -69,7 +69,7 @@ OUT DROP -dest 172.16.0.0/12
 OUT DROP -dest 192.168.0.0/16                          # ...including your router's admin page
 ```
 
-Replies to connections that were made *to* the honeypot still work, because the firewall tracks them. Internet traffic still goes out through your router: it is the router's address as a *destination* that is blocked, not its use as gateway. Give the honeypot a public DNS server (for example `1.1.1.1`) instead of your router. Then run the isolation test above.
+Replies to connections that were made *to* the honeypot still work, because the firewall tracks them. Internet traffic still goes out through your router: it is the router's address as a *destination* that is blocked, not its use as gateway. Give the honeypot a **static IP address** and a public DNS server (for example `1.1.1.1`) instead of your router. With DHCP, the lease renewal to your router would be blocked too, and the honeypot would drop off the network after a while. Then run the isolation test above.
 
 **About the blocklists:**
 - They only help where you **apply** them, on the firewall in front of your *real* services.
