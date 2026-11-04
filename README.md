@@ -32,7 +32,7 @@ A honeypot **invites attacks on purpose**. Port forwarding from the internet int
 
 Only open ports when **all** of this is true:
 
-- **The honeypot is truly isolated.** It is on its own VLAN or network, and your firewall blocks every connection from it to your LAN, your router's admin page, your NAS and your other VLANs. "Different subnet" alone is not isolation. **Test it** from the honeypot. Every one of these must fail:
+- **The honeypot is truly isolated.** Use its own VLAN (best) or the hypervisor's firewall (see [How to isolate the honeypot](#how-to-isolate-the-honeypot)), so it cannot open connections to your LAN, your router's admin page, your NAS or your other VLANs. A correct port forward alone is not isolation, and neither is a different subnet. **Test it** from the honeypot. Every one of these must fail:
   ```bash
   ping -c1 <a LAN machine>      # must time out
   nc -zv -w3 <your router> 80   # must fail
@@ -42,6 +42,34 @@ Only open ports when **all** of this is true:
 - **You keep it up to date.** Patch the honeypot (`apt upgrade`) and Cowrie (`git pull`). Rebuild it if anything looks wrong. Consider blocking its outbound internet once it is installed.
 - **You are allowed to.** Some internet providers forbid running servers or block port 25. In many countries, IP addresses are personal data (GDPR), so keep the retention short.
 - **You accept the risk.** Huginn comes with **no warranty** (see sections 15–16 of the [license](LICENSE)). You are responsible for your own network.
+
+### How to isolate the honeypot
+
+Getting the port forward right in your router only controls what comes **in**. Isolation is about what a successful attacker can reach **from** the honeypot. Pick one of these:
+
+| | How | Verdict |
+|---|---|---|
+| **1. Own VLAN** | Put the honeypot on its own VLAN (UniFi, OPNsense, pfSense, MikroTik, most managed switches). Add firewall rules: honeypot VLAN → LAN/other VLANs/router = **block**, LAN → honeypot = allow only Huginn to the admin port. | **Best.** The network itself keeps it apart. |
+| **2. Hypervisor firewall** | No VLAN-capable gear? Keep the honeypot on your normal network, but block it from your LAN with the firewall of the *host* it runs on (Proxmox example below). Rules inside the honeypot itself do not count: an attacker with root just turns them off. | **Acceptable.** It is still on your LAN segment, so get the rules right and test them. |
+| **3. Nothing** | Honeypot on the same network as everything else, only a port forward. | **Don't.** One escape from the fake shell and the attacker is inside your home network. |
+
+**Proxmox firewall example (option 2).** Turn on the firewall under Datacenter → Firewall, and on the container's network device (`firewall=1`). Then create `/etc/pve/firewall/<CTID>.fw` on the Proxmox host. Replace `192.168.1.0/24` with your LAN, `192.168.1.50` with Huginn's address and `22022` with your admin port:
+
+```
+[OPTIONS]
+enable: 1
+policy_in: ACCEPT
+policy_out: ACCEPT
+
+[RULES]
+IN ACCEPT -source 192.168.1.50 -p tcp -dport 22022   # Huginn may pull the export
+IN DROP -p tcp -dport 22022                           # nobody else reaches admin SSH
+OUT DROP -dest 10.0.0.0/8                              # no private networks at all...
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16                          # ...including your router's admin page
+```
+
+Replies to connections that were made *to* the honeypot still work, because the firewall tracks them. Internet traffic still goes out through your router: it is the router's address as a *destination* that is blocked, not its use as gateway. Give the honeypot a public DNS server (for example `1.1.1.1`) instead of your router. Then run the isolation test above.
 
 **About the blocklists:**
 - They only help where you **apply** them, on the firewall in front of your *real* services.
@@ -76,7 +104,7 @@ You need **two machines**, VMs or LXC containers. That is on purpose: the honeyp
 |---|---|---|
 | OS | Debian 12 or 13 | Debian 12 or 13 |
 | CPU / RAM / disk | 1 core, 1–2 GB, 8 GB | 1 core, 512 MB–1 GB, 8 GB |
-| Network | **isolated** network/VLAN, no route to your LAN; internet ports forwarded to it | your normal LAN |
+| Network | **isolated**: own VLAN (best) or blocked from your LAN by the hypervisor firewall, see [How to isolate](#how-to-isolate-the-honeypot); internet ports forwarded to it | your normal LAN |
 | Reaches | the internet while installing | the honeypot's admin SSH port |
 
 **Proxmox:** use unprivileged LXC containers from the Debian template, with **nesting enabled** (the default in recent versions). The services use systemd sandboxing, which needs it.
