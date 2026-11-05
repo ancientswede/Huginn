@@ -298,6 +298,8 @@ def link(m):
         target = "api/tty/%s.json" % path[9:]
     if target is None:
         return '%s=%s#%s' % (attr, q, q)          # account, exports, feeds, logout: not part of the demo
+    if path.startswith("/static/") and u.query:
+        target += "?" + u.query                  # keep app.css?v=<version>: static hosts cache CSS for a long time
     return "%s=%s%s%s%s" % (attr, q, P(target), frag, q)
 
 
