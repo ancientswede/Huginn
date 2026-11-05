@@ -386,6 +386,8 @@ css = app.CSS + (".demo-banner{background:#2f5bb7;color:#fff;text-align:center;p
 save("static/app.css", css)
 save("static/app.js", js)
 save("static/icon.svg", app.ICON)
+for _ic in ("icon-32.png", "icon-180.png", "icon-192.png"):
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(app.__file__)), "static", _ic), os.path.join(OUT, "static", _ic))
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(app.__file__)), "static", "world-map.json"), os.path.join(OUT, "static", "world-map.json"))
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(app.__file__)), "static", "world-map.LICENSE.md"), os.path.join(OUT, "static", "world-map.LICENSE.md"))
 save("robots.txt", "User-agent: *\nDisallow:\n")

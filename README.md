@@ -1,4 +1,4 @@
-# Huginn
+<h1 align="center"><img src="docs/banner.png" alt="Huginn: attacker intelligence for a homelab honeypot" width="100%"></h1>
 
 [![Tests](https://github.com/ancientswede/Huginn/actions/workflows/ci.yml/badge.svg)](https://github.com/ancientswede/Huginn/actions/workflows/ci.yml)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/ancientswede)
@@ -468,5 +468,7 @@ If Huginn is useful in your homelab, you can [buy me a coffee](https://buymeacof
 ## License
 
 Copyright © 2026 Ancientswede. Licensed under [AGPL-3.0-or-later](LICENSE). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
+
+The raven logo and the banner were made for this project with Grok Imagine and are shared under the same license.
 
 You may use, change and share Huginn. If you share a modified version, or run one as a service for others, you must publish your changes under the same license and keep the copyright notice (the footer on every page counts as one).

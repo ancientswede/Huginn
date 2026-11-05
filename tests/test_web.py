@@ -99,6 +99,13 @@ class Web(unittest.TestCase):
         self.assertEqual(r.status, 200)
         self.assertNotIn("<script>", body)
 
+    def test_icons(self):
+        for p in ("/favicon.ico", "/static/icon-32.png", "/static/icon-192.png"):
+            r, _ = self.req("GET", p)                                 # public, like the CSS
+            self.assertEqual((p, r.status, r.getheader("Content-Type")), (p, 200, "image/png"))
+        r, body = self.req("GET", "/login")
+        self.assertIn("icon-32.png", body)
+
     def test_feed_token(self):
         tok = app.get_meta(app.connect(), "feed_token")
         r, body = self.req("GET", "/feed/%s/txt" % tok)

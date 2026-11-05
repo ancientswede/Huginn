@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.12.2"
+HUGINN_VERSION = "0.12.3"
 CHANGELOG = [
+    ("0.12.3", "2026-11-05", "Huginn has a logo: the raven as tab icon, next to the name in the header and on the login page. README banner."),
     ("0.12.2", "2026-11-05", "The bar charts show the number above each bar (no need to hover), sharp at any screen size."),
     ("0.12.1", "2026-11-05", "Fix: copying session recordings in batches stopped at the first batch (bytes vs. text)."),
     ("0.12.0", "2026-11-05", "Disk housekeeping. Honeypot: hp-logclean gzips Cowrie's logs and keeps 30 days, OpenCanary's log is rotated compressed, the journal is capped. Huginn: copies every session recording in the background and keeps it compressed, HUGINN_RETENTION_DAYS=0 keeps the whole history forever, the Account page shows database size and free disk, updates keep only one database backup."),
@@ -1212,9 +1213,9 @@ def page(title, body, active="/"):
     nav = "".join('<a href="%s"%s>%s</a>' % (h, ' class="on"' if h == active else "", esc(t)) for h, t in NAV)
     return ("<!doctype html><html lang=en%s><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s · %s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'>"
+            "<title>%s · %s</title><link rel=icon type=image/png sizes=32x32 href='/static/icon-32.png'><link rel=apple-touch-icon href='/static/icon-180.png'><link rel=stylesheet href='/static/app.css?v=%s'>"
             "<script src='/static/app.js?v=%s' defer></script></head><body>"
-            "<header><div class=brand><a href='/'>%s</a></div><nav>%s</nav>"
+            "<header><div class=brand><a href='/'><img class=brand-ic src='/static/icon-32.png' alt=''>%s</a></div><nav>%s</nav>"
             "<div class=hdr-right>%s<span class=muted>v%s</span>%s%s"
             "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
@@ -2164,8 +2165,8 @@ def save_settings(f, lists):
 def v_login(err=""):
     st = settings()
     return ("<!doctype html><html lang=en%s><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'></head><body class=login>"
-            "<form method=post action='/login' class='card loginbox'><h1>%s</h1>%s"
+            "<title>%s</title><link rel=icon type=image/png sizes=32x32 href='/static/icon-32.png'><link rel=apple-touch-icon href='/static/icon-180.png'><link rel=stylesheet href='/static/app.css?v=%s'></head><body class=login>"
+            "<form method=post action='/login' class='card loginbox'><img class=login-ic src='/static/icon-192.png' alt=''><h1>%s</h1>%s"
             "<input type=password name=password placeholder=Password autofocus autocomplete=current-password required>"
             "<button>Log in</button></form>%s</body></html>") % (html_attrs(st), esc(st["title"]), HUGINN_VERSION, esc(st["title"]),
                                                               '<p class=err>%s</p>' % esc(err) if err else "", footer())
@@ -2190,6 +2191,7 @@ CSS = r"""
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .mono,code{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;font-size:12.5px}
+.brand a{display:flex;align-items:center;gap:9px}.brand-ic{width:24px;height:24px;border-radius:6px;display:block}.login-ic{width:72px;height:72px;border-radius:16px;align-self:center;margin-bottom:4px}
 .muted{color:var(--muted)}.small{font-size:12px}
 header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:24px;padding:0 24px;height:52px;background:var(--panel);border-bottom:1px solid var(--line)}
 .brand a{font-weight:650;letter-spacing:.3px;color:var(--text);font-size:16px}
@@ -2253,7 +2255,7 @@ details.sess:target,details.sess.hl{border-color:var(--accent)}
 .feed{padding:10px 0;border-bottom:1px solid var(--line)}.feed-h{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .url{margin:4px 0;color:var(--muted);overflow-wrap:anywhere}.inline{margin-top:12px}
 .preview{display:flex;flex-wrap:wrap;gap:4px 14px;max-height:300px;overflow:auto}
-body.login{display:grid;place-items:center;min-height:100vh}.loginbox{width:320px;display:flex;flex-direction:column;gap:12px}.loginbox h1{margin:0 0 4px}
+body.login{display:grid;place-items:center;min-height:100vh}.loginbox{width:320px;display:flex;flex-direction:column;gap:12px}.loginbox h1{margin:0 0 4px;text-align:center}
 .err{color:var(--red);margin:0}
 @media (max-width:1000px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.grid,.grid3{grid-template-columns:minmax(0,1fr)}.span2{grid-column:auto}
 header{padding:0 16px;gap:12px}main{padding:16px}.card{overflow-x:auto}.hdr-right .muted{display:none}.rel{flex-direction:column;gap:4px}.kv{grid-template-columns:110px 1fr}}
@@ -2509,7 +2511,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, fh.read(), "application/json", cache=True)
             except OSError:
                 return self.send(404, "{}", "application/json")
-        if path in ("/favicon.ico", "/static/icon.svg"):
+        m = re.fullmatch(r"/static/icon-(32|180|192)\.png|/favicon\.ico", path)
+        if m:
+            try:
+                with open(os.path.join(STATIC_DIR, "icon-%s.png" % (m.group(1) or "32")), "rb") as fh:
+                    return self.send(200, fh.read(), "image/png", cache=True)
+            except OSError:
+                return self.send(200, ICON, "image/svg+xml", cache=True)
+        if path == "/static/icon.svg":
             return self.send(200, ICON, "image/svg+xml", cache=True)
         if path == "/static/app.js":
             return self.send(200, JS, "application/javascript; charset=utf-8", cache=True)
