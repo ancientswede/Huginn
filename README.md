@@ -7,6 +7,8 @@
 
 **[See the live demo →](https://ancientswede.se/huginn/)** (made-up data, read-only)
 
+*Built with Claude (AI) and run every day on my own honeypot — see [How Huginn is made](#how-huginn-is-made).*
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/overview-dark.png">
   <img alt="Huginn overview: attackers per day, world map and top attackers" src="docs/screenshots/overview-light.png">
@@ -487,6 +489,15 @@ app.py import FILE...        # import full cowrie.json* / opencanary.log* files
 ./uninstall-huginn.sh [--purge]                  # remove Huginn (keeps the data unless --purge)
 ./uninstall-honeypot.sh [--purge] [--restore-ssh]   # remove the honeypot side
 ```
+
+## How Huginn is made
+
+Huginn is written with [Claude](https://claude.ai), Anthropic's AI, using Claude Code. I (Ancientswede) decide what it should do, run it on my own honeypot every day and report what breaks or looks wrong. Claude writes the code, the tests and the documentation, and the commits say so (`Co-Authored-By: Claude`).
+
+Nothing is released before it has run on my own honeypot and Huginn, and it is tested end to end on fresh test machines for the install, update, uninstall and Docker paths. Even so, this is a security tool that faces the internet, so:
+
+- **Read before you trust it.** Huginn is small on purpose: one Python file with only the standard library, a few shell scripts, 70+ tests and CI on every change. The [Security model](#security-model) explains what can reach what.
+- **Bugs and ideas** are welcome as issues. Security problems: please report them privately (see [SECURITY.md](SECURITY.md)).
 
 ## Support
 
