@@ -46,7 +46,7 @@ Only open ports when **all** of this is true:
   nc -zv -w3 <your router> 80   # must fail
   nc -zv -w3 <your NAS> 445     # must fail
   ```
-- **You forward only to the honeypot**, and only the ports the installer lists. Never forward its admin SSH port. Never forward anything to Huginn: Huginn stays on your LAN or VPN.
+- **You forward only to the honeypot**, and only the ports in [Ports to forward](#ports-to-forward). Never forward its admin SSH port. Never forward anything to Huginn: Huginn stays on your LAN or VPN.
 - **You keep it up to date.** Patch the honeypot (`apt upgrade`) and Cowrie (`git pull`). Rebuild it if anything looks wrong. Consider blocking its outbound internet once it is installed.
 - **You are allowed to.** Some internet providers forbid running servers or block port 25. In many countries, IP addresses are personal data (GDPR), so keep the retention short.
 - **You accept the risk.** Huginn comes with **no warranty** (see sections 15–16 of the [license](LICENSE)). You are responsible for your own network.
@@ -172,7 +172,7 @@ The script:
    ```
 3. Waits until the honeypot accepts the key, starts Huginn and asks for the password for the web page.
 
-**3. Forward the ports**, but only after you have read [the warning above](#️-read-this-before-you-open-any-ports) and **tested the isolation**. Forward the ports listed at the end of step 1 from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
+**3. Forward the ports**, but only after you have read [the warning above](#️-read-this-before-you-open-any-ports) and **tested the isolation**. Forward the ports in [Ports to forward](#ports-to-forward) (also listed at the end of step 1) from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
 
 **Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
 
@@ -257,6 +257,31 @@ Huginn can push a short summary to [ntfy](https://ntfy.sh), the phone app, when 
 - **Later:** add `HUGINN_NTFY_URL` to `/opt/huginn/.env` (and `HUGINN_NTFY_TOKEN` if your server uses access control), then run `systemctl restart huginn`.
 - **Choose which events** you get, or send a test, on the **Settings** page.
 - **Your own ntfy server** in the homelab is the most private option. On the public `ntfy.sh`, anyone who guesses the topic name can read your messages, so use a long random name like the one the installer suggests. The messages only contain counts and attacker IPs, never your own addresses.
+
+## Ports to forward
+
+Forward these **TCP** ports from the internet to the honeypot, and only the rows for the parts you installed. The installer prints the same list at the end. Inside the honeypot, nftables passes each port on to the service that pretends to be there.
+
+| Public port | Pretends to be | Part | Inside the honeypot |
+|---|---|---|---|
+| 22 | SSH (server or file-server persona) | Cowrie, always | 2225 |
+| 23 | Telnet (IP camera persona) | Cowrie, always | 2323 |
+| 2222 | SSH tarpit: keeps scanners stuck for hours | endlessh | 2224 |
+| 21 | FTP | OpenCanary | 2121 |
+| 80 | Web login page (a NAS) | OpenCanary | 8080 |
+| 443 | The same over HTTPS (self-signed, generic name) | OpenCanary | 8443 |
+| 8080 | Web, alternative port | OpenCanary | 8080 |
+| 3306 | MySQL | OpenCanary | 3306 |
+| 5900 | VNC | OpenCanary | 5900 |
+| 6379 | Redis | OpenCanary | 6379 |
+| 25 | SMTP mail server (open-relay bait, never sends) | hp-traps | 2525 |
+| 587 | Mail submission | hp-traps | 2587 |
+| 110 | POP3 | hp-traps | 2110 |
+| 143 | IMAP | hp-traps | 2143 |
+| 5432 | PostgreSQL | hp-traps | 5432 |
+| 1080 | SOCKS5 proxy (always refuses) | hp-traps | 1080 |
+
+**Never forward** the honeypot's admin SSH port (22022 by default), and never forward anything to Huginn. Forward a port to the same port number on the honeypot (22 → 22, not 22 → 2225): the redirects inside take care of the rest. Some providers block port 25; the rest still works. All of this is TCP; UDP is not needed.
 
 ## Updating
 

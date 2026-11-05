@@ -423,6 +423,13 @@ if [ "$WITH_TRAPS" = yes ]; then
   install -d -m 755 /opt/hp-traps
   install -m 644 "$HERE/honeypot/hp-traps.py" /opt/hp-traps/hp-traps.py
   [ -f /etc/systemd/system/hp-traps.service ] || install -m 644 "$HERE/systemd/hp-traps.service" /etc/systemd/system/hp-traps.service
+  # The fake mail server greets with a name that fits the persona (the default, mail.example.com, gives the honeypot away).
+  MAIL_HOST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mail_host",""))' "$P/persona-$PERSONA/persona.json" 2>/dev/null || true)
+  if [ -n "$MAIL_HOST" ]; then
+    install -d /etc/systemd/system/hp-traps.service.d
+    printf '[Service]\nEnvironment=TRAPS_HOSTNAME=%s\n' "$MAIL_HOST" > /etc/systemd/system/hp-traps.service.d/huginn.conf
+    ok "mail server name: $MAIL_HOST"
+  fi
   start_svc hp-traps
 fi
 

@@ -161,7 +161,7 @@ def server():
     return f, {"hostname": host, "kernel_version": kernel, "kernel_build_string": "#%d-Ubuntu SMP PREEMPT_DYNAMIC" % R.randint(100, 160),
                "hardware_platform": "x86_64", "arch": "linux-x64-lsb", "ssh_version": "OpenSSH_%s, OpenSSL %s" % (sshv.split()[0], sslv),
                "ssh_banner": "SSH-2.0-OpenSSH_" + sshv, "cpus": cores, "cpu_model": model,
-               "users": ["ubuntu", deploy],
+               "users": ["ubuntu", deploy], "mail_host": "mail.%s.internal" % app,
                "commands": {"usr/bin/mysql": "ERROR 2003 (HY000): Can't connect to MySQL server on '%s:3306' (110)\n" % ip["db"],
                             "usr/bin/mysqldump": "mysqldump: Got error: 2003: \"Can't connect to MySQL server on '%s:3306' (110)\" when trying to connect\n" % ip["db"],
                             "usr/bin/redis-cli": "Could not connect to Redis at %s:6379: Connection timed out\n" % ip["redis"],
@@ -216,6 +216,7 @@ def nas():
     return f, {"hostname": host, "kernel_version": kernel, "kernel_build_string": "#1 SMP PREEMPT_DYNAMIC Debian 6.1.%d-1" % R.randint(90, 130),
                "hardware_platform": "x86_64", "arch": "linux-x64-lsb", "ssh_version": "OpenSSH_%s, OpenSSL 3.0.15 3 Sep 2024" % sshv,
                "ssh_banner": "SSH-2.0-OpenSSH_" + sshv, "cpus": cores, "cpu_model": model, "users": [user],
+               "mail_host": "mail.%s.lan" % pick(["home", "office", "family", "local", "workgroup"]),
                "commands": {"usr/bin/rclone": "ERROR : : error reading source root directory: couldn't list files: Get \"https://api.backblazeb2.com/\": dial tcp: i/o timeout\n",
                             "usr/bin/mysql": "ERROR 2002 (HY000): Can't connect to local server through socket '/run/mysqld/mysqld.sock' (2)\n",
                             "usr/bin/smbpasswd": "Failed to find entry for user %s.\n" % user}}, bait

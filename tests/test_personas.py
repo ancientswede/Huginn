@@ -110,6 +110,12 @@ class Personas(unittest.TestCase):
                 self.assertLessEqual(info["cpus"], 16)
             shutil.rmtree(os.path.join(self.d, "cpu"))
 
+    def test_mail_host(self):
+        for name in ("server", "nas"):
+            _, info = self.make(name, "m-" + name)
+            self.assertRegex(info["mail_host"], r"^mail\.[a-z]+\.(internal|lan)$")
+            self.assertNotIn("example", info["mail_host"])
+
     def test_camera_banner(self):
         out, _ = self.make("camera")
         with open(os.path.join(out, "honeyfs", "etc", "motd")) as fh:

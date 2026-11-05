@@ -83,6 +83,7 @@ if [ "$PURGE" = 1 ] && grep -qs "Written by Huginn" /etc/endlessh/config; then
   rm -rf /etc/endlessh
   ok "removed the endlessh package"
 fi
+rm -rf /etc/systemd/system/hp-traps.service.d
 systemctl daemon-reload
 rm -f /etc/logrotate.d/opencanary
 
