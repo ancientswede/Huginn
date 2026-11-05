@@ -1,5 +1,5 @@
 # The web server: login, CSRF protection, feed tokens, security headers and that every page renders.
-import http.client, threading, time, unittest, urllib.parse
+import http.client, json, threading, time, unittest, urllib.parse
 from http.server import ThreadingHTTPServer
 
 from tests.helpers import app
@@ -83,6 +83,21 @@ class Web(unittest.TestCase):
             self.assertIn(r.status, (200, 400, 404), p)
             if r.status == 200:
                 self.assertIn("Source on GitHub", body, p)
+
+    def test_creds_endpoints(self):
+        r, body = self.get("/api/creds-check/%s.json" % ("0" * app.CRED_PREFIX))
+        self.assertEqual(r.status, 200)
+        self.assertIn("matches", json.loads(body))
+        r, _ = self.req("GET", "/api/creds-check/0000.json")
+        self.assertEqual(r.status, 303)                              # needs login like everything else
+        r, _ = self.get("/api/creds-check/zz.json")
+        self.assertEqual(r.status, 404)
+        r, body = self.get("/creds/export.txt?what=usernames&days=7")
+        self.assertEqual(r.status, 200)
+        self.assertIn("attachment", r.getheader("Content-Disposition"))
+        r, body = self.get("/creds?q=%3Cscript%3E")
+        self.assertEqual(r.status, 200)
+        self.assertNotIn("<script>", body)
 
     def test_feed_token(self):
         tok = app.get_meta(app.connect(), "feed_token")

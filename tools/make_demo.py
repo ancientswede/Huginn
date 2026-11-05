@@ -292,6 +292,8 @@ def link(m):
         target = path[1:] + ".html"
     elif path.startswith("/static/"):
         target = path[1:]
+    elif path == "/api/creds-check/":
+        target = "api/creds-check/"
     elif path.startswith("/api/tty/"):
         target = "api/tty/%s.json" % path[9:]
     if target is None:
@@ -343,7 +345,15 @@ for kind, sql in (("script", "SELECT DISTINCT cmdhash FROM sessions WHERE cmdhas
         if out:
             save("campaign/%s/%s.html" % (kind, v), fix(out))
 save("files.html", fix(app.v_files()))
-save("creds.html", fix(app.v_creds({"days": "7"})))
+# The password check works in the demo too: one static answer per hash prefix (missing prefix = not found).
+creds = fix(app.v_creds({"days": "7"}))
+creds = re.sub(r'<div class="card"><h3>Search and export</h3>.*?</div></div>',
+               '<div class="card"><h3>Search and export</h3><p class="muted">In your own Huginn: search every username and password, '
+               'and export them as word lists or CSV.</p><p class="muted small">Try the check on the left with a common password like '
+               '<span class=mono>123456</span> or <span class=mono>admin</span>.</p></div></div>', creds, count=1, flags=re.S)
+save("creds.html", creds)
+for prefix in app.cred_index(con)["buckets"]:
+    save("api/creds-check/%s.json" % prefix, json.dumps(app.cred_check(con, prefix)))
 save("blocklist.html", fix(app.v_blocklist(FakeHandler(), {})))
 save("settings.html", fix(app.v_settings()))
 for sha, frames in TTY.items():
@@ -364,7 +374,7 @@ js += r"""
 var b=document.querySelector('.theme-btn');if(b){b.lastChild.textContent=t.charAt(0).toUpperCase()+t.slice(1);var i=b.querySelector('.ti');if(i)i.className='ti ti-'+t}}
 var cur='auto';try{cur=localStorage.getItem('hgDemoTheme')||'auto'}catch(e){}apply(cur);
 var note=null;function toast(m){if(!note){note=document.createElement('div');note.className='demo-toast';document.body.appendChild(note)}note.textContent=m;note.classList.add('on');clearTimeout(note._t);note._t=setTimeout(function(){note.classList.remove('on')},2400)}
-document.addEventListener('submit',function(e){e.preventDefault();var a=e.target.getAttribute('action')||'';
+document.addEventListener('submit',function(e){e.preventDefault();if(e.target.id==='pwcheck')return;var a=e.target.getAttribute('action')||'';
 if(a.indexOf('theme')>=0||e.target.querySelector('.theme-btn')){cur=order[(order.indexOf(cur)+1)%3];apply(cur);try{localStorage.setItem('hgDemoTheme',cur)}catch(x){}return}
 toast('This is a read-only demo — install Huginn to use filters and settings.')},true);
 document.addEventListener('click',function(e){var a=e.target.closest('a');if(a&&a.getAttribute('href')==='#'){e.preventDefault();toast('Not available in the demo.')}})})();

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.10.1"
+HUGINN_VERSION = "0.11.0"
 CHANGELOG = [
+    ("0.11.0", "2026-11-05", "Credentials: \"Is my password in here?\" checks a password against everything attackers tried, in the browser (only 4 characters of its SHA-256 hash are sent). Search all usernames and passwords, and export them as word lists or a CSV of every attempt."),
     ("0.10.1", "2026-11-05", "Personas look more real: CPU count fits the CPU model, the tools in the bash history exist (and fail like a real network problem), the camera shows a BusyBox banner. Huginn remembers bait from earlier honeypot identities, so old attackers keep their took-bait tag. New uninstall-huginn.sh and uninstall-honeypot.sh."),
     ("0.10.0", "2026-11-05", "Ready-made personas with planted bait: the honeypot installer makes SSH a server or file server and Telnet an IP camera, with a random hostname, network, hardware and bait values for every install. The honeypot announces its personas and bait to Huginn, so bait detection works without setup. Tests and CI."),
     ("0.9.1", "2026-11-05", "Footer on every page: copyright, license (AGPL-3.0, no warranty) and a link to the source code, as the AGPL asks of network software."),
@@ -1520,12 +1521,15 @@ def export_ip(ip):
     }
 
 
+def csv_safe(v):
+    # Attacker text must not become a spreadsheet formula (CSV injection).
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
 def export_csv(data):
     import csv, io
-    def safe(v):
-        # Attacker text must not become a spreadsheet formula (CSV injection).
-        v = "" if v is None else str(v)
-        return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+    safe = csv_safe
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["time", "ip", "source", "kind", "session", "value", "detail"])
@@ -1577,14 +1581,139 @@ def v_creds(qs):
     td = lambda k, n=80: (lambda r: "<td class=mono>%s</td>" % esc(clean(r[k], n)))
     tn = lambda k: (lambda r: "<td class=num>%s</td>" % num(r[k]))
     tabs = " ".join('<a class="chip%s" href="/creds?days=%s">%s</a>' % (" on" if d == days else "", d, l) for d, l in [("1", "24h"), ("7", "7 days"), ("30", "30 days"), ("all", "All")])
-    body = ('<h1>Credentials</h1><div class="chips">%s</div><div class="grid3">'
+    q = (qs.get("q") or "").strip()[:100]
+    search = ""
+    if q:
+        found, total = cred_search(con, q)
+        rows = "".join("<tr><td>%s</td><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
+                       % (esc(svc), esc(clean(u, 60)), esc(clean(pw, 60)), num(d["n"]), num(len(d["ips"])), esc(ago(d["last"])))
+                       for (svc, u, pw), d in found)
+        search = ('<div class="card"><h3>Search: %s <span class=muted>%s matches%s</span></h3><table><thead><tr><th>Service</th><th>User</th><th>Password</th>'
+                  '<th class=num>Tries</th><th class=num>IPs</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
+                  % (esc(q), num(total), ", first 200" if total > 200 else "", rows or '<tr><td colspan=6 class=muted>Nothing found.</td></tr>'))
+    exp = " · ".join('<a href="/creds/export.%s?days=%s%s">%s</a>' % (ext, days, ("&what=" + w) if w else "", lab)
+                     for ext, w, lab in [("txt", "passwords", "Passwords (word list)"), ("txt", "usernames", "Usernames (word list)"), ("csv", "", "Every attempt (CSV)")])
+    check = ('<div class="grid2"><div class="card"><h3>Is my password in here?</h3>'
+             '<form class="pwcheck" id="pwcheck" data-src="/api/creds-check/" data-prefix="%d"><input type="password" id="pwc-in" autocomplete="off" '
+             'placeholder="Type a password to check" aria-label="Password to check"> <button type=submit>Check</button></form>'
+             '<div id="pwc-out" class="pwc-out" aria-live="polite"></div>'
+             '<p class="muted small">Checked in your browser. Only the first %d characters of its SHA-256 hash are sent to Huginn, '
+             'never the password itself. Exact match, case-sensitive.</p></div>'
+             '<div class="card"><h3>Search and export</h3><form method=get action="/creds" class="pwcheck"><input name=q value="%s" '
+             'placeholder="Search usernames and passwords" aria-label="Search"><input type=hidden name=days value="%s"> <button type=submit>Search</button></form>'
+             '<p class="muted small">For words like your name, domain or company. Do not type real passwords here: the search is sent to Huginn. '
+             'Use the check on the left instead.</p><p class=small>Export (%s): %s</p></div></div>'
+             % (CRED_PREFIX, CRED_PREFIX, esc(q), esc(days), {"1": "24h", "7": "7 days", "30": "30 days", "all": "all"}[days], exp))
+    body = ('<h1>Credentials</h1><div class="chips">%s</div>' % tabs) + check + search + ('<div class="grid3">'
             '<div class="card"><h3>Usernames</h3><table><thead><tr><th>User</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
             '<div class="card"><h3>Passwords</h3><table><thead><tr><th>Password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
             '<div class="card"><h3>Pairs (SSH/Telnet)</h3><table><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
             '<div class="card"><h3>Other services (FTP, HTTP, MySQL…)</h3><table><thead><tr><th>Service</th><th>User / password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div></div>'
-            % (tabs, t(users, [td("a"), tn("n"), tn("nip")]), t(pws, [td("b"), tn("n"), tn("nip")]),
+            % (t(users, [td("a"), tn("n"), tn("nip")]), t(pws, [td("b"), tn("n"), tn("nip")]),
                t(pairs, [td("a", 40), td("b", 40), tn("n"), tn("nip")]), t(canary, [td("svc", 10), td("b", 80), tn("n"), tn("nip")])))
     return page("Credentials", body, "/creds")
+
+
+# ---------------------------------------------------------------- every password attackers tried
+# "Is my password in here?": the browser hashes the password (SHA-256) and sends only the first CRED_PREFIX hex
+# characters. Huginn answers with every tried password whose hash starts the same way, and the browser compares the
+# rest itself. Your password never leaves the browser, so it cannot end up in a log, a proxy or Huginn's database.
+CRED_PREFIX = 4
+_cred_lock = threading.Lock()
+_cred_cache = {"key": None}
+
+
+def cred_rows(con, since=0):
+    # Every login attempt on every service: (ts, ip, service, user, password, accepted).
+    out = []
+    q = ("SELECT e.ts, e.ip, e.src, e.kind, e.a, e.b, s.proto FROM events e LEFT JOIN sessions s ON s.session = e.session "
+         "WHERE e.ts >= ? AND (e.kind IN ('login_ok','login_fail') OR (e.kind = 'canary' AND e.b LIKE '% / %')) ORDER BY e.ts")
+    for ts, ip, src, kind, a, b, proto in con.execute(q, (since,)):
+        if kind == "canary":
+            user, _, pw = (b or "").partition(" / ")
+            if src == "traps":
+                pw = re.sub(r"  \(db .*\)$", "", pw)
+            svc = a or "?"
+        else:
+            user, pw, svc = a or "", b or "", proto or "ssh"
+        if user or pw:
+            out.append((ts, ip, svc, user, pw, kind == "login_ok"))
+    return out
+
+
+def pw_hash(pw):
+    return hashlib.sha256(pw.encode("utf-8", "replace")).hexdigest()
+
+
+def cred_index(con):
+    key = "%s|%s" % (get_meta(con, "last_ingest", ""), con.execute("SELECT COUNT(*) FROM events WHERE kind IN ('login_ok','login_fail','canary')").fetchone()[0])
+    with _cred_lock:
+        if _cred_cache["key"] == key:
+            return _cred_cache
+        agg, oldest = {}, None
+        for ts, ip, svc, user, pw, ok in cred_rows(con):
+            if not pw:
+                continue
+            oldest = ts if oldest is None else min(oldest, ts)
+            d = agg.get(pw)
+            if d is None:
+                d = agg[pw] = {"tries": 0, "ok": 0, "ips": set(), "first": ts, "last": ts, "svcs": {}, "users": {}}
+            d["tries"] += 1
+            d["ok"] += 1 if ok else 0
+            d["ips"].add(ip)
+            d["last"] = max(d["last"], ts)
+            d["svcs"][svc] = d["svcs"].get(svc, 0) + 1
+            d["users"][user] = d["users"].get(user, 0) + 1
+        buckets = {}
+        for pw, d in agg.items():
+            h = pw_hash(pw)
+            buckets.setdefault(h[:CRED_PREFIX], []).append((h[CRED_PREFIX:], d))
+        _cred_cache.clear()
+        _cred_cache.update(key=key, buckets=buckets, distinct=len(agg), oldest=oldest)
+        return _cred_cache
+
+
+def cred_check(con, prefix):
+    idx = cred_index(con)
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    matches = [{"s": suf, "tries": d["tries"], "accepted": d["ok"], "ips": len(d["ips"]), "first": iso(d["first"]), "last": iso(d["last"]),
+                "services": sorted(d["svcs"], key=lambda k: -d["svcs"][k])[:8],
+                "users": [[u, n] for u, n in sorted(d["users"].items(), key=lambda x: -x[1])[:10]]}
+               for suf, d in idx["buckets"].get(prefix, [])]
+    return {"distinct": idx["distinct"], "since": iso(idx["oldest"]) if idx["oldest"] else None, "matches": matches}
+
+
+def cred_export(con, what, days):
+    since = 0 if days == "all" else time.time() - int(days) * 86400
+    rows = cred_rows(con, since)
+    if what in ("passwords", "usernames"):
+        # A word list, most tried first: one entry per line, so entries with line breaks are left out.
+        count = {}
+        for r in rows:
+            v = r[4] if what == "passwords" else r[3]
+            if v and "\n" not in v and "\r" not in v:
+                count[v] = count.get(v, 0) + 1
+        return "".join(v + "\n" for v, _ in sorted(count.items(), key=lambda x: (-x[1], x[0]))), "text/plain"
+    import csv, io
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["time", "ip", "service", "username", "password", "accepted"])
+    for ts, ip, svc, user, pw, ok in rows:
+        w.writerow([datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), ip, svc, csv_safe(user), csv_safe(pw), "yes" if ok else "no"])
+    return out.getvalue(), "text/csv"
+
+
+def cred_search(con, q, limit=200):
+    # Plain text search in usernames and passwords (for words like your domain or company name, not real passwords).
+    ql = q.lower()
+    agg = {}
+    for ts, ip, svc, user, pw, ok in cred_rows(con):
+        if ql in user.lower() or ql in pw.lower():
+            d = agg.setdefault((svc, user, pw), {"n": 0, "ips": set(), "last": 0})
+            d["n"] += 1
+            d["ips"].add(ip)
+            d["last"] = max(d["last"], ts)
+    return sorted(agg.items(), key=lambda x: (-x[1]["n"], -x[1]["last"]))[:limit], len(agg)
 
 
 def v_campaigns():
@@ -1941,6 +2070,9 @@ def v_login(err=""):
 # ---------------------------------------------------------------- static files
 
 CSS = r"""
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}@media(max-width:800px){.grid2{grid-template-columns:1fr}}
+.pwcheck{display:flex;gap:8px;flex-wrap:wrap}.pwcheck input{flex:1;min-width:180px}.pwc-out{margin-top:10px}.pwc-out table{margin-top:6px}
+.pwc-out th{text-align:left;font-weight:500;color:var(--muted);padding-right:14px}.pwc-ok{color:#2f9e5b;font-weight:600}.pwc-bad{color:#d1453b;font-weight:600}
 :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f8f9fb;--line:#e3e6ea;--text:#1b1f24;--muted:#6b7480;--accent:#3b6fd8;--accent2:#e9effb;
 --red:#c73a3a;--orange:#c46a12;--yellow:#9a7b00;--green:#2e8b57;--blue:#3b6fd8;--purple:#7d4fc7;--teal:#178a8a;--grey:#6b7480;
 --term:#11151a;--termtext:#d6dde6;--shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04)}
@@ -2018,6 +2150,33 @@ header{padding:0 16px;gap:12px}main{padding:16px}.card{overflow-x:auto}.hdr-righ
 """
 
 JS = r"""
+(function(){var f=document.getElementById('pwcheck');if(!f)return;var inp=document.getElementById('pwc-in'),out=document.getElementById('pwc-out');
+// SHA-256 in plain JavaScript: crypto.subtle only exists on HTTPS pages, and Huginn often runs on plain http on the LAN.
+function sha256(str){var b=new TextEncoder().encode(str),K=[],H=[1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225],
+n=2,c=0;while(c<64){var p=true;for(var i=2;i*i<=n;i++)if(n%i===0){p=false;break}if(p){K[c++]=(Math.pow(n,1/3)%1)*4294967296|0}n++}
+var l=b.length,m=new Uint8Array(((l+9+63)>>6)<<6);m.set(b);m[l]=128;var bits=l*8,dv=new DataView(m.buffer);dv.setUint32(m.length-4,bits>>>0);dv.setUint32(m.length-8,Math.floor(bits/4294967296));
+var w=new Array(64);for(var o=0;o<m.length;o+=64){for(var t=0;t<16;t++)w[t]=dv.getUint32(o+t*4);
+for(t=16;t<64;t++){var x=w[t-15],y=w[t-2];w[t]=(w[t-16]+((x>>>7|x<<25)^(x>>>18|x<<14)^(x>>>3))+w[t-7]+((y>>>17|y<<15)^(y>>>19|y<<13)^(y>>>10)))|0}
+var a=H[0],bb=H[1],cc=H[2],d=H[3],e=H[4],ff=H[5],g=H[6],h=H[7];
+for(t=0;t<64;t++){var t1=(h+((e>>>6|e<<26)^(e>>>11|e<<21)^(e>>>25|e<<7))+((e&ff)^(~e&g))+K[t]+w[t])|0,t2=(((a>>>2|a<<30)^(a>>>13|a<<19)^(a>>>22|a<<10))+((a&bb)^(a&cc)^(bb&cc)))|0;
+h=g;g=ff;ff=e;e=(d+t1)|0;d=cc;cc=bb;bb=a;a=(t1+t2)|0}
+H[0]=(H[0]+a)|0;H[1]=(H[1]+bb)|0;H[2]=(H[2]+cc)|0;H[3]=(H[3]+d)|0;H[4]=(H[4]+e)|0;H[5]=(H[5]+ff)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0}
+return H.map(function(v){return('00000000'+(v>>>0).toString(16)).slice(-8)}).join('')}
+window.huginnSha256=sha256;
+function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
+var P=+f.dataset.prefix||4;
+f.addEventListener('submit',function(ev){ev.preventDefault();var pw=inp.value;out.textContent='';if(!pw)return;
+var h=sha256(pw),pre=h.slice(0,P),suf=h.slice(P);out.textContent='Checking…';
+fetch(f.dataset.src+pre+'.json',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():{matches:[],distinct:null}}).then(function(d){
+out.textContent='';var hit=(d.matches||[]).filter(function(x){return x.s===suf})[0];
+if(!hit){out.appendChild(el('div','pwc-ok','Not found'));out.appendChild(el('div','muted small','Not among the '+(d.distinct!=null?d.distinct.toLocaleString()+' different ':'')+'passwords attackers tried'+(d.since?' since '+d.since.slice(0,10):'')+'.'));return}
+out.appendChild(el('div','pwc-bad','Found: attackers tried this password'));
+var t=el('table','');[['Tries',hit.tries+(hit.accepted?' ('+hit.accepted+' accepted by the honeypot)':'')],['From',hit.ips+' IP address'+(hit.ips===1?'':'es')],
+['First / last',hit.first.slice(0,10)+' / '+hit.last.slice(0,10)],['Services',hit.services.join(', ')],
+['With usernames',hit.users.map(function(u){return u[0]+(u[1]>1?' ('+u[1]+')':'')}).join(', ')]].forEach(function(r){var tr=el('tr');tr.appendChild(el('th','',r[0]));tr.appendChild(el('td','',r[1]));t.appendChild(tr)});
+out.appendChild(t);out.appendChild(el('div','muted small','It is on attackers’ lists: do not use it anywhere that can be reached from the internet.'))
+}).catch(function(){out.textContent='Could not check right now.'})});
+inp.addEventListener('input',function(){out.textContent=''})})();
 function copyText(t){if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(t);
 var a=document.createElement('textarea');a.value=t;a.setAttribute('readonly','');a.className='offscreen';document.body.appendChild(a);a.select();
 try{document.execCommand('copy')}finally{a.remove()}return Promise.resolve()}
@@ -2284,6 +2443,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_files())
         if path == "/creds":
             return self.send(200, v_creds(qs))
+        m = re.fullmatch(r"/creds/export\.(txt|csv)", path)
+        if m:
+            days = qs.get("days") if qs.get("days") in ("1", "7", "30", "all") else "all"
+            what = "csv" if m.group(1) == "csv" else ("usernames" if qs.get("what") == "usernames" else "passwords")
+            body, ctype = cred_export(db(), what, days)
+            fn = "huginn-%s-%s.%s" % ("attempts" if what == "csv" else what, days, m.group(1))
+            return self.send(200, body, ctype + "; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
+        m = re.fullmatch(r"/api/creds-check/([0-9a-f]{%d})\.json" % CRED_PREFIX, path)
+        if m:
+            return self.send(200, json.dumps(cred_check(db(), m.group(1))), "application/json")
         if path == "/campaigns":
             return self.send(200, v_campaigns())
         m = re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path)
