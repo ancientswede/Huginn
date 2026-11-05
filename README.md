@@ -4,6 +4,8 @@
 
 **Attacker intelligence for a homelab honeypot.** Huginn pulls the logs from your honeypot, keeps the history, shows everything about every attacker IP on its own page, and turns it into blocklists your firewalls can fetch.
 
+**[See the live demo →](https://ancientswede.se/huginn/)** (made-up data, read-only)
+
 In Norse myth Huginn is one of Odin's ravens. It flies out over the world every day and comes back to tell what it saw.
 
 ```

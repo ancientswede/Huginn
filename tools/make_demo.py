@@ -369,7 +369,7 @@ if(a.indexOf('theme')>=0||e.target.querySelector('.theme-btn')){cur=order[(order
 toast('This is a read-only demo — install Huginn to use filters and settings.')},true);
 document.addEventListener('click',function(e){var a=e.target.closest('a');if(a&&a.getAttribute('href')==='#'){e.preventDefault();toast('Not available in the demo.')}})})();
 """
-css = app.CSS + (".demo-banner{background:var(--accent);color:#fff;text-align:center;padding:7px 16px;font-size:13px}"
+css = app.CSS + (".demo-banner{background:#2f5bb7;color:#fff;text-align:center;padding:7px 16px;font-size:13px}"
                  ".demo-banner a{color:#fff;text-decoration:underline;font-weight:600}"
                  ".demo-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);opacity:0;background:var(--text);color:var(--bg);"
                  "padding:9px 16px;border-radius:8px;font-size:13px;transition:all .2s;z-index:60;pointer-events:none}.demo-toast.on{opacity:1;transform:translateX(-50%)}")
