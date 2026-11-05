@@ -126,9 +126,9 @@ class SettingsUpgrade(unittest.TestCase):
         try:
             app.set_meta(con, "settings", json.dumps({"cards": ["chart", "top"], "notify_events": ["bait"]}))
             st = app.settings(con)
-            self.assertEqual(st["cards"], ["chart", "top", "week", "heatmap"])
+            self.assertEqual(st["cards"], ["hero", "chart", "top", "week", "heatmap"])
             self.assertIn("weekly", st["notify_events"])
-            app.set_meta(con, "settings", json.dumps({"cards": ["chart"], "notify_events": [], "v": 2}))
+            app.set_meta(con, "settings", json.dumps({"cards": ["chart"], "notify_events": [], "v": 3}))
             self.assertEqual(app.settings(con)["cards"], ["chart"])      # a later choice is respected
         finally:
             app.set_meta(con, "settings", old)

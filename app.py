@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.14.3"
+HUGINN_VERSION = "0.15.0"
 CHANGELOG = [
+    ("0.15.0", "2026-11-05", "Overview: a banner with the raven and what Huginn has seen so far (since when, attackers, countries, login attempts, last sync). It is a card like the others: switch it off in Settings."),
     ("0.14.3", "2026-11-05", "Security review: data from ipwho.is, Shodan and reverse DNS is validated, the CSV blocklist uses real CSV quoting, a negative Content-Length can no longer hang a request, extra security headers, harder systemd sandbox, hp-export never follows symlinks, hp-logclean runs as the cowrie user. New tests plant HTML/JS in every attacker-controlled field."),
     ("0.14.2", "2026-11-05", "Session replays are easy to find: a Replay button on every recorded shell session of an attacker (no need to open it first) and in Latest shell sessions on the overview."),
     ("0.14.1", "2026-11-05", "Malware families from real honeypot data: loaders hidden as \\x escapes or base64 are decoded (their C2 addresses show up too), more dropper shapes (busybox wget, wget -O- | sh, ftpget), \"competitor killer\" scripts, SSH keys written to authorized_keys."),
@@ -1236,8 +1237,8 @@ def kv(rows):
 
 
 SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
-                    "cards": ["chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
-                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "weekly"], "v": 2,
+                    "cards": ["hero", "chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
+                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "weekly"], "v": 3,
                     "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
                     "hide_cc": [], "hide_asn": []}
 # Optional columns of the Attackers list: key -> (header, sort key, css class)
@@ -1245,7 +1246,7 @@ IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "A
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
             ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
             ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
-CARDS = [("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
+CARDS = [("hero", "Banner (Huginn, what it has seen so far)"), ("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
          ("shells", "Latest shell sessions"), ("creds", "Top credentials"), ("timewasted", "Time wasted")]
 # accent: (light accent, light tint, dark accent, dark tint)
 ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d4fc7", "#f1ebfb", "#b394f0", "#2a2140"),
@@ -1268,7 +1269,9 @@ def settings(con=None):
         # Settings saved before 0.14: show the new cards and the weekly summary once; the next save keeps the choice.
         out["cards"] = list(out["cards"]) + [c for c in ("week", "heatmap") if c not in out["cards"]]
         out["notify_events"] = list(out["notify_events"]) + (["weekly"] if "weekly" not in out["notify_events"] else [])
-        out["v"] = 2
+    if saved and saved.get("v", 1) < 3 and "hero" not in out["cards"]:
+        out["cards"] = ["hero"] + list(out["cards"])                  # 0.15: the banner, once
+    out["v"] = 3
     return out
 
 
@@ -1402,7 +1405,8 @@ def v_overview():
              "week": week_card(con) if "week" in st["cards"] else "",
              "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
                          % heat_html(heatmap(con))) if "heatmap" in st["cards"] else ""}
-    body = '<div class="kpis">%s</div><div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"]))
+    body = ((hero_card(con, st) if "hero" in st["cards"] else "")
+            + '<div class="kpis">%s</div><div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero")))
     return page("Overview", body, "/")
 
 
@@ -1499,6 +1503,22 @@ def heat_html(grid):
             for h, v in enumerate(row))))
     return ('<div class="heat">%s</div><div class="hm-legend"><span class="hm-what">attacker IPs per hour, %s</span><span>fewer</span>%s<span>more</span></div>'
             % ("".join(cells), esc(str(TZ)), "".join('<i class="hm%d"></i>' % n for n in range(1, 9))))
+
+
+def hero_card(con, st):
+    # The raven banner with what Huginn has seen so far. The picture is dark in both themes, so the text is always light.
+    n_ips, first = con.execute("SELECT COUNT(*), MIN(first) FROM ips").fetchone()
+    n_cc = con.execute("SELECT COUNT(DISTINCT e.cc) FROM enrich e JOIN ips i USING(ip) WHERE e.cc IS NOT NULL AND e.cc!=''").fetchone()[0]
+    n_logins = con.execute("SELECT COALESCE(SUM(logins_ok + logins_fail), 0) FROM ips").fetchone()[0]
+    li = float(get_meta(con, "last_ingest", "0") or 0)
+    facts = []
+    if first:
+        facts.append("watching since %s" % datetime.fromtimestamp(first, TZ).strftime("%Y-%m-%d"))
+    facts += ["%s attackers" % num(n_ips), "%s countries" % num(n_cc), "%s login attempts" % num(n_logins)]
+    return ('<div class="hero"><img src="/static/hero.jpg" alt="" width="1600" height="400">'
+            '<div class="hero-txt"><div class="hero-name">%s</div><div class="hero-tag">Attacker intelligence for a homelab honeypot</div>'
+            '<div class="hero-facts">%s%s</div></div></div>'
+            % (esc(st["title"] or "Huginn"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
 
 
 def week_card(con):
@@ -2398,6 +2418,14 @@ def v_login(err=""):
 # ---------------------------------------------------------------- static files
 
 CSS = r"""
+.hero{position:relative;border-radius:12px;overflow:hidden;margin-bottom:14px;background:#06080d;border:1px solid var(--line)}
+.hero img{display:block;width:100%;height:190px;object-fit:cover;object-position:20% 35%}
+@media (min-width:1600px){.hero img{height:230px}.hero-name{font-size:48px}}
+.hero-txt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 32px 0 46%;color:#e8ecf2}
+.hero-name{font-size:42px;font-weight:800;letter-spacing:.5px;line-height:1.05}
+.hero-tag{font-size:17px;color:#c8cfd9;margin-top:6px}.hero-facts{font-size:13px;color:#7aa2f7;margin-top:12px}
+@media (max-width:800px){.hero img{height:130px;object-position:15% 50%}.hero-txt{padding:0 14px 0 44%}.hero-name{font-size:28px}
+.hero-tag{font-size:13px}.hero-facts{display:none}}
 .heat{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
 .hm-row{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;align-items:center}
 .hm-row i{display:block;aspect-ratio:1;border-radius:3px;background:var(--panel2);min-height:10px}.hm-head span{text-align:left}
@@ -2764,6 +2792,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, fh.read(), "image/png", cache=True)
             except OSError:
                 return self.send(200, ICON, "image/svg+xml", cache=True)
+        if path == "/static/hero.jpg":
+            try:
+                with open(os.path.join(STATIC_DIR, "hero.jpg"), "rb") as fh:
+                    return self.send(200, fh.read(), "image/jpeg", cache=True)
+            except OSError:
+                return self.send(404, "", "text/plain")
         if path == "/static/icon.svg":
             return self.send(200, ICON, "image/svg+xml", cache=True)
         if path == "/static/app.js":
