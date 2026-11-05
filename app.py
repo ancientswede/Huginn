@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.14.0"
+HUGINN_VERSION = "0.14.1"
 CHANGELOG = [
+    ("0.14.1", "2026-11-05", "Malware families from real honeypot data: loaders hidden as \\x escapes or base64 are decoded (their C2 addresses show up too), more dropper shapes (busybox wget, wget -O- | sh, ftpget), \"competitor killer\" scripts, SSH keys written to authorized_keys."),
     ("0.14.0", "2026-11-05", "Malware families: captured files are recognised as Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors or dropper scripts (strings in the file, its name or URL, optionally MalwareBazaar with HUGINN_MALWAREBAZAAR_KEY). Overview: New this week, and When they attack (a heat map per hour of the week). Weekly ntfy summary on Sunday evening."),
     ("0.13.0", "2026-11-05", "Huginn runs in Docker: Dockerfile and docker-compose.yml (one volume for everything, unprivileged, read-only, health check), the container makes its SSH key and learns the honeypot's host key on first start. Image for amd64 and arm64 at ghcr.io/ancientswede/huginn from each release."),
     ("0.12.4", "2026-11-05", "Fix: the bars in the charts were gone in 0.12.2-0.12.3 (only the numbers showed). Their heights were inline styles, which Huginn's own Content-Security-Policy blocks."),
@@ -505,7 +506,8 @@ NAME_FAMILIES = [(re.compile(r"mozi\.[ma]\b|/mozi\b", re.I), "Mozi (P2P botnet)"
                  (re.compile(r"redtail", re.I), "RedTail (miner)"),
                  (re.compile(r"mirai", re.I), "Mirai"),
                  (re.compile(r"gafgyt|bashlite", re.I), "Gafgyt / Bashlite"),
-                 (re.compile(r"(^|/)(bins|wget|curl|t8UsA|ohshit|8UsA)\.sh\b", re.I), "Dropper script")]
+                 (re.compile(r"(^|/)(bins|wget|curl|t8UsA|ohshit|8UsA)\.sh\b", re.I), "Dropper script"),
+                 (re.compile(r"authorized_keys", re.I), "SSH key backdoor")]
 
 
 def name_family(names):

