@@ -15,6 +15,8 @@ HP_PORT=""
 WEB_PORT=8095
 TZ_NAME=""
 NTFY=""
+NTFY_TOKEN=""
+NO_NTFY=0
 YES=0
 NO_PASSWORD=0
 WAIT_MIN=15
@@ -26,7 +28,9 @@ Usage: $0 --honeypot HOST [options]
   --honeypot-port N     the honeypot's admin SSH port chosen in install-honeypot.sh (asked if not given; default 22022)
   --port N              Huginn web port (default $WEB_PORT)
   --tz ZONE             time zone, e.g. Europe/Stockholm (default: this machine's)
-  --ntfy URL            ntfy topic URL for alerts, e.g. http://ntfy.lan:2586/huginn
+  --ntfy URL            ntfy topic URL for alerts, e.g. http://ntfy.lan:2586/huginn (asked if not given)
+  --ntfy-token TOKEN    access token for an ntfy server with access control (tk_...)
+  --no-ntfy             do not ask about notifications
   --no-password         do not ask for the login password now (set it later with app.py set-password)
   --yes                 no questions; trust the honeypot host key on first contact
 EOF
@@ -40,6 +44,8 @@ while [ $# -gt 0 ]; do
     --port) WEB_PORT="$2"; shift ;;
     --tz) TZ_NAME="$2"; shift ;;
     --ntfy) NTFY="$2"; shift ;;
+    --ntfy-token) NTFY_TOKEN="$2"; shift ;;
+    --no-ntfy) NO_NTFY=1 ;;
     --no-password) NO_PASSWORD=1 ;;
     --yes|-y) YES=1 ;;
     -h|--help) usage ;;
@@ -78,6 +84,37 @@ if [ -z "$TZ_NAME" ]; then
   TZ_NAME="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo UTC)"
 fi
 
+# ------------------------------------------------------------------ notifications (optional)
+if [ -z "$NTFY" ] && [ "$YES" != 1 ] && [ "$NO_NTFY" != 1 ] && ! grep -q "^HUGINN_NTFY_URL=." /opt/huginn/.env 2>/dev/null; then
+  echo
+  echo "    Huginn can push a short summary to ntfy (phone app) when something notable happens:"
+  echo "    bait taken, new malware, a human-like session, an exploit. At most one message per hour."
+  if ask "Set up ntfy notifications?" no; then
+    SUGGEST="huginn-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d " \n")"
+    echo "    Your own ntfy server:   http://ntfy.lan:2586/$SUGGEST"
+    echo "    Public ntfy.sh:         https://ntfy.sh/$SUGGEST"
+    echo "    (On ntfy.sh anyone who guesses the topic name can read it — keep a random name like this one.)"
+    read -r -p "    Topic URL: " NTFY </dev/tty || NTFY=""
+    if [ -n "$NTFY" ]; then
+      read -r -s -p "    Access token (empty if your topic is open): " NTFY_TOKEN </dev/tty || NTFY_TOKEN=""; echo
+    fi
+  fi
+fi
+if [ -n "$NTFY" ]; then
+  [[ "$NTFY" =~ ^https?://[A-Za-z0-9._:-]+/[A-Za-z0-9_-]{1,64}$ ]] || die "ntfy URL must look like http(s)://server/topic"
+  [ -z "$NTFY_TOKEN" ] || [[ "$NTFY_TOKEN" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || die "That access token does not look right."
+  if NTFY_URL="$NTFY" NTFY_TOKEN="$NTFY_TOKEN" python3 - <<'PY'
+import os, urllib.request
+h = {"Title": "Huginn: test", "Tags": "honey_pot"}
+if os.environ.get("NTFY_TOKEN"):
+    h["Authorization"] = "Bearer " + os.environ["NTFY_TOKEN"]
+urllib.request.urlopen(urllib.request.Request(os.environ["NTFY_URL"], data=b"Huginn is being installed. Notifications work.", headers=h, method="POST"), timeout=10).read()
+PY
+  then ok "test notification sent — check your phone"
+  else warn "could not send to $NTFY — check the URL/token; you can change HUGINN_NTFY_URL in /opt/huginn/.env later"
+  fi
+fi
+
 say "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -101,13 +138,19 @@ HUGINN_HP_HOST=$HP_HOST
 HUGINN_HP_PORT=$HP_PORT
 HUGINN_PORT=$WEB_PORT
 HUGINN_TZ=$TZ_NAME
-${NTFY:+HUGINN_NTFY_URL=$NTFY}
-${NTFY:+HUGINN_PUBLIC_URL=http://$(hostname -I | awk '{print $1}'):$WEB_PORT}
 EOF
   chmod 600 /opt/huginn/.env
   ok "wrote /opt/huginn/.env"
 else
   ok "keeping existing /opt/huginn/.env"
+fi
+if [ -n "$NTFY" ] && ! grep -q "^HUGINN_NTFY_URL=." /opt/huginn/.env; then
+  {
+    echo "HUGINN_NTFY_URL=$NTFY"
+    [ -n "$NTFY_TOKEN" ] && echo "HUGINN_NTFY_TOKEN=$NTFY_TOKEN"
+    grep -q "^HUGINN_PUBLIC_URL=." /opt/huginn/.env || echo "HUGINN_PUBLIC_URL=http://$(hostname -I | awk '{print $1}'):$WEB_PORT"
+  } >> /opt/huginn/.env
+  ok "ntfy notifications on (HUGINN_NTFY_URL in /opt/huginn/.env)"
 fi
 if [ ! -f /opt/huginn/.ssh/honeypot_ro ]; then
   runuser -u huginn -- ssh-keygen -q -t ed25519 -N "" -C "huginn@$(hostname)" -f /opt/huginn/.ssh/honeypot_ro

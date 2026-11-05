@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.8.3"
+HUGINN_VERSION = "0.8.4"
 CHANGELOG = [
+    ("0.8.4", "2026-11-05", "ntfy servers with access control: HUGINN_NTFY_TOKEN. The installer asks about ntfy and sends a test notification."),
     ("0.8.3", "2026-11-05", "Web decoy: HTTPS port and readable web requests (method, path, status). The address the attacker connected to is no longer stored, and HUGINN_MASK hides your own IPs/domains in everything stored."),
     ("0.8.2", "2026-11-05", "Clicking a country on the map shows exactly that country (new country filter on the Attackers list)."),
     ("0.8.1", "2026-11-05", "Map and chart cards line up."),
@@ -83,6 +84,18 @@ SESSION_DAYS = 14
 MAX_EXPORT = int(os.environ.get("HUGINN_MAX_EXPORT_MB", "256")) * 1024 * 1024
 MAX_TTY = 64 * 1024 * 1024
 NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan:2586/huginn — empty = no notifications
+NTFY_TOKEN = os.environ.get("HUGINN_NTFY_TOKEN", "")      # access token (tk_...) for ntfy servers with access control
+
+
+def ntfy_post(body, title, prio=3):
+    # One place that talks to ntfy (alerts and the test button). Never logs the token.
+    h = {"Title": title, "Priority": str(prio), "Tags": "honey_pot", "User-Agent": UA}
+    if PUBLIC_URL:
+        h["Click"] = PUBLIC_URL.rstrip("/") + "/"
+    if NTFY_TOKEN:
+        h["Authorization"] = "Bearer " + NTFY_TOKEN
+    req = urllib.request.Request(NTFY_URL, data=body.encode("utf-8"), method="POST", headers=h)
+    urllib.request.urlopen(req, timeout=10).read()
 PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
 TTY_DIR = os.path.join(DATA, "tty")
@@ -711,10 +724,7 @@ def notify(con):
     set_meta(con, "ntfy_last", now)
     if not lines:
         return
-    req = urllib.request.Request(NTFY_URL, data="\n".join(lines).encode("utf-8"), method="POST",
-                                 headers={k: v for k, v in {"Title": "Huginn: honeypot activity", "Priority": str(prio), "Tags": "honey_pot",
-                                          "Click": (PUBLIC_URL.rstrip("/") + "/") if PUBLIC_URL else "", "User-Agent": UA}.items() if v})
-    urllib.request.urlopen(req, timeout=10).read()
+    ntfy_post("\n".join(lines), "Huginn: honeypot activity", prio)
     set_meta(con, "last_notify", "%s: %s" % (fmt_ts(now), " | ".join(lines))[:500])
 
 
@@ -1727,7 +1737,7 @@ def v_settings(ok="", err=""):
     accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
                       % (a, " checked" if st["accent"] == a else "", a, a.capitalize()) for a in ACCENTS)
     ntfy_host = urllib.parse.urlsplit(NTFY_URL).netloc if NTFY_URL else ""
-    ntfy_line = ("Sends to <span class=mono>%s</span> (HUGINN_NTFY_URL)." % esc(ntfy_host)) if NTFY_URL else "HUGINN_NTFY_URL is not set in .env, so nothing is sent."
+    ntfy_line = ("Sends to <span class=mono>%s</span> (HUGINN_NTFY_URL%s)." % (esc(ntfy_host), ", with access token" if NTFY_TOKEN else "")) if NTFY_URL else "HUGINN_NTFY_URL is not set in .env, so nothing is sent."
     body = ('<h1>Settings</h1>%s<form method=post action="/settings" class="settings"><div class="grid">'
             '<div class="card"><h3>Appearance</h3>'
             '<div class="row"><div class="rl">Theme</div><div>%s%s%s</div></div>'
@@ -2212,9 +2222,7 @@ class Handler(BaseHTTPRequestHandler):
             if not NTFY_URL:
                 return self.send(400, v_settings(err="HUGINN_NTFY_URL is not set."))
             try:
-                req = urllib.request.Request(NTFY_URL, data=b"Test from Huginn. Notifications work.", method="POST",
-                                             headers={"Title": "Huginn: test", "Tags": "honey_pot", "User-Agent": UA})
-                urllib.request.urlopen(req, timeout=10).read()
+                ntfy_post("Test from Huginn. Notifications work.", "Huginn: test")
             except Exception as e:
                 return self.send(502, v_settings(err="Sending failed: %s" % str(e)[:150]))
             return self.redirect("/settings?ok=test")

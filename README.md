@@ -225,6 +225,15 @@ Open `http://huginn-host:8095` and log in. The first sync runs within two minute
 
 **History from before Huginn:** copy old `cowrie.json.*` and `opencanary.log*` files to the Huginn host and run `runuser -u huginn -- python3 /opt/huginn/app.py import FILE...`. Lines Huginn already has are skipped, so you can run it again at any time, for example after Huginn has been down for a while. The export only covers the latest lines, so a long gap otherwise leaves a hole.
 
+## Notifications (optional)
+
+Huginn can push a short summary to [ntfy](https://ntfy.sh), the phone app, when something worth a look happens: bait taken, new malware, a human-like session or an exploit attempt. It sends at most one message per hour, and nothing at all if this is not set up.
+
+- **During install:** `install-huginn.sh` asks whether you want ntfy, suggests a random topic name and sends a test notification.
+- **Later:** add `HUGINN_NTFY_URL` to `/opt/huginn/.env` (and `HUGINN_NTFY_TOKEN` if your server uses access control), then run `systemctl restart huginn`.
+- **Choose which events** you get, or send a test, on the **Settings** page.
+- **Your own ntfy server** in the homelab is the most private option. On the public `ntfy.sh`, anyone who guesses the topic name can read your messages, so use a long random name like the one the installer suggests. The messages only contain counts and attacker IPs, never your own addresses.
+
 ## Using the blocklists
 
 The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
@@ -281,6 +290,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_PERSONAS` | – | `port=name,...` for several Cowrie instances |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Bait values to watch for |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
+| `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |
 | `HUGINN_TRUSTED_PROXIES` | – | Reverse proxy IPs allowed to set `X-Forwarded-*` |
 | `HUGINN_MASK` | – | Your own public IPs/domains, replaced with `[self]` in everything stored (attackers often echo the address they target) |
 | `HUGINN_ALLOW_PRIVATE` | `0` | `1` = also record LAN source addresses (testing only; never blocklisted) |
