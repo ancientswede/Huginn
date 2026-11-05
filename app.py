@@ -66,6 +66,13 @@ ENRICH_TTL = 14 * 86400
 MASK = [x.strip() for x in os.environ.get("HUGINN_MASK", "").split(",") if x.strip()]
 # Testing only: also record private/LAN source addresses (normally dropped so you never block yourself).
 ALLOW_PRIVATE = os.environ.get("HUGINN_ALLOW_PRIVATE", "0") == "1"
+# Demo only (tools/make_demo.py): the documentation ranges used for made-up attackers count as public addresses.
+DEMO_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
+DEMO = os.environ.get("HUGINN_DEMO", "0") == "1"
+
+
+def is_public(a):
+    return a.is_global or (DEMO and any(a in n for n in DEMO_NETS))
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
 os.environ["TZ"] = os.environ.get("HUGINN_TZ", "UTC")  # SQLite "localtime" (per-day grouping) follows the process TZ
@@ -1518,7 +1525,7 @@ def blocklist_ips(con, min_score, days, research, v6):
     out = []
     for (ip,) in rows:
         a = ipaddress.ip_address(ip)
-        if not a.is_global or (a.version == 6 and not v6):
+        if not is_public(a) or (a.version == 6 and not v6):
             continue
         out.append(a)
     out.sort(key=lambda a: (a.version, int(a)))
@@ -1534,7 +1541,7 @@ def c2_list(con):
             a = ipaddress.ip_address(host)
         except ValueError:
             return
-        if not a.is_global or str(a) in BENIGN_IOC:
+        if not is_public(a) or str(a) in BENIGN_IOC:
             return
         out.setdefault(str(a), set()).add(why)
     for r in con.execute("SELECT sha, iocs FROM files WHERE iocs IS NOT NULL AND iocs!='[]'"):

@@ -299,6 +299,15 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Huginn:** `systemctl disable --now huginn`, then `rm -rf /opt/huginn /etc/systemd/system/huginn.service`, then `userdel huginn`.
 - **Honeypot:** `systemctl disable --now cowrie opencanary endlessh hp-traps`. Remove the `include "/etc/huginn-honeypot.nft"` line from `/etc/nftables.conf`, then `nft -f /etc/nftables.conf`. Delete the `restrict,command="/usr/local/bin/hp-export"` line in `/root/.ssh/authorized_keys`.
 
+## Try it without a honeypot
+
+`tools/make_demo.py` builds a static, read-only copy of Huginn with made-up data. Every address, network and AS number comes from the ranges reserved for documentation, so none of it belongs to anyone real:
+
+```bash
+python3 tools/make_demo.py ./demo --base /
+cd demo && python3 -m http.server 8000   # then open http://127.0.0.1:8000/
+```
+
 ## Commands
 
 ```
