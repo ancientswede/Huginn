@@ -95,13 +95,14 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - **related attackers** (same SSH client fingerprint, same command script, same file, same /24)
   - an "always block" / "never block" switch
 - **Campaigns:** IPs grouped by identical command scripts and SSH client fingerprints (HASSH), so one botnet shows up as one group.
-- **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, and the IP addresses and URLs embedded in it. Nothing is ever executed.
+- **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up on [MalwareBazaar](https://bazaar.abuse.ch) by its hash.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
   - **Is my password in here?** Check whether attackers have tried one of your own passwords. The check runs in your browser: only the first 4 characters of the password's SHA-256 hash go to Huginn (the same idea as Have I Been Pwned), so the password itself never leaves your machine.
   - Search every username and password, and export them as word lists (for your own password policy or audits) or as a CSV of every attempt.
 - **Personas and bait detection:** the installer makes the honeypot look like a real server, file server or IP camera, with fake credentials planted where attackers look. Huginn tags anyone who reads them (`read-bait`) or later tries one of them anywhere (`took-bait`).
 - **Blocklists** as plain text, nftables, ipset, MikroTik or CSV, filtered by score and age. There is also a separate **C2 list**: the servers attackers download from and the addresses found inside their malware.
-- **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt).
+- **New this week** and **When they attack:** what was new in the last seven days (attackers, countries, campaigns, malware, bait), and a heat map of attacker IPs per hour of the week.
+- **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt), plus a weekly summary on Sunday evening.
 - **Your way:** light, dark or automatic theme, six accent colours, a compact layout, a 12- or 24-hour clock, the columns and overview cards you want, and countries or networks you never want to see (they are still blocklisted). Every attacker can be exported as JSON or CSV. Keyboard shortcuts: press `?`.
 
 Huginn uses only the Python standard library and SQLite. There are no dependencies, no build step and no JavaScript framework. It runs comfortably in a 1 core / 512 MB LXC.
@@ -405,6 +406,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_RETENTION_DAYS` | `180` | Days of history kept; `0` keeps everything forever |
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
 | `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
+| `HUGINN_MALWAREBAZAAR_KEY` | – | Look captured files up on MalwareBazaar by SHA-256 (only the hash is sent). Free key at [auth.abuse.ch](https://auth.abuse.ch) |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |

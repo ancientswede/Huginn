@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.13.0"
+HUGINN_VERSION = "0.14.0"
 CHANGELOG = [
+    ("0.14.0", "2026-11-05", "Malware families: captured files are recognised as Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors or dropper scripts (strings in the file, its name or URL, optionally MalwareBazaar with HUGINN_MALWAREBAZAAR_KEY). Overview: New this week, and When they attack (a heat map per hour of the week). Weekly ntfy summary on Sunday evening."),
     ("0.13.0", "2026-11-05", "Huginn runs in Docker: Dockerfile and docker-compose.yml (one volume for everything, unprivileged, read-only, health check), the container makes its SSH key and learns the honeypot's host key on first start. Image for amd64 and arm64 at ghcr.io/ancientswede/huginn from each release."),
     ("0.12.4", "2026-11-05", "Fix: the bars in the charts were gone in 0.12.2-0.12.3 (only the numbers showed). Their heights were inline styles, which Huginn's own Content-Security-Policy blocks."),
     ("0.12.3", "2026-11-05", "Huginn has a logo: the raven as tab icon, next to the name in the header and on the login page. README banner."),
@@ -103,6 +104,8 @@ UPDATE_CHECK = os.environ.get("HUGINN_UPDATE_CHECK", "1") == "1"
 REPO = os.environ.get("HUGINN_REPO", "ancientswede/Huginn")
 NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan:2586/huginn — empty = no notifications
 NTFY_TOKEN = os.environ.get("HUGINN_NTFY_TOKEN", "")      # access token (tk_...) for ntfy servers with access control
+# Optional: look captured files up on MalwareBazaar (abuse.ch) by SHA-256. Sends only the hash. Free key: auth.abuse.ch
+MB_KEY = os.environ.get("HUGINN_MALWAREBAZAAR_KEY", "")
 
 
 def ntfy_post(body, title, prio=3):
@@ -211,6 +214,10 @@ def init_db():
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
     if "tty" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
+    fcols = [r[1] for r in con.execute("PRAGMA table_info(files)")]
+    for col, typ in (("family", "TEXT"), ("mb", "TEXT"), ("mb_checked", "REAL")):
+        if col not in fcols:
+            con.execute("ALTER TABLE files ADD COLUMN %s %s" % (col, typ))
     con.commit()
     os.makedirs(TTY_DIR, exist_ok=True)
     if not get_meta(con, "feed_token"):
@@ -484,9 +491,78 @@ def store_files(con, files):
                 size, mtime = int(f.get("size") or 0), float(f.get("mtime") or 0)
             except (TypeError, ValueError):
                 continue
-            con.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO files(sha, src, size, type, arch, packed, iocs, mtime, updated, family) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(sha) DO UPDATE SET src=excluded.src, size=excluded.size, type=excluded.type, arch=excluded.arch, "
+                        "packed=excluded.packed, iocs=excluded.iocs, mtime=excluded.mtime, updated=excluded.updated, family=excluded.family",
                         (sha, str(f.get("src") or "")[:20], size, str(f.get("type") or "")[:80],
-                         str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now))
+                         str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now,
+                         str(f.get("family") or "")[:60]))
+
+
+# File and URL names that give a family away, for files the honeypot could not fetch or analyse.
+NAME_FAMILIES = [(re.compile(r"mozi\.[ma]\b|/mozi\b", re.I), "Mozi (P2P botnet)"),
+                 (re.compile(r"xmrig|kdevtmpfsi|kinsing", re.I), "Crypto miner"),
+                 (re.compile(r"redtail", re.I), "RedTail (miner)"),
+                 (re.compile(r"mirai", re.I), "Mirai"),
+                 (re.compile(r"gafgyt|bashlite", re.I), "Gafgyt / Bashlite"),
+                 (re.compile(r"(^|/)(bins|wget|curl|t8UsA|ohshit|8UsA)\.sh\b", re.I), "Dropper script")]
+
+
+def name_family(names):
+    for rx, fam in NAME_FAMILIES:
+        if rx.search(names or ""):
+            return fam
+    return ""
+
+
+def file_family(f, names=""):
+    # Best guess, most reliable first: MalwareBazaar's signature, strings in the file, then its name or URL.
+    if f is not None:
+        try:
+            mb = json.loads(f["mb"] or "{}")
+        except (ValueError, TypeError, IndexError, KeyError):
+            mb = {}
+        if mb.get("signature"):
+            return mb["signature"], "MalwareBazaar"
+        if f["family"]:
+            return f["family"], "strings in the file"
+    fam = name_family(names)
+    return (fam, "file name") if fam else ("", "")
+
+
+def family_tag(fam, how=""):
+    if not fam:
+        return ""
+    return '<span class="tag t-red" title="Looks like %s%s">%s</span>' % (esc(fam), (" (from %s)" % esc(how)) if how else "", esc(fam))
+
+
+def mb_lookup(con, limit=4):
+    # Ask MalwareBazaar about files we have not asked about yet (or not found a week ago). Only the hash leaves Huginn.
+    if not MB_KEY:
+        return 0
+    rows = con.execute("SELECT sha FROM files WHERE mb_checked IS NULL OR (mb LIKE '%\"found\": false%' AND mb_checked < ?) "
+                       "ORDER BY mtime DESC LIMIT ?", (time.time() - 7 * 86400, limit)).fetchall()
+    done = 0
+    for (sha,) in rows:
+        req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=urllib.parse.urlencode({"query": "get_info", "hash": sha}).encode(),
+                                     headers={"Auth-Key": MB_KEY, "User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = json.loads(r.read(2 * 1024 * 1024))
+        except Exception:
+            break
+        if d.get("query_status") == "ok" and d.get("data"):
+            x = d["data"][0]
+            mb = {"found": True, "signature": str(x.get("signature") or "")[:60],
+                  "tags": [str(t)[:30] for t in (x.get("tags") or [])][:8], "first_seen": str(x.get("first_seen") or "")[:20]}
+        elif d.get("query_status") in ("hash_not_found", "no_results"):
+            mb = {"found": False}
+        else:
+            break                                    # bad key, rate limit, ...: try again later
+        with con:
+            con.execute("UPDATE files SET mb=?, mb_checked=? WHERE sha=?", (json.dumps(mb), time.time(), sha))
+        done += 1
+    return done
 
 
 def tty_path(sha):
@@ -819,10 +895,12 @@ def collector_loop():
             set_meta(con, "last_error", "%s %s" % (fmt_ts(time.time()), str(e)[:300]))
         try:
             prefetch_tty(con)
+            mb_lookup(con)
         except Exception as e:
             set_meta(con, "last_tty_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
         try:
             notify(con)
+            weekly_digest(con)
             check_update(con)
         except Exception as e:
             set_meta(con, "last_notify_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
@@ -1142,8 +1220,8 @@ def kv(rows):
 
 
 SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
-                    "cards": ["chart", "countries", "top", "shells", "creds", "timewasted"], "ips_days": "30",
-                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit"],
+                    "cards": ["chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
+                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "weekly"], "v": 2,
                     "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
                     "hide_cc": [], "hide_asn": []}
 # Optional columns of the Attackers list: key -> (header, sort key, css class)
@@ -1151,14 +1229,14 @@ IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "A
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
             ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
             ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
-CARDS = [("chart", "Unique attackers per day"), ("countries", "Countries"), ("top", "Top attackers"),
+CARDS = [("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
          ("shells", "Latest shell sessions"), ("creds", "Top credentials"), ("timewasted", "Time wasted")]
 # accent: (light accent, light tint, dark accent, dark tint)
 ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d4fc7", "#f1ebfb", "#b394f0", "#2a2140"),
            "green": ("#2e8b57", "#e6f4ec", "#5fc28a", "#17302a"), "orange": ("#c46a12", "#fbefe3", "#f0a050", "#352616"),
            "red": ("#c73a3a", "#fbe9e9", "#f07070", "#3a1d1f"), "teal": ("#178a8a", "#e3f4f4", "#4cc6c6", "#15302f")}
 NOTIFY_EVENTS = [("bait", "Someone took or read the bait"), ("files", "New files captured"),
-                 ("human", "Human-like sessions"), ("exploit", "Exploit attempts")]
+                 ("human", "Human-like sessions"), ("exploit", "Exploit attempts"), ("weekly", "Weekly summary (Sunday evening)")]
 THEMES = ["auto", "light", "dark"]
 
 
@@ -1170,6 +1248,11 @@ def settings(con=None):
         saved = {}
     out = dict(SETTINGS_DEFAULT)
     out.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULT})
+    if saved and saved.get("v", 1) < 2:
+        # Settings saved before 0.14: show the new cards and the weekly summary once; the next save keeps the choice.
+        out["cards"] = list(out["cards"]) + [c for c in ("week", "heatmap") if c not in out["cards"]]
+        out["notify_events"] = list(out["notify_events"]) + (["weekly"] if "weekly" not in out["notify_events"] else [])
+        out["v"] = 2
     return out
 
 
@@ -1298,9 +1381,120 @@ def v_overview():
     tw_html = ('<div class="card"><h3>Time wasted, 7 days <span class=muted>%s total%s</span></h3><table><thead><tr><th>IP</th><th>CC</th><th class=num>Tarpit</th>'
                '<th class=num>Fake shell</th><th class=num>Total</th><th class=num>Longest</th></tr></thead><tbody>%s</tbody></table></div>'
                % (esc(dur(tw["total"])), " · %d stuck in the tarpit right now" % tw["stuck"] if tw["stuck"] else "", twrows or "<tr><td colspan=6 class=muted>Nothing yet</td></tr>"))
-    parts = {"chart": chart, "countries": cc_html_, "top": top_html, "shells": shells_html, "creds": creds_html, "timewasted": tw_html}
+    parts = {"chart": chart, "countries": cc_html_, "top": top_html, "shells": shells_html, "creds": creds_html, "timewasted": tw_html,
+             "week": week_card(con) if "week" in st["cards"] else "",
+             "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
+                         % heat_html(heatmap(con))) if "heatmap" in st["cards"] else ""}
     body = '<div class="kpis">%s</div><div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"]))
     return page("Overview", body, "/")
+
+
+
+# ---------------------------------------------------------------- weekly view, digest and heat map
+
+def week_summary(con, start, end):
+    # What was new between start and end: the "New this week" card and the Sunday ntfy summary.
+    q = lambda sql, *a: con.execute(sql, a).fetchone()[0] or 0
+    span = end - start
+    active = q("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>=? AND ts<?", start, end)
+    before = q("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>=? AND ts<?", start - span, start)
+    new_ips = q("SELECT COUNT(*) FROM ips WHERE first>=? AND first<?", start, end)
+    new_cc = [r[0] for r in con.execute("SELECT e.cc FROM ips i JOIN enrich e USING(ip) WHERE e.cc IS NOT NULL AND e.cc!='' "
+                                        "GROUP BY e.cc HAVING MIN(i.first)>=? AND MIN(i.first)<? ORDER BY COUNT(*) DESC", (start, end))]
+    camps = con.execute("SELECT cmdhash, COUNT(DISTINCT ip) n FROM sessions WHERE cmdhash IS NOT NULL GROUP BY cmdhash "
+                        "HAVING MIN(start)>=? AND MIN(start)<? ORDER BY n DESC", (start, end)).fetchall()
+    fams = {}
+    for sha, names in con.execute("SELECT b, GROUP_CONCAT(DISTINCT a) FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b "
+                                  "HAVING MIN(ts)>=? AND MIN(ts)<?", (start, end)):
+        fam, _how = file_family(con.execute("SELECT * FROM files WHERE sha=?", (sha,)).fetchone(), names or "")
+        fams[fam or "Unknown"] = fams.get(fam or "Unknown", 0) + 1
+    took = q("SELECT COUNT(DISTINCT ip) FROM ips WHERE last>=? AND ','||tags||',' LIKE '%,took-bait,%'", start)
+    top = con.execute("SELECT i.ip, i.score, e.cc FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=? ORDER BY i.score DESC LIMIT 3", (start,)).fetchall()
+    pw = con.execute("SELECT b, COUNT(*) n FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? AND ts<? AND b IS NOT NULL "
+                     "GROUP BY b ORDER BY n DESC LIMIT 1", (start, end)).fetchone()
+    return {"active": active, "before": before, "new_ips": new_ips, "new_cc": new_cc, "campaigns": len(camps),
+            "campaign_ips": sum(c["n"] for c in camps), "families": fams, "took": took, "top": top, "password": pw}
+
+
+def trend(now_n, before_n):
+    if not before_n:
+        return ""
+    pct = round((now_n - before_n) * 100.0 / before_n)
+    return "%+d%% vs the week before" % pct
+
+
+def weekly_digest(con):
+    # One ntfy message on Sunday evening (Huginn's time zone) about the past seven days.
+    st = settings(con)
+    if not NTFY_URL or not st["notify"] or "weekly" not in st["notify_events"]:
+        return
+    now = datetime.now(TZ)
+    if now.weekday() != 6 or now.hour < 18:
+        return
+    key = "%d-W%02d" % now.isocalendar()[:2]
+    if get_meta(con, "weekly_sent") == key:
+        return
+    end = time.time()
+    w = week_summary(con, end - 7 * 86400, end)
+    lines = ["%s attackers (%s), %s of them new" % (num(w["active"]), trend(w["active"], w["before"]) or "first week", num(w["new_ips"]))]
+    if w["new_cc"]:
+        lines.append("New countries: " + ", ".join(w["new_cc"][:8]) + (" +%d" % (len(w["new_cc"]) - 8) if len(w["new_cc"]) > 8 else ""))
+    if w["campaigns"]:
+        lines.append("New campaigns: %d (%d IPs)" % (w["campaigns"], w["campaign_ips"]))
+    if w["families"]:
+        lines.append("New malware: " + ", ".join("%s ×%d" % (k, v) for k, v in sorted(w["families"].items(), key=lambda x: -x[1])[:5]))
+    if w["took"]:
+        lines.append("Took the bait: %d IP(s)" % w["took"])
+    if w["top"]:
+        lines.append("Top attacker: %s (%s, score %d)" % (w["top"][0]["ip"], w["top"][0]["cc"] or "?", w["top"][0]["score"]))
+    if w["password"]:
+        lines.append("Most tried password: %s (%s×)" % (clean(w["password"]["b"], 40), num(w["password"]["n"])))
+    ntfy_post("\n".join(lines), "Huginn: week %d" % now.isocalendar()[1], 3)
+    set_meta(con, "weekly_sent", key)
+    set_meta(con, "last_notify", "%s: weekly summary %s" % (fmt_ts(end), key))
+
+
+_heat_cache = {}
+
+
+def heatmap(con, days=30):
+    # Unique attacker IPs per hour of the week (Huginn's time zone), over the last `days` days. Cached until the next sync.
+    key = (days, get_meta(con, "last_ingest", ""))
+    if _heat_cache.get("key") == key:
+        return _heat_cache["grid"]
+    grid = [[0] * 24 for _ in range(7)]
+    for ip, hour in con.execute("SELECT DISTINCT ip, CAST(ts/3600 AS INTEGER) FROM events WHERE ts>=?", (time.time() - days * 86400,)):
+        t = datetime.fromtimestamp(hour * 3600, TZ)
+        grid[t.weekday()][t.hour] += 1
+    _heat_cache.update(key=key, grid=grid)
+    return grid
+
+
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def heat_html(grid):
+    mx = max(max(r) for r in grid) or 1
+    cells = ['<div class="hm-row hm-head"><span></span>%s</div>' % "".join('<span>%s</span>' % (("%02d" % h) if h % 3 == 0 else "") for h in range(24))]
+    for d, row in enumerate(grid):
+        cells.append('<div class="hm-row"><span class="hm-day">%s</span>%s</div>' % (DAYS[d], "".join(
+            '<i class="hm%d" title="%s %02d:00–%02d:00: %s attacker IPs"></i>' % (0 if not v else max(1, -(-v * 8 // mx)), DAYS[d], h, (h + 1) % 24, num(v))
+            for h, v in enumerate(row))))
+    return ('<div class="heat">%s</div><div class="hm-legend"><span class="hm-what">attacker IPs per hour, %s</span><span>fewer</span>%s<span>more</span></div>'
+            % ("".join(cells), esc(str(TZ)), "".join('<i class="hm%d"></i>' % n for n in range(1, 9))))
+
+
+def week_card(con):
+    end = time.time()
+    w = week_summary(con, end - 7 * 86400, end)
+    rows = [("Attackers", "%s <span class=muted>%s</span>" % (num(w["active"]), esc(trend(w["active"], w["before"])))),
+            ("New attackers", num(w["new_ips"])),
+            ("New countries", " ".join(cc_html(c) for c in w["new_cc"][:12]) or "–"),
+            ("New campaigns", ('<a href="/campaigns">%d</a> <span class=muted>(%d IPs)</span>' % (w["campaigns"], w["campaign_ips"])) if w["campaigns"] else "–"),
+            ("New malware", " ".join("%s ×%d" % (family_tag(k) if k != "Unknown" else '<span class="tag">unknown</span>', v)
+                                     for k, v in sorted(w["families"].items(), key=lambda x: -x[1])[:6]) or "–"),
+            ("Took the bait", num(w["took"]) if w["took"] else "–")]
+    return '<div class="card"><h3>New this week <span class=muted>last 7 days</span></h3>%s</div>' % kv(rows)
 
 
 def time_wasted(con, since):
@@ -1499,8 +1693,9 @@ def v_ip(ip):
     for x in files:
         sha = x["b"] or ""
         links_f = (ext("https://bazaar.abuse.ch/sample/" + sha + "/", "MalwareBazaar") + " · " + ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")) if sha else (ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(x["a"] or ""), "URLhaus") if x["a"] else "")
-        frows += "<tr><td class='mono trunc'>%s</td><td class=mono>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            esc(clean(x["a"], 200)), esc(sha[:16] + "…" if sha else ("download failed" if x["kind"] == "file_fail" else "")), esc(ago(x["l"])), num(x["n"]), links_f)
+        fam, how = file_family(con.execute("SELECT * FROM files WHERE sha=?", (sha,)).fetchone() if sha else None, x["a"] or "")
+        frows += "<tr><td class='mono trunc'>%s %s</td><td class=mono>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            family_tag(fam, how), esc(clean(x["a"], 200)), esc(sha[:16] + "…" if sha else ("download failed" if x["kind"] == "file_fail" else "")), esc(ago(x["l"])), num(x["n"]), links_f)
     files_html = ('<div class="card span2"><h3>Files and URLs</h3><table><thead><tr><th>Name / URL</th><th>SHA-256</th><th>Last</th><th>Count</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>' % frows) if frows else ""
 
     # Related IPs
@@ -1637,8 +1832,9 @@ def v_files():
     for sha in shas:
         e, f = ev.get(sha), fi.get(sha)
         iocs = json.loads(f["iocs"]) if f and f["iocs"] else []
-        kind = (esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
-                + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>'
+        fam, how = file_family(f, e["names"] if e else "")
+        kind = (family_tag(fam, how) + " " if fam else "") + ((esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
+                + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>')
         trs += ("<tr><td class=mono>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td>%s</td><td class=num>%s</td><td>%s · %s</td></tr>"
                 % (("<a href='/campaign/file/%s'>%s…</a>" % (esc(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
                    esc("%.1f KB" % (f["size"] / 1024.0)) if f else "", esc(clean(e["names"], 200)) if e else "",
@@ -2179,6 +2375,15 @@ def v_login(err=""):
 # ---------------------------------------------------------------- static files
 
 CSS = r"""
+.heat{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
+.hm-row{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;align-items:center}
+.hm-row i{display:block;aspect-ratio:1;border-radius:3px;background:var(--panel2);min-height:10px}.hm-head span{text-align:left}
+.hm1{background:color-mix(in srgb,var(--accent) 14%,var(--panel2))!important}.hm2{background:color-mix(in srgb,var(--accent) 26%,var(--panel2))!important}
+.hm3{background:color-mix(in srgb,var(--accent) 38%,var(--panel2))!important}.hm4{background:color-mix(in srgb,var(--accent) 50%,var(--panel2))!important}
+.hm5{background:color-mix(in srgb,var(--accent) 62%,var(--panel2))!important}.hm6{background:color-mix(in srgb,var(--accent) 74%,var(--panel2))!important}
+.hm7{background:color-mix(in srgb,var(--accent) 87%,var(--panel2))!important}.hm8{background:var(--accent)!important}
+.hm-legend{display:flex;align-items:center;gap:3px;justify-content:flex-end;margin-top:8px;font-size:11px;color:var(--muted)}
+.hm-legend i{width:12px;height:12px;border-radius:3px;display:block}.hm-legend span{margin:0 4px}.hm-legend .hm-what{margin-right:auto;margin-left:0}
 .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}@media(max-width:800px){.grid2{grid-template-columns:1fr}}
 .pwcheck{display:flex;gap:8px;flex-wrap:wrap}.pwcheck input{flex:1;min-width:180px}.pwc-out{margin-top:10px}.pwc-out table{margin-top:6px}
 .pwc-out th{text-align:left;font-weight:500;color:var(--muted);padding-right:14px}.pwc-ok{color:#2f9e5b;font-weight:600}.pwc-bad{color:#d1453b;font-weight:600}
