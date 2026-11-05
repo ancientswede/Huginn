@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.12.4"
+HUGINN_VERSION = "0.13.0"
 CHANGELOG = [
+    ("0.13.0", "2026-11-05", "Huginn runs in Docker: Dockerfile and docker-compose.yml (one volume for everything, unprivileged, read-only, health check), the container makes its SSH key and learns the honeypot's host key on first start. Image for amd64 and arm64 at ghcr.io/ancientswede/huginn from each release."),
     ("0.12.4", "2026-11-05", "Fix: the bars in the charts were gone in 0.12.2-0.12.3 (only the numbers showed). Their heights were inline styles, which Huginn's own Content-Security-Policy blocks."),
     ("0.12.3", "2026-11-05", "Huginn has a logo: the raven as tab icon, next to the name in the header and on the login page. README banner."),
     ("0.12.2", "2026-11-05", "The bar charts show the number above each bar (no need to hover), sharp at any screen size."),

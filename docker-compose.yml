@@ -1,0 +1,29 @@
+# Huginn in Docker (part of Huginn, AGPL-3.0-or-later). Only Huginn: the honeypot runs on its own isolated VM/LXC.
+#   cp docker/.env.example .env   # set HUGINN_HP_HOST, then:
+#   docker compose up -d && docker compose logs huginn     # shows the line to run on the honeypot
+#   docker compose exec -it huginn huginn set-password
+services:
+  huginn:
+    image: ghcr.io/ancientswede/huginn:${HUGINN_TAG:-latest}
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${HUGINN_WEB_PORT:-8095}:8095"
+    volumes:
+      - huginn-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  huginn-data:

@@ -37,6 +37,26 @@ jobs:
       - name: ShellCheck
         run: shellcheck -S warning *.sh tools/*.sh honeypot/*.sh honeypot/hp-export honeypot/hp-logclean
 
+  docker:
+    name: Docker image builds and starts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t huginn-ci .
+      - name: Start and wait until healthy
+        run: |
+          docker run -d --name huginn-ci-test --read-only --tmpfs /tmp --cap-drop ALL -e HUGINN_HP_HOST=192.0.2.10 -p 8095:8095 huginn-ci
+          for i in $(seq 1 30); do
+            s=$(docker inspect --format '{{.State.Health.Status}}' huginn-ci-test); echo "$s"
+            [ "$s" = healthy ] && break; sleep 5
+          done
+          docker logs huginn-ci-test
+          [ "$(docker inspect --format '{{.State.Health.Status}}' huginn-ci-test)" = healthy ]
+          docker logs huginn-ci-test | grep -q "hp-add-huginn-key 'ssh-ed25519 "
+          [ "$(docker exec huginn-ci-test id -u)" = 10001 ]
+          curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8095/login | grep -qE '200|503'
+
   upstream:
     name: Patches fit the newest Cowrie and OpenCanary
     runs-on: ubuntu-latest

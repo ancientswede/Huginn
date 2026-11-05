@@ -157,7 +157,7 @@ The script asks before each optional part: OpenCanary, the endlessh tarpit and h
 
 From now on, log in with `ssh -p <your admin port> root@honeypot`.
 
-**2. On the Huginn machine**
+**2. On the Huginn machine** (or use [Docker](#run-huginn-in-docker))
 
 ```bash
 apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
@@ -175,6 +175,31 @@ The script:
 **3. Forward the ports**, but only after you have read [the warning above](#️-read-this-before-you-open-any-ports) and **tested the isolation**. Forward the ports in [Ports to forward](#ports-to-forward) (also listed at the end of step 1) from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
 
 **Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
+
+## Run Huginn in Docker
+
+The Huginn side also runs as a container. **The honeypot does not:** it needs its own isolated VM or LXC with port redirects, set up with `install-honeypot.sh` as above. Never run the honeypot next to your other containers.
+
+```bash
+git clone https://github.com/ancientswede/Huginn.git && cd Huginn
+cp docker/.env.example .env          # set HUGINN_HP_HOST (and HUGINN_HP_PORT if not 22022)
+docker compose up -d
+docker compose logs huginn           # shows the honeypot's key fingerprint and the line to run on the honeypot
+```
+
+1. Compare the fingerprint in the log with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the honeypot.
+2. On the honeypot, run the `hp-add-huginn-key '...'` line from the log, once.
+3. Set the login password: `docker compose exec -it huginn huginn set-password`
+4. Open `http://<docker host>:8095`. The first data shows up within two minutes.
+
+Everything Huginn keeps lives in the `huginn-data` volume: the database, session recordings, its SSH key and the honeypot's host key. The container runs as an unprivileged user with a read-only file system and no capabilities.
+
+- **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. `docker compose up -d --build` builds it yourself instead. Pin a version with `HUGINN_TAG=0.13.0` in `.env`.
+- **Update:** `docker compose pull && docker compose up -d`. The volume is kept.
+- **Extra bait values:** `docker compose cp bait.json huginn:/data/bait.json`, then `docker compose restart huginn`.
+- **Honeypot reinstalled** (new host key): `docker compose exec huginn rm /data/.ssh/known_hosts`, then `docker compose restart huginn` and compare the new fingerprint.
+- **Back up** the volume, for example: `docker run --rm -v huginn_huginn-data:/data -v "$PWD":/backup alpine tar czf /backup/huginn-data.tgz -C /data .`
+- **Remove:** `docker compose down` keeps the data; `docker compose down -v` deletes it too.
 
 ## Manual install (what the scripts do)
 
