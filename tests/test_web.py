@@ -106,6 +106,13 @@ class Web(unittest.TestCase):
         r, body = self.req("GET", "/login")
         self.assertIn("icon-32.png", body)
 
+    def test_no_inline_styles(self):
+        # The CSP has style-src 'self': style="" attributes are silently ignored by browsers, so never render any.
+        for p in ("/", "/ips", "/campaigns", "/files", "/creds", "/blocklist", "/settings", "/account", "/ip/198.51.100.10"):
+            r, body = self.get(p)
+            if r.status == 200:
+                self.assertNotRegex(body, r"\sstyle=", p)
+
     def test_feed_token(self):
         tok = app.get_meta(app.connect(), "feed_token")
         r, body = self.req("GET", "/feed/%s/txt" % tok)

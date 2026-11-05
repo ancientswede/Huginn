@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.12.3"
+HUGINN_VERSION = "0.12.4"
 CHANGELOG = [
+    ("0.12.4", "2026-11-05", "Fix: the bars in the charts were gone in 0.12.2-0.12.3 (only the numbers showed). Their heights were inline styles, which Huginn's own Content-Security-Policy blocks."),
     ("0.12.3", "2026-11-05", "Huginn has a logo: the raven as tab icon, next to the name in the header and on the login page. README banner."),
     ("0.12.2", "2026-11-05", "The bar charts show the number above each bar (no need to hover), sharp at any screen size."),
     ("0.12.1", "2026-11-05", "Fix: copying session recordings in batches stopped at the first batch (bytes vs. text)."),
@@ -1124,11 +1125,13 @@ def bars(values, labels, h=90, cls="bar"):
     if not values:
         return ""
     mx = max(values) or 1
-    out = ['<div class="bars" style="--bh:%dpx" role="img">' % h]
+    # No style="" attributes: the Content-Security-Policy (style-src 'self') blocks them. Heights are CSS classes.
+    out = ['<div class="bars bars-%d" role="img">' % (90 if h >= 90 else 60)]
     for v, lab in zip(values, labels):
         pct = (v / mx * 100) if v else 0
-        out.append('<div class="bcol" title="%s: %s"><span class="bval">%s</span><i class="%s" style="height:calc((100%% - 16px) * %.3f)"></i></div>'
-                   % (esc(lab), num(v), short_num(v) if v else "", cls, max(pct, 1.5) / 100 if v else 0))
+        step = max(2, round(pct / 2) * 2) if v else 0          # 2 % steps: 51 classes cover every bar
+        out.append('<div class="bcol" title="%s: %s"><span class="bval">%s</span><i class="%s h%d"></i></div>'
+                   % (esc(lab), num(v), short_num(v) if v else "", cls, step))
     out.append("</div>")
     return "".join(out)
 
@@ -2225,7 +2228,7 @@ tbody tr:hover{background:var(--panel2)}tr:last-child td{border-bottom:0}
 .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:500;border:1px solid currentColor;margin:1px 2px 1px 0;color:var(--muted)}
 .t-red{color:var(--red)}.t-orange{color:var(--orange)}.t-yellow{color:var(--yellow)}.t-blue{color:var(--blue)}.t-purple{color:var(--purple)}
 .t-teal{color:var(--teal)}.t-grey{color:var(--grey)}.t-green{color:var(--green)}
-.bars{display:flex;align-items:flex-end;gap:4px;width:100%;height:calc(var(--bh,90px) + 18px)}
+.bars{display:flex;align-items:flex-end;gap:4px;width:100%;height:108px}.bars-60{height:78px}
 .bcol{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
 .bval{font-size:11px;line-height:1;color:var(--muted);margin-bottom:4px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bcol i{display:block;width:100%;max-width:44px;border-radius:3px 3px 0 0;background:var(--accent);opacity:.85;flex:none}
@@ -2349,6 +2352,7 @@ if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.
 """
 CSS += ".offscreen{position:fixed;left:-9999px;top:0}"
 # Accent colours: light first, then dark (higher specificity wins in dark mode), then compact layout and settings page.
+CSS += "".join(".bcol i.h%d{height:calc((100%% - 16px) * %.2f)}" % (n, n / 100) for n in range(0, 101, 2))
 CSS += ":root{color-scheme:light}" + "".join(":root[data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[0], v[1]) for k, v in ACCENTS.items())
 CSS += "@media (prefers-color-scheme:dark){" + "".join(":root:not([data-theme=light])[data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[2], v[3]) for k, v in ACCENTS.items()) + "}"
 CSS += "".join(":root[data-theme=dark][data-accent=%s]{--accent:%s;--accent2:%s}" % (k, v[2], v[3]) for k, v in ACCENTS.items())
