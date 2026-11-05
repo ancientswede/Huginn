@@ -59,9 +59,21 @@ Getting the port forward right in your router only controls what comes **in**. I
 
 | | How | Verdict |
 |---|---|---|
-| **1. Own VLAN** | Put the honeypot on its own VLAN (UniFi, OPNsense, pfSense, MikroTik, most managed switches). Add firewall rules: honeypot VLAN → LAN/other VLANs/router = **block**, LAN → honeypot = allow only Huginn to the admin port. | **Best.** The network itself keeps it apart. |
+| **1. Own VLAN** | Put the honeypot on its own VLAN (UniFi, OPNsense, pfSense, MikroTik, most managed switches). Add firewall rules: honeypot VLAN → LAN/other VLANs **and the router itself** = **block**, LAN → honeypot = allow only Huginn to the admin port. | **Best.** The network itself keeps it apart. |
 | **2. Hypervisor firewall** | No VLAN-capable gear? Keep the honeypot on your normal network, but block it from your LAN with the firewall of the *host* it runs on (Proxmox example below). Rules inside the honeypot itself do not count: an attacker with root just turns them off. | **Acceptable.** It is still on your LAN segment, so get the rules right and test them. |
 | **3. Nothing** | Honeypot on the same network as everything else, only a port forward. | **Don't.** One escape from the fake shell and the attacker is inside your home network. |
+
+**Test it from the honeypot** with `tools/check-isolation.sh`, giving it a few machines from your LAN. It also checks the router itself, which is the most common gap:
+
+```bash
+cd Huginn && ./tools/check-isolation.sh 192.168.1.10 192.168.1.20:445 192.168.1.30:8006
+```
+
+**UniFi (learned on our own honeypot).**
+- **"Isolate Network" is not enough.** It blocks the other VLANs, but the honeypot can still reach the **gateway itself** on all its addresses: its SSH (port 22) answered from the honeypot. Add a firewall policy with the honeypot network as source, the **Gateway** zone as destination and action **Block**, placed before the default "allow to Gateway" policy. Allow DNS (port 53) first only if you want the honeypot to resolve names. It does not need to, and the router's DNS may hand out your internal host names.
+- **Give the honeypot a static IP address** in its own network settings (in Proxmox: the container's network device, *Static*). DHCP also goes to the gateway, so once that is blocked the lease cannot be renewed and the honeypot drops off the network. A "Fixed IP" in UniFi is still DHCP.
+- **Exclude the honeypot from Threat Management (IPS)**, or it silently drops the attacks. See [Router security features can hide the attacks](#router-security-features-can-hide-the-attacks).
+- Run `tools/check-isolation.sh` again after every change.
 
 **Proxmox firewall example (option 2).** Turn on the firewall under Datacenter → Firewall, and on the container's network device (`firewall=1`). Then create `/etc/pve/firewall/<CTID>.fw` on the Proxmox host. Replace `192.168.1.0/24` with your LAN, `192.168.1.50` with Huginn's address and `22022` with your admin port:
 
