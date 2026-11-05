@@ -4,5 +4,15 @@ Description=Huginn honeypot: compress and remove old logs
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/hp-logclean
+# Only Cowrie's own files are touched, so it runs as Cowrie's user, without network, in a read-only system.
+User=cowrie
+Group=cowrie
 Nice=10
 IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/cowrie
+PrivateTmp=yes
+PrivateNetwork=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

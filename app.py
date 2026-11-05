@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.14.2"
+HUGINN_VERSION = "0.14.3"
 CHANGELOG = [
+    ("0.14.3", "2026-11-05", "Security review: data from ipwho.is, Shodan and reverse DNS is validated, the CSV blocklist uses real CSV quoting, a negative Content-Length can no longer hang a request, extra security headers, harder systemd sandbox, hp-export never follows symlinks, hp-logclean runs as the cowrie user. New tests plant HTML/JS in every attacker-controlled field."),
     ("0.14.2", "2026-11-05", "Session replays are easy to find: a Replay button on every recorded shell session of an attacker (no need to open it first) and in Latest shell sessions on the overview."),
     ("0.14.1", "2026-11-05", "Malware families from real honeypot data: loaders hidden as \\x escapes or base64 are decoded (their C2 addresses show up too), more dropper shapes (busybox wget, wget -O- | sh, ftpget), \"competitor killer\" scripts, SSH keys written to authorized_keys."),
     ("0.14.0", "2026-11-05", "Malware families: captured files are recognised as Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors or dropper scripts (strings in the file, its name or URL, optionally MalwareBazaar with HUGINN_MALWAREBAZAAR_KEY). Overview: New this week, and When they attack (a heat map per hour of the week). Weekly ntfy summary on Sunday evening."),
@@ -1016,6 +1017,14 @@ def http_json(url):
         raise
 
 
+def ext_text(v, n=200):
+    # Text from outside (ipwho.is, Shodan, the attacker's own reverse DNS): no control characters, bounded length.
+    if v is None:
+        return None
+    v = "".join(c for c in str(v) if c.isprintable())[:n].strip()
+    return v or None
+
+
 def enrich_ip(ip):
     d = {"cc": None, "country": None, "city": None, "asn": None, "org": None, "isp": None, "rdns": None,
          "ports": None, "tags": None, "vulns": None, "hostnames": None}
@@ -1024,21 +1033,25 @@ def enrich_ip(ip):
         j = http_json("https://ipwho.is/%s?fields=success,country,country_code,city,connection" % urllib.parse.quote(ip))
         if j.get("success"):
             conn = j.get("connection") or {}
-            d.update(cc=j.get("country_code"), country=j.get("country"), city=j.get("city"),
-                     asn=str(conn.get("asn") or "") or None, org=conn.get("org"), isp=conn.get("isp"))
+            cc = str(j.get("country_code") or "").upper()
+            asn = str(conn.get("asn") or "")
+            d.update(cc=cc if re.fullmatch(r"[A-Z]{2}", cc) else None, country=ext_text(j.get("country"), 60), city=ext_text(j.get("city"), 60),
+                     asn=asn if re.fullmatch(r"\d{1,10}", asn) else None, org=ext_text(conn.get("org")), isp=ext_text(conn.get("isp")))
             ok = 1
     except Exception:
         pass
     try:
         j = http_json("https://internetdb.shodan.io/" + urllib.parse.quote(ip))
-        d.update(ports=",".join(str(p) for p in (j.get("ports") or [])[:40]),
-                 tags=",".join(j.get("tags") or []), vulns=",".join((j.get("vulns") or [])[:40]),
-                 hostnames=",".join((j.get("hostnames") or [])[:10]))
+        lst = lambda k, n, rx: [x for x in (str(v) for v in (j.get(k) or [])[:n]) if re.fullmatch(rx, x)]
+        d.update(ports=",".join(lst("ports", 40, r"\d{1,5}")) or None,
+                 tags=",".join(lst("tags", 20, r"[A-Za-z0-9_.-]{1,40}")) or None,
+                 vulns=",".join(lst("vulns", 40, r"(CVE|cve)-\d{4}-\d{3,7}")) or None,
+                 hostnames=",".join(lst("hostnames", 10, r"[A-Za-z0-9_.-]{1,253}")) or None)
         ok = 1
     except Exception:
         pass
     try:
-        d["rdns"] = _rdns_pool.submit(lambda: socket.gethostbyaddr(ip)[0]).result(timeout=4)
+        d["rdns"] = ext_text(_rdns_pool.submit(lambda: socket.gethostbyaddr(ip)[0]).result(timeout=4), 253)
     except Exception:
         pass
     # Only names count: Shodan's "scanner" tag just means "seen scanning", which every attacker is.
@@ -2151,17 +2164,22 @@ def render_feed(fmt, ips):
         c2 = c2_list(db())
         return ("# Huginn C2 / malware hosts, %s, %d entries\n" % (now, len(c2))) + "".join("%s\n" % i for i in sorted(c2)), "text/plain"
     if fmt == "csv":
+        # Real CSV quoting: no value (country, tags) can ever start a new row in a firewall's import.
+        import csv as _csv, io as _io
         con = db()
         meta = {}
         if ips:
             for r in con.execute("SELECT i.ip, i.score, i.last, i.tags, e.cc FROM ips i LEFT JOIN enrich e USING(ip)"):
                 meta[r["ip"]] = r
-        s = ["value,score,last_seen,country,reason"]
+        out = _io.StringIO()
+        w = _csv.writer(out, lineterminator="\n")
+        w.writerow(["value", "score", "last_seen", "country", "reason"])
         for i in ips:
             r = meta.get(i)
-            s.append("%s,%s,%s,%s,huginn %s" % (i, r["score"] if r else "", datetime.fromtimestamp(r["last"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if r else "",
-                                                   (r["cc"] or "") if r else "", ((r["tags"] or "").replace(",", " ")) if r else ""))
-        return "\n".join(s) + "\n", "text/csv"
+            cc = (r["cc"] or "") if r else ""
+            w.writerow([i, r["score"] if r else "", datetime.fromtimestamp(r["last"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if r else "",
+                        cc if re.fullmatch(r"[A-Z]{2}", cc) else "", "huginn " + re.sub(r"[^a-z0-9 -]", "", ((r["tags"] or "").replace(",", " ")) if r else "")])
+        return out.getvalue(), "text/csv"
     return None, None
 
 
@@ -2616,6 +2634,8 @@ SEC_HEADERS = {
     "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
                                "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin", "X-Frame-Options": "DENY",
+    "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
 
 
@@ -2679,8 +2699,13 @@ class Handler(BaseHTTPRequestHandler):
         return urllib.parse.urlsplit(o).netloc == (self.headers.get("Host") or "")
 
     def form(self, lists=None):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 20000:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > 20000:
+            # Never read an unknown or huge body (a negative length would wait forever); drop the connection instead.
+            self.close_connection = True
             return {}
         raw = self.rfile.read(n).decode("utf-8", "replace")
         parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
@@ -2692,7 +2717,10 @@ class Handler(BaseHTTPRequestHandler):
         # Redirect to the page the form was posted from (same origin was already checked).
         ref = urllib.parse.urlsplit(self.headers.get("Referer") or "/")
         target = ref.path + ("?" + ref.query if ref.query else "")
-        return target if target.startswith("/") and not target.startswith("//") else "/"
+        # Only a path on this site: "//host" and "/\host" would send the browser elsewhere.
+        if not target.startswith("/") or target[1:2] in ("/", "\\") or any(c in target for c in "\\\r\n\t"):
+            return "/"
+        return target
 
     def do_HEAD(self):
         self.do_GET()

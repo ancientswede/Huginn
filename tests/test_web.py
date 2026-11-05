@@ -113,6 +113,17 @@ class Web(unittest.TestCase):
             if r.status == 200:
                 self.assertNotRegex(body, r"\sstyle=", p)
 
+    def test_bad_content_length(self):
+        import socket
+        for cl in ("-5", "abc", "999999"):
+            sk = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            sk.sendall(("POST /login HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: http://127.0.0.1:%d\r\n"
+                        "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %s\r\n\r\n" % (self.port, self.port, cl)).encode())
+            data = sk.recv(4096)                                      # answers instead of waiting forever
+            sk.close()
+            self.assertTrue(data.startswith(b"HTTP/1."), cl)
+        app._fails.clear()                                            # these count as failed logins; do not lock out other tests
+
     def test_feed_token(self):
         tok = app.get_meta(app.connect(), "feed_token")
         r, body = self.req("GET", "/feed/%s/txt" % tok)

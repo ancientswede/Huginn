@@ -34,9 +34,31 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
   *) ;;  # any other command gets the normal export
 esac
 # Print the files matching a pattern, oldest first, skipping old compressed ones (Huginn has had those for days).
-# No match -> no output (cat must never wait on stdin).
-# shellcheck disable=SC2207,SC2010  # $1 is a glob of our own log files; their names never contain spaces
-catfiles() { local f; f=( $(ls -tr $1 2>/dev/null | grep -v '\.gz$') ); [ ${#f[@]} -gt 0 ] && cat "${f[@]}" 2>/dev/null; return 0; }
+# Never follows a symlink: this runs as root, and an attacker who got out of Cowrie (as the cowrie user) could replace a
+# log with a link to /etc/shadow. Files are opened with O_NOFOLLOW and must be regular files. No match -> no output.
+# shellcheck disable=SC2010  # $1 is a glob of our own log files; their names never contain spaces
+catfiles() {
+  local list
+  list=$(ls -tr $1 2>/dev/null | grep -v '\.gz$')
+  [ -n "$list" ] || return 0
+  printf '%s\n' "$list" | python3 -I -c '
+import os, stat, sys
+for p in sys.stdin.read().splitlines():
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        continue
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            continue
+        while True:
+            b = fh.read(1 << 20)
+            if not b:
+                break
+            sys.stdout.buffer.write(b)
+'
+  return 0
+}
 echo "##COWRIE"
 for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000; done
 echo "##CANARY"

@@ -98,6 +98,27 @@ class FileInfo(unittest.TestCase):
         self.assertNotIn("8.8.4.4", out)      # already part of a URL
 
 
+class ExportSymlinks(unittest.TestCase):
+    # hp-export runs as root. A log replaced by a symlink (to /etc/shadow, say) must never be followed.
+    def test_catfiles_skips_symlinks(self):
+        import subprocess
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, "secret"), "w") as fh:
+                fh.write("TOP-SECRET-LINE\n")
+            with open(os.path.join(d, "log.json"), "w") as fh:
+                fh.write("REAL-LOG-LINE\n")
+            os.symlink(os.path.join(d, "secret"), os.path.join(d, "log.json.2026-11-01"))
+            with open(os.path.join(ROOT, "honeypot", "hp-export")) as fh:
+                src = fh.read()
+            func = src[src.index("catfiles() {"):src.index("\n}\n", src.index("catfiles() {")) + 3]
+            out = subprocess.run(["bash", "-c", func + '\ncatfiles "%s/log.json*"' % d], capture_output=True, text=True, timeout=20).stdout
+            self.assertIn("REAL-LOG-LINE", out)
+            self.assertNotIn("TOP-SECRET-LINE", out)
+        finally:
+            shutil.rmtree(d)
+
+
 class Traps(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
