@@ -234,6 +234,26 @@ Huginn can push a short summary to [ntfy](https://ntfy.sh), the phone app, when 
 - **Choose which events** you get, or send a test, on the **Settings** page.
 - **Your own ntfy server** in the homelab is the most private option. On the public `ntfy.sh`, anyone who guesses the topic name can read your messages, so use a long random name like the one the installer suggests. The messages only contain counts and attacker IPs, never your own addresses.
 
+## Updating
+
+Get the new version, then run the update script on each machine. Your settings, keys, login and collected data are never replaced.
+
+```bash
+cd Huginn && git pull
+
+# On the Huginn machine
+./update-huginn.sh              # backup -> install -> checks the new version answers -> rolls back by itself if not
+./update-huginn.sh --rollback   # go back to the version before the last update
+
+# On the honeypot
+./update-honeypot.sh                          # hp-export, hp-fileinfo, hp-traps
+./update-honeypot.sh --cowrie --opencanary    # also upgrade Cowrie and OpenCanary and re-apply Huginn's patches
+```
+
+- `update-huginn.sh` keeps the last three backups (code + a consistent copy of the database) in `/opt/huginn/backups/`, and lists what is new since your version.
+- Huginn checks GitHub's public list of version tags once a day and shows **update x.y.z** in the header when there is a newer one. Nothing about you is sent. Turn it off with `HUGINN_UPDATE_CHECK=0`.
+- Running the install scripts again also works. They keep everything that is already set up, but they make no backup and do not roll back on failure.
+
 ## Using the blocklists
 
 The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
@@ -293,6 +313,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |
 | `HUGINN_TRUSTED_PROXIES` | – | Reverse proxy IPs allowed to set `X-Forwarded-*` |
 | `HUGINN_MASK` | – | Your own public IPs/domains, replaced with `[self]` in everything stored (attackers often echo the address they target) |
+| `HUGINN_UPDATE_CHECK` | `1` | Daily check for a newer version (reads GitHub's public tag list) |
 | `HUGINN_ALLOW_PRIVATE` | `0` | `1` = also record LAN source addresses (testing only; never blocklisted) |
 
 ## Security model
@@ -327,6 +348,9 @@ app.py serve                 # run the web UI and the collector (what systemd ru
 app.py set-password          # set or reset the login password (logs out every session)
 app.py ingest-once           # one sync, for testing
 app.py import FILE...        # import full cowrie.json* / opencanary.log* files
+
+./update-huginn.sh [--rollback]          # update / go back (Huginn machine)
+./update-honeypot.sh [--cowrie] [--opencanary]   # update the honeypot side
 ```
 
 ## Support

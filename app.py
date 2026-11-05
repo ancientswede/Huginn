@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.8.4"
+HUGINN_VERSION = "0.9.0"
 CHANGELOG = [
+    ("0.9.0", "2026-11-05", "Updates: update-huginn.sh (backup, health check, automatic rollback, --rollback) and update-honeypot.sh (also upgrades Cowrie/OpenCanary and re-applies Huginn's patches). Huginn shows when a newer version is out."),
     ("0.8.4", "2026-11-05", "ntfy servers with access control: HUGINN_NTFY_TOKEN. The installer asks about ntfy and sends a test notification."),
     ("0.8.3", "2026-11-05", "Web decoy: HTTPS port and readable web requests (method, path, status). The address the attacker connected to is no longer stored, and HUGINN_MASK hides your own IPs/domains in everything stored."),
     ("0.8.2", "2026-11-05", "Clicking a country on the map shows exactly that country (new country filter on the Attackers list)."),
@@ -83,6 +84,9 @@ SESSION_DAYS = 14
 # The honeypot may be fully compromised one day: never read more than this from it.
 MAX_EXPORT = int(os.environ.get("HUGINN_MAX_EXPORT_MB", "256")) * 1024 * 1024
 MAX_TTY = 64 * 1024 * 1024
+# Update check: once a day, read the public list of version tags on GitHub (sends nothing about you). 0 = off.
+UPDATE_CHECK = os.environ.get("HUGINN_UPDATE_CHECK", "1") == "1"
+REPO = os.environ.get("HUGINN_REPO", "ancientswede/Huginn")
 NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan:2586/huginn — empty = no notifications
 NTFY_TOKEN = os.environ.get("HUGINN_NTFY_TOKEN", "")      # access token (tk_...) for ntfy servers with access control
 
@@ -664,6 +668,7 @@ def collector_loop():
             set_meta(con, "last_error", "%s %s" % (fmt_ts(time.time()), str(e)[:300]))
         try:
             notify(con)
+            check_update(con)
         except Exception as e:
             set_meta(con, "last_notify_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
         if time.time() - last_ret > 86400:
@@ -673,6 +678,39 @@ def collector_loop():
             except Exception as e:
                 set_meta(con, "last_error", "retention: %s" % e)
         time.sleep(max(10, POLL - (time.time() - t0)))
+
+
+def vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).lstrip("v").split(".")[:3])
+    except ValueError:
+        return (0,)
+
+
+def check_update(con):
+    if not UPDATE_CHECK or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO):
+        return
+    if time.time() - float(get_meta(con, "update_checked", "0") or 0) < 86400:
+        return
+    set_meta(con, "update_checked", time.time())
+    try:
+        req = urllib.request.Request("https://api.github.com/repos/%s/tags?per_page=50" % REPO,
+                                     headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+        tags = json.loads(urllib.request.urlopen(req, timeout=15).read(500000))
+        versions = [t.get("name", "") for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t.get("name", ""))]
+        latest = max(versions, key=vtuple) if versions else ""
+        set_meta(con, "update_latest", latest.lstrip("v"))
+        set_meta(con, "update_error", "")
+    except Exception as e:  # repo not public yet, offline, rate limited: never a problem, just no notice
+        set_meta(con, "update_error", str(e)[:200])
+
+
+def update_badge(con):
+    latest = get_meta(con, "update_latest", "") or ""
+    if latest and vtuple(latest) > vtuple(HUGINN_VERSION):
+        return ("<a class='upd' href='https://github.com/%s/releases' target='_blank' rel='noopener noreferrer' "
+                "title='Update with: git pull && ./update-huginn.sh'>update %s</a>" % (esc(REPO), esc(latest)))
+    return ""
 
 
 def human_like(con, sid):
@@ -1011,12 +1049,12 @@ def page(title, body, active="/"):
             "<title>%s · %s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'>"
             "<script src='/static/app.js?v=%s' defer></script></head><body>"
             "<header><div class=brand><a href='/'>%s</a></div><nav>%s</nav>"
-            "<div class=hdr-right>%s<span class=muted>v%s</span>%s"
+            "<div class=hdr-right>%s<span class=muted>v%s</span>%s%s"
             "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
             "<main>%s</main></body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
-                                                  esc(st["title"]), nav, status, HUGINN_VERSION, theme_btn,
+                                                  esc(st["title"]), nav, status, HUGINN_VERSION, update_badge(con), theme_btn,
                                                   " on" if active == "/settings" else "", " on" if active == "/account" else "", body)
 
 
@@ -1691,7 +1729,10 @@ def v_account(cur, ok="", err=""):
                  ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
-                 ("Honeypot", '<span class=mono>%s:%s</span> every %ss' % (esc(HP_HOST), esc(HP_PORT), POLL))])
+                 ("Honeypot", '<span class=mono>%s:%s</span> every %ss' % (esc(HP_HOST), esc(HP_PORT), POLL)),
+                 ("Updates", esc(("newest release %s" % get_meta(con, "update_latest")) if get_meta(con, "update_latest") else
+                                 ("not checked yet" if UPDATE_CHECK else "check turned off (HUGINN_UPDATE_CHECK=0)"))
+                  + (' <span class=muted>(%s)</span>' % esc(ago(float(get_meta(con, "update_checked", "0") or 0))) if get_meta(con, "update_checked") else ""))])
     log = "".join('<div class="cl"><span class="mono">%s</span><span class="muted">%s</span><span>%s</span></div>' % (esc(v), esc(d), esc(t)) for v, d, t in CHANGELOG)
     body = ('<h1>Account</h1>%s<div class="grid">'
             '<div class="card"><h3>Change password</h3><form method=post action="/account/password" class="stack">'
@@ -1964,6 +2005,7 @@ CSS += ("[data-density=compact] th,[data-density=compact] td{padding:3px 6px}[da
         "[data-density=compact] .kpi{padding:9px 12px}[data-density=compact] .kpi-v{font-size:21px}[data-density=compact] .grid,"
         "[data-density=compact] .kpis,[data-density=compact] .grid3{gap:9px}[data-density=compact] main{padding-top:14px}"
         "[data-density=compact] body{font-size:13px}")
+CSS += (".upd{font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 9px}")
 CSS += (".vtabs{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;text-transform:none;letter-spacing:0}"
         ".vtabs button{background:none;color:var(--muted);border:0;border-radius:0;padding:3px 12px;font-size:12px}.vtabs button.on{background:var(--accent2);color:var(--accent)}"
         ".wm-svg{width:100%;height:auto;max-height:420px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:90px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"

@@ -101,7 +101,7 @@ command -v systemctl >/dev/null || die "systemd is required."
 for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_TELNET $TARPIT $CANARY_FTP $CANARY_HTTP $CANARY_HTTPS; do
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py systemd/hp-traps.service; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py systemd/hp-traps.service; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -197,35 +197,9 @@ else
 fi
 # Cowrie's "free" reads the host's real /proc/meminfo, which gives the honeypot away: read the fake one first.
 FREE="$C/src/cowrie/commands/free.py"
-if [ -f "$FREE" ] && ! grep -q "Huginn patch" "$FREE"; then
-  python3 - "$FREE" <<'PY' && ok "patched free.py to read the fake /proc/meminfo" || warn "free.py not patched (Cowrie changed); harmless"
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = '''        try:
-            with open("/proc/meminfo") as proc_file:
-                for line in proc_file:'''
-new = '''        try:
-            # Huginn patch: read the persona's fake /proc/meminfo (honeyfs) first, the host's real one only as fallback.
-            try:
-                lines = self.fs.file_contents("/proc/meminfo").decode("utf-8", "replace").splitlines()
-            except Exception:
-                with open("/proc/meminfo") as real_file:
-                    lines = real_file.read().splitlines()
-            if True:
-                for line in lines:'''
-old2 = '''        # Got a map with all tokens from /proc/meminfo and sizes in KBs
-        return mem_info_map'''
-new2 = '''        for k in ("MemTotal", "MemFree", "Buffers", "Cached", "SwapTotal", "SwapFree", "Shmem"):
-            mem_info_map.setdefault(k, 0)
-        mem_info_map.setdefault("MemAvailable", mem_info_map["MemFree"] + mem_info_map["Cached"] + mem_info_map["Buffers"])
-        # Got a map with all tokens from /proc/meminfo and sizes in KBs
-        return mem_info_map'''
-if s.count(old) != 1 or s.count(old2) != 1:
-    sys.exit(1)
-cp = p + ".orig"
-open(cp, "w").write(s)
-open(p, "w").write(s.replace(old, new).replace(old2, new2))
-PY
+if [ -f "$FREE" ]; then
+  rc=0; python3 "$HERE/honeypot/patches.py" cowrie-free "$FREE" || rc=$?
+  case $rc in 0) ok "patched free.py to read the fake /proc/meminfo" ;; 3) ok "free.py already patched" ;; *) warn "free.py not patched (Cowrie changed); harmless" ;; esac
 fi
 cat > /etc/systemd/system/cowrie.service <<EOF
 [Unit]
@@ -308,20 +282,7 @@ PY
     ok "wrote $O/.opencanary.conf"
   fi
   # OpenCanary refuses to start if two modules share a port, even when one is disabled: move disabled ones away.
-  python3 - "$O/.opencanary.conf" <<'PY'
-import json, sys
-p = sys.argv[1]; c = json.load(open(p))
-mods = {k[:-8] for k in c if k.endswith(".enabled")}
-used = {c.get(m + ".port") for m in mods if c.get(m + ".enabled") and isinstance(c.get(m + ".port"), int)}
-free, changed = 62000, False
-for m in sorted(mods):
-    if not c.get(m + ".enabled") and c.get(m + ".port") in used:
-        while free in used:
-            free += 1
-        c[m + ".port"] = free; used.add(free); free += 1; changed = True
-if changed:
-    json.dump(c, open(p, "w"), indent=2)
-PY
+  python3 "$HERE/honeypot/patches.py" opencanary-ports "$O/.opencanary.conf" || true
   cat > /etc/systemd/system/opencanary.service <<EOF
 [Unit]
 Description=OpenCanary honeypot
@@ -349,39 +310,9 @@ EOF
   fi
   # OpenCanary answers unknown paths with 404 and never logs them, so most scanner traffic is invisible: log them.
   HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
-  if [ -n "$HTTPPY" ] && ! grep -q "Huginn patch" "$HTTPPY"; then
-    python3 - "$HTTPPY" <<'PY' && ok "OpenCanary logs every probed web path" || warn "OpenCanary 404 logging not patched (OpenCanary changed); harmless"
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = """    def render(self, request):
-        request.setHeader(b"Server", self.factory.banner)
-        request.setResponseCode(int(self.error_code))
-        return Resource.render(self, request)"""
-new = """    def render(self, request):
-        # Huginn patch: log every probed path. Scanners mostly ask for paths that do not exist (404),
-        # which OpenCanary never logged, so the most interesting web traffic was invisible.
-        try:
-            ua = request.getHeader("user-agent") or "<not supplied>"
-            logdata = {"PATH": request.uri.decode("utf-8", "replace")[:500],
-                       "METHOD": request.method.decode("ascii", "replace")[:10],
-                       "STATUS": self.error_code, "USERAGENT": ua}
-            if request.method in (b"POST", b"PUT") and request.content is not None:
-                request.content.seek(0)
-                body = request.content.read(500)
-                request.content.seek(0)
-                if body:
-                    logdata["BODY"] = body.decode("utf-8", "replace")
-            self.factory.log(logdata, transport=request.transport, logtype=self.factory.logger.LOG_HTTP_GET)
-        except Exception:
-            pass
-        request.setHeader(b"Server", self.factory.banner)
-        request.setResponseCode(int(self.error_code))
-        return Resource.render(self, request)"""
-if s.count(old) != 1:
-    sys.exit(1)
-open(p + ".orig", "w").write(s)
-open(p, "w").write(s.replace(old, new))
-PY
+  if [ -n "$HTTPPY" ]; then
+    rc=0; python3 "$HERE/honeypot/patches.py" opencanary-http "$HTTPPY" || rc=$?
+    case $rc in 0) ok "OpenCanary logs every probed web path" ;; 3) ok "OpenCanary web logging already patched" ;; *) warn "OpenCanary 404 logging not patched (OpenCanary changed); harmless" ;; esac
   fi
   # OpenCanary never rotates its log: rotate daily, uncompressed so hp-export can still read every file.
   cat > /etc/logrotate.d/opencanary <<EOF
