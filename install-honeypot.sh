@@ -6,7 +6,8 @@
 #
 # What it does (each optional part asks first, or use the flags):
 #   1. Moves your admin SSH to another port (default 22022) — checked BEFORE anything takes port 22
-#   2. Installs Cowrie (fake SSH on 22, fake Telnet on 23)
+#   2. Installs Cowrie (fake SSH on 22, fake Telnet on 23) with a ready-made persona and planted bait:
+#      a server or file server on SSH and an IP camera on Telnet, randomised for this install
 #   3. Optional: OpenCanary (fake FTP/HTTP/MySQL/Redis/VNC), endlessh (SSH tarpit on 2222),
 #      hp-traps (fake SMTP relay/POP3/IMAP/PostgreSQL/SOCKS5)
 #   4. Redirects the public ports to the honeypot services with nftables
@@ -17,6 +18,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ADMIN_PORT=""
 PERSONA_HOSTNAME="srv01"
+PERSONA=ask            # server | nas | none (plain Cowrie)
+WITH_CAMERA=ask
 WITH_CANARY=ask
 WITH_TARPIT=ask
 WITH_TRAPS=ask
@@ -35,7 +38,9 @@ usage() {
   cat <<EOF
 Usage: $0 [options]
   --admin-port N        your admin SSH port after install (asked if not given; suggestion 22022)
-  --hostname NAME       hostname the fake shell shows (default $PERSONA_HOSTNAME)
+  --persona P           what SSH (port 22) pretends to be: server (default), nas, or none (plain Cowrie)
+  --camera | --no-camera           a second Cowrie on Telnet (port 23) that pretends to be an IP camera
+  --hostname NAME       hostname for --persona none (default $PERSONA_HOSTNAME); personas pick their own
   --opencanary | --no-opencanary
   --tarpit     | --no-tarpit       (endlessh on public port 2222)
   --traps      | --no-traps        (hp-traps: SMTP 25/587, POP3 110, IMAP 143, PostgreSQL 5432, SOCKS5 1080)
@@ -49,6 +54,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --admin-port) ADMIN_PORT="$2"; shift ;;
     --hostname) PERSONA_HOSTNAME="$2"; shift ;;
+    --persona) PERSONA="$2"; shift ;;
+    --camera) WITH_CAMERA=yes ;; --no-camera) WITH_CAMERA=no ;;
     --opencanary) WITH_CANARY=yes ;; --no-opencanary) WITH_CANARY=no ;;
     --tarpit) WITH_TARPIT=yes ;; --no-tarpit) WITH_TARPIT=no ;;
     --traps) WITH_TRAPS=yes ;; --no-traps) WITH_TRAPS=no ;;
@@ -101,7 +108,8 @@ command -v systemctl >/dev/null || die "systemd is required."
 for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_TELNET $TARPIT $CANARY_FTP $CANARY_HTTP $CANARY_HTTPS; do
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py systemd/hp-traps.service; do
+case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py systemd/hp-traps.service; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -113,6 +121,19 @@ cat <<EOF
   with no route to your LAN. Your admin SSH moves to port $ADMIN_PORT.
 EOF
 ask "Continue?" yes || exit 0
+if [ "$PERSONA" = ask ]; then
+  if [ "$YES" = 1 ]; then PERSONA=server; else
+    echo
+    echo "    What should SSH (port 22) pretend to be? Each install gets its own random names, hardware and bait."
+    python3 "$HERE/honeypot/personas.py" list | grep -v camera | sed 's/^/      /'
+    echo "      none    plain Cowrie, no bait"
+    read -r -p "    Persona [server]: " PERSONA </dev/tty || true
+    PERSONA="${PERSONA:-server}"
+    case "$PERSONA" in server|nas|none) ;; *) die "Unknown persona: $PERSONA" ;; esac
+  fi
+fi
+[ "$PERSONA" = none ] && [ "$WITH_CAMERA" = ask ] && WITH_CAMERA=no
+decide WITH_CAMERA "Let Telnet (port 23) pretend to be an IP camera (a second, small Cowrie)?"
 decide WITH_CANARY "Install OpenCanary (fake FTP, HTTP/HTTPS, MySQL, Redis, VNC)?"
 decide WITH_TARPIT "Install endlessh (SSH tarpit on public port 2222)?"
 decide WITH_TRAPS  "Install hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, SOCKS5)?"
@@ -174,7 +195,38 @@ if [ ! -x "$C/cowrie-env/bin/cowrie" ]; then
 else
   ok "Cowrie venv exists"
 fi
-if [ ! -f "$C/etc/cowrie.cfg" ]; then
+P=/etc/huginn-honeypot
+install -d -m 700 "$P"
+PY_P="python3 $HERE/honeypot/personas.py"
+CAM=/home/cowrie/cowrie-camera
+TELNET_ON_MAIN=true
+[ "$WITH_CAMERA" = yes ] && TELNET_ON_MAIN=false
+
+persona_instance() {  # persona_instance NAME DIR [cfg options...]: honeyfs, filesystem, txtcmds and cowrie.cfg for one persona
+  local name="$1" dir="$2"; shift 2
+  local out="$P/persona-$name"
+  if [ ! -f "$out/persona.json" ]; then $PY_P make "$name" "$out" | sed 's/^/    /'; fi
+  runuser -u cowrie -- install -d "$dir/etc" "$dir/var/log/cowrie" "$dir/var/lib/cowrie" "$dir/var/run"
+  rm -rf "$dir/honeyfs" && cp -a "$out/honeyfs" "$dir/honeyfs"
+  rm -rf "$dir/txtcmds" && cp -a "$C/src/cowrie/data/txtcmds" "$dir/txtcmds"
+  $PY_P txtcmds "$out" "$dir/txtcmds"
+  if [ -f "$C/src/cowrie/data/fs.pickle" ]; then
+    $PY_P fs "$C/src/cowrie/data/fs.pickle" "$dir/var/lib/cowrie/fs-$name.pickle" "$out/honeyfs" | sed 's/^/    /'
+  else
+    warn "Cowrie's fs.pickle not found: the bait files exist but 'ls' will not show them"
+  fi
+  $PY_P cfg "$out" "$dir" "$@"
+  chown -R cowrie:cowrie "$dir/etc" "$dir/var" "$dir/honeyfs" "$dir/txtcmds"
+  ok "$name persona: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostname"])' "$out/persona.json")"
+}
+
+if [ -f "$C/etc/cowrie.cfg" ]; then
+  ok "keeping existing $C/etc/cowrie.cfg"
+  if [ "$WITH_CAMERA" = yes ] && [ ! -f "$CAM/etc/cowrie.cfg" ] && grep -A3 '^\[telnet\]' "$C/etc/cowrie.cfg" | grep -q 'enabled *= *true'; then
+    warn "the existing Cowrie already serves Telnet: no camera persona added (remove $C/etc/cowrie.cfg to rebuild both)"
+    WITH_CAMERA=no
+  fi
+elif [ "$PERSONA" = none ]; then
   cat > "$C/etc/cowrie.cfg" <<EOF
 # Written by Huginn install-honeypot.sh. Full list of settings: src/cowrie/data/etc/cowrie.cfg.dist
 [honeypot]
@@ -187,14 +239,44 @@ auth_class_parameters = 2, 5, 10
 listen_endpoints = tcp:$COWRIE_SSH:interface=0.0.0.0
 
 [telnet]
-enabled = true
+enabled = $TELNET_ON_MAIN
 listen_endpoints = tcp:$COWRIE_TELNET:interface=0.0.0.0
 EOF
   chown cowrie:cowrie "$C/etc/cowrie.cfg"
-  ok "wrote $C/etc/cowrie.cfg"
+  ok "wrote $C/etc/cowrie.cfg (plain Cowrie, no persona)"
 else
-  ok "keeping existing $C/etc/cowrie.cfg"
+  if [ "$TELNET_ON_MAIN" = true ]; then
+    persona_instance "$PERSONA" "$C" --ssh "$COWRIE_SSH" --telnet "$COWRIE_TELNET"
+  else
+    persona_instance "$PERSONA" "$C" --ssh "$COWRIE_SSH"
+  fi
 fi
+if [ "$WITH_CAMERA" = yes ] && [ ! -f "$CAM/etc/cowrie.cfg" ]; then
+  runuser -u cowrie -- install -d "$CAM"
+  # Same Cowrie code and venv; captured files and recordings go to the main instance, so Huginn finds them in one place.
+  persona_instance camera "$CAM" --telnet "$COWRIE_TELNET" --shared "$C/var/lib/cowrie"
+fi
+# What Huginn reads through hp-export: which internal port is which persona, and every bait value.
+{
+  if [ "$PERSONA" != none ] && [ -f "$P/persona-$PERSONA/persona.json" ]; then
+    echo "$COWRIE_SSH=$PERSONA"; [ "$TELNET_ON_MAIN" = true ] && echo "$COWRIE_TELNET=$PERSONA"
+  fi
+  [ "$WITH_CAMERA" = yes ] && echo "$COWRIE_TELNET=camera"
+} > "$P/personas"
+python3 - "$P" <<'PYEOF'
+import glob, json, os, sys
+bait = {}
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "persona-*", "persona.json"))):
+    name = os.path.basename(os.path.dirname(f))[8:]
+    for k, v in json.load(open(f)).get("bait", {}).items():
+        bait["%s_%s" % (name, k)] = v
+out = os.path.join(sys.argv[1], "bait.json")
+with open(out + ".tmp", "w") as fh:
+    json.dump(bait, fh)
+os.chmod(out + ".tmp", 0o600)
+os.replace(out + ".tmp", out)
+print("    ok %d bait values in %s" % (len(bait), out))
+PYEOF
 # Cowrie's "free" reads the host's real /proc/meminfo, which gives the honeypot away: read the fake one first.
 FREE="$C/src/cowrie/commands/free.py"
 if [ -f "$FREE" ]; then
@@ -220,6 +302,11 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 start_svc cowrie
+if [ "$WITH_CAMERA" = yes ] && [ -f "$CAM/etc/cowrie.cfg" ]; then
+  sed -e "s#^WorkingDirectory=.*#WorkingDirectory=$CAM#" -e 's#^Description=.*#Description=Cowrie Telnet honeypot (camera persona)#' \
+    /etc/systemd/system/cowrie.service > /etc/systemd/system/cowrie-camera.service
+  start_svc cowrie-camera
+fi
 
 # ------------------------------------------------------------------ 3a. endlessh
 if [ "$WITH_TARPIT" = yes ]; then
@@ -383,12 +470,15 @@ install -m 755 "$HERE/honeypot/hp-fileinfo" /usr/local/bin/hp-fileinfo
 if [ ! -f /etc/default/hp-export ]; then
   cat > /etc/default/hp-export <<EOF
 # hp-export settings (read by /usr/local/bin/hp-export). Several Cowrie dirs = several personas.
-COWRIE_DIRS="$C"
+COWRIE_DIRS="$C$( [ -f "$CAM/etc/cowrie.cfg" ] && echo " $CAM" )"
 OPENCANARY_LOG="/home/opencanary/opencanary.log"
 ENDLESSH_UNIT="endlessh"
 TRAPS_LOG_DIR="/var/log/hp-traps"
 FILEINFO_USER="cowrie"
 EOF
+elif [ -f "$CAM/etc/cowrie.cfg" ] && ! grep -q "$CAM" /etc/default/hp-export; then
+  sed -i "s#^COWRIE_DIRS=\"\(.*\)\"#COWRIE_DIRS=\"\1 $CAM\"#" /etc/default/hp-export
+  ok "added the camera persona to /etc/default/hp-export"
 fi
 cat > /usr/local/sbin/hp-add-huginn-key <<'EOF'
 #!/bin/bash
@@ -412,9 +502,17 @@ SECTIONS=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || tru
 # ------------------------------------------------------------------ summary
 say "Done"
 sleep 3
-for s in cowrie $( [ "$WITH_TARPIT" = yes ] && echo endlessh ) $( [ "$WITH_CANARY" = yes ] && echo opencanary ) $( [ "$WITH_TRAPS" = yes ] && echo hp-traps ); do
-  printf '    %-11s %s\n' "$s" "$(systemctl is-active "$s")"
+for s in cowrie $( [ -f /etc/systemd/system/cowrie-camera.service ] && echo cowrie-camera ) $( [ "$WITH_TARPIT" = yes ] && echo endlessh ) $( [ "$WITH_CANARY" = yes ] && echo opencanary ) $( [ "$WITH_TRAPS" = yes ] && echo hp-traps ); do
+  printf '    %-14s %s\n' "$s" "$(systemctl is-active "$s")"
 done
+if [ -s "$P/personas" ]; then
+  echo
+  echo "    Personas (Huginn picks these and the bait up by itself):"
+  for f in "$P"/persona-*/persona.json; do
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("      %-7s %-20s %d bait values" % (d["persona"], d["hostname"], len(d["bait"])))' "$f"
+  done
+  echo "    Keep $P private: it is exactly what would let someone recognise this honeypot."
+fi
 FWD="22, 23"
 [ "$WITH_TARPIT" = yes ] && FWD="$FWD, 2222"
 [ "$WITH_CANARY" = yes ] && FWD="$FWD, 21, 80, 443, 8080, 3306, 5900, 6379"

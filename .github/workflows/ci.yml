@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"   # weekly: notice when a new Cowrie/OpenCanary breaks Huginn's patches
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile app.py honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py tools/make_demo.py && python -m py_compile honeypot/hp-fileinfo
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+      - name: Demo builder
+        run: python tools/make_demo.py "$RUNNER_TEMP/demo" --base /
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -S warning *.sh tools/*.sh honeypot/hp-export
+
+  upstream:
+    name: Patches fit the newest Cowrie and OpenCanary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: tools/check-upstream-patches.sh

@@ -1,0 +1,22 @@
+name: Idea or feature request
+description: Suggest something Huginn could do better
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to see or know?
+      description: Describe what you want to find out or do. That helps more than a finished solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could it work?
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Fits Huginn's idea
+      options:
+        - label: It works without new Python dependencies, or the dependency is optional
+        - label: It never lets the honeypot open connections towards Huginn or the LAN

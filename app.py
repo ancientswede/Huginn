@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.9.1"
+HUGINN_VERSION = "0.10.0"
 CHANGELOG = [
+    ("0.10.0", "2026-11-05", "Ready-made personas with planted bait: the honeypot installer makes SSH a server or file server and Telnet an IP camera, with a random hostname, network, hardware and bait values for every install. The honeypot announces its personas and bait to Huginn, so bait detection works without setup. Tests and CI."),
     ("0.9.1", "2026-11-05", "Footer on every page: copyright, license (AGPL-3.0, no warranty) and a link to the source code, as the AGPL asks of network software."),
     ("0.9.0", "2026-11-05", "Updates: update-huginn.sh (backup, health check, automatic rollback, --rollback) and update-honeypot.sh (also upgrades Cowrie/OpenCanary and re-applies Huginn's patches). Huginn shows when a newer version is out."),
     ("0.8.4", "2026-11-05", "ntfy servers with access control: HUGINN_NTFY_TOKEN. The installer asks about ntfy and sends a test notification."),
@@ -106,16 +107,38 @@ NOTIFY_EVERY = 3600
 TTY_DIR = os.path.join(DATA, "tty")
 STATIC_DIR = os.environ.get("HUGINN_STATIC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
 # Persona per internal Cowrie port, e.g. HUGINN_PERSONAS="2225=server,2323=camera" (several Cowrie instances).
-PERSONA = {}
-for _x in os.environ.get("HUGINN_PERSONAS", "").split(","):
-    if "=" in _x and _x.split("=")[0].strip().isdigit():
-        PERSONA[int(_x.split("=")[0])] = _x.split("=", 1)[1].strip()[:20]
-# Bait: fake credentials that only exist in the honeypot's bait files (bait.json next to app.py).
+# Without the setting, Huginn uses what the honeypot announces in its export (##PERSONAS, written by install-honeypot.sh).
+PERSONA_RE = re.compile(r"^\s*(\d{1,5})\s*=\s*([A-Za-z0-9_.-]{1,20})\s*$")
+
+
+def parse_personas(items):
+    out = {}
+    for x in items:
+        m = PERSONA_RE.match(x or "")
+        if m:
+            out[int(m.group(1))] = m.group(2)
+    return out
+
+
+PERSONA_ENV = parse_personas(os.environ.get("HUGINN_PERSONAS", "").split(","))
+PERSONA = dict(PERSONA_ENV)
+
+
+# Bait: fake credentials that only exist in the honeypot's bait files. From bait.json next to app.py (optional) plus
+# the values the honeypot announces in its export (##BAIT). Treated as untrusted data: only strings, sane lengths.
+def bait_values(d):
+    if not isinstance(d, dict):
+        return []
+    return sorted({v for v in list(d.values())[:100] if isinstance(v, str) and 8 <= len(v) <= 200})
+
+
 try:
-    BAIT = [v for v in json.load(open(os.environ.get("HUGINN_BAIT_FILE", os.path.join(BASE, "bait.json")))).values() if isinstance(v, str) and len(v) >= 8]
+    BAIT_LOCAL = bait_values(json.load(open(os.environ.get("HUGINN_BAIT_FILE", os.path.join(BASE, "bait.json")))))
 except Exception:
-    BAIT = []
-BAIT_FILES_RE = re.compile(r"\.env\b|\.my\.cnf|\.aws/credentials|\.bash_history|backup\.sh|Account1|network\.conf|wpa_supplicant|\.ssh/config")
+    BAIT_LOCAL = []
+BAIT = list(BAIT_LOCAL)
+BAIT_FILES_RE = re.compile(r"\.env\b|\.my\.cnf|\.aws/credentials|\.bash_history|backup\.sh|Account1|network\.conf|wpa_supplicant|\.ssh/config"
+                           r"|rsyncd\.secrets|\.smbcredentials|rclone\.conf|nextcloud/config/config\.php|nextcloud-admin\.txt")
 # Common harmless addresses found in malware (connectivity checks, docs) — never put on the C2 list.
 BENIGN_IOC = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "208.67.222.222", "208.67.220.220", "4.2.2.2"}
 
@@ -180,6 +203,7 @@ def init_db():
     os.makedirs(TTY_DIR, exist_ok=True)
     if not get_meta(con, "feed_token"):
         set_meta(con, "feed_token", secrets.token_urlsafe(24))
+    load_honeypot_meta(con)
     con.close()
 
 
@@ -217,7 +241,7 @@ def norm_ip(s):
         return None
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
-    if not a.is_global and not (ALLOW_PRIVATE and a.is_private and not a.is_loopback):  # private addresses are dropped unless testing
+    if not is_public(a) and not (ALLOW_PRIVATE and a.is_private and not a.is_loopback):  # private addresses are dropped unless testing
         return None
     return str(a)
 
@@ -359,7 +383,7 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
-    files = []
+    files, personas, bait = [], [], {}
     for line in text.splitlines():
         if line.startswith("##"):
             section = line[2:].strip()
@@ -368,6 +392,15 @@ def parse_export(text, skip):
             try:
                 files.append(json.loads(line))
             except ValueError:
+                pass
+            continue
+        if section == "PERSONAS":
+            personas.append(line)
+            continue
+        if section == "BAIT" and line.startswith("{"):
+            try:
+                bait.update(json.loads(line))
+            except (ValueError, TypeError):
                 pass
             continue
         fn = PARSERS.get(section)
@@ -384,7 +417,39 @@ def parse_export(text, skip):
         if r:
             rows.append((h,) + r)
     parse_export.files = files
+    parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait),
+                         "has_personas": "##PERSONAS" in text, "has_bait": "##BAIT" in text}
     return rows, hashes
+
+
+def apply_honeypot_meta(con, meta):
+    # Personas and bait announced by the honeypot. Stored so they survive a restart; a change of bait re-checks every attacker.
+    if meta.get("has_personas"):
+        set_meta(con, "hp_personas", json.dumps({str(k): v for k, v in meta["personas"].items()}))
+    if meta.get("has_bait"):
+        old = get_meta(con, "hp_bait", "[]")
+        new = json.dumps(meta["bait"])
+        if new != old:
+            set_meta(con, "hp_bait", new)
+            load_honeypot_meta(con)
+            with con:
+                for (ip,) in con.execute("SELECT ip FROM ips").fetchall():
+                    recompute_ip(con, ip)
+    load_honeypot_meta(con)
+
+
+def load_honeypot_meta(con):
+    try:
+        announced = {int(k): str(v)[:20] for k, v in json.loads(get_meta(con, "hp_personas", "{}")).items()}
+    except (ValueError, TypeError, AttributeError):
+        announced = {}
+    PERSONA.clear()
+    PERSONA.update(PERSONA_ENV or announced)
+    try:
+        hp_bait = bait_values({str(i): v for i, v in enumerate(json.loads(get_meta(con, "hp_bait", "[]")))})
+    except (ValueError, TypeError):
+        hp_bait = []
+    BAIT[:] = sorted(set(BAIT_LOCAL) | set(hp_bait))
 
 
 def store_files(con, files):
@@ -658,6 +723,7 @@ def collector_loop():
         try:
             text = fetch_export()
             rows, hashes = parse_export(text, skip)
+            apply_honeypot_meta(con, parse_export.meta)
             n = store(con, rows)
             store_files(con, parse_export.files)
             skip = hashes  # only set once everything is stored
@@ -1084,7 +1150,7 @@ def v_overview():
     bait7 = con.execute("SELECT SUM(','||tags||',' LIKE '%,took-bait,%'), SUM(','||tags||',' LIKE '%,read-bait,%') FROM ips WHERE last>=?", (d7,)).fetchone()
     kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"])), ("Attackers 7d", num(k["b"]), "%s total" % num(k["c"])),
             ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24)), ("Files captured", num(files), "unique SHA-256"),
-            ("Took the bait 7d", num(bait7[0]), "%s read bait files" % num(bait7[1])),
+            ("Took the bait 7d", num(bait7[0]), ("%s read bait files" % num(bait7[1])) if BAIT else "no bait values known yet"),
             ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else "")),
             ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]))]
     kp = "".join('<div class="kpi"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (esc(a), b, esc(c)) for a, b, c in kpis)
@@ -2365,6 +2431,7 @@ def ingest_once():
     t0 = time.time()
     text = fetch_export()
     rows, _ = parse_export(text, set())
+    apply_honeypot_meta(con, parse_export.meta)
     n = store(con, rows)
     store_files(con, parse_export.files)
     set_meta(con, "last_ingest", t0)

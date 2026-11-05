@@ -9,6 +9,8 @@ OPENCANARY_LOG="/home/opencanary/opencanary.log"
 ENDLESSH_UNIT="endlessh"
 TRAPS_LOG_DIR="/var/log/hp-traps"
 FILEINFO_USER="cowrie"                         # unprivileged user that may read the Cowrie downloads
+PERSONAS_FILE="/etc/huginn-honeypot/personas"  # "internal port=persona" per line (written by install-honeypot.sh)
+BAIT_FILE="/etc/huginn-honeypot/bait.json"     # the fake credentials planted in the personas
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
 FIRST_COWRIE="${COWRIE_DIRS%% *}"
 export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downloads}"
@@ -23,6 +25,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
   *) ;;  # any other command gets the normal export
 esac
 # Print the files matching a pattern, oldest first. No match -> no output (cat must never wait on stdin).
+# shellcheck disable=SC2207  # $1 is a glob of log files; their names never contain spaces
 catfiles() { local f; f=( $(ls -tr $1 2>/dev/null) ); [ ${#f[@]} -gt 0 ] && cat "${f[@]}" 2>/dev/null; return 0; }
 echo "##COWRIE"
 for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000; done
@@ -34,6 +37,9 @@ echo "##NFT"
 nft list ruleset 2>/dev/null | grep -o "dport [0-9]* counter packets [0-9]*"
 echo "##TRAPS"
 catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000
+# Personas and bait, so Huginn needs no extra settings. The bait is fake and already sits in the fake file systems.
+if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
+if [ -r "$BAIT_FILE" ]; then echo "##BAIT"; head -c 20000 "$BAIT_FILE" | tr -d '\n'; echo; fi
 echo "##FILES"
 # The captured files are attacker data: analyse them as the Cowrie user (who already owns them), never as root.
 FILEINFO_USER="${FILEINFO_USER:-cowrie}"

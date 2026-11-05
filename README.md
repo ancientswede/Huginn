@@ -1,10 +1,16 @@
 # Huginn
 
+[![Tests](https://github.com/ancientswede/Huginn/actions/workflows/ci.yml/badge.svg)](https://github.com/ancientswede/Huginn/actions/workflows/ci.yml)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/ancientswede)
 
 **Attacker intelligence for a homelab honeypot.** Huginn pulls the logs from your honeypot, keeps the history, shows everything about every attacker IP on its own page, and turns it into blocklists your firewalls can fetch.
 
 **[See the live demo →](https://ancientswede.se/huginn/)** (made-up data, read-only)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/overview-dark.png">
+  <img alt="Huginn overview: attackers per day, world map and top attackers" src="docs/screenshots/overview-light.png">
+</picture>
 
 In Norse myth Huginn is one of Odin's ravens. It flies out over the world every day and comes back to tell what it saw.
 
@@ -91,12 +97,27 @@ Replies to connections that were made *to* the honeypot still work, because the 
 - **Campaigns:** IPs grouped by identical command scripts and SSH client fingerprints (HASSH), so one botnet shows up as one group.
 - **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, and the IP addresses and URLs embedded in it. Nothing is ever executed.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
-- **Bait detection:** put fake credentials in the honeypot's files. Huginn tags anyone who reads them (`read-bait`) or later tries one of them anywhere (`took-bait`).
+- **Personas and bait detection:** the installer makes the honeypot look like a real server, file server or IP camera, with fake credentials planted where attackers look. Huginn tags anyone who reads them (`read-bait`) or later tries one of them anywhere (`took-bait`).
 - **Blocklists** as plain text, nftables, ipset, MikroTik or CSV, filtered by score and age. There is also a separate **C2 list**: the servers attackers download from and the addresses found inside their malware.
 - **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt).
 - **Your way:** light, dark or automatic theme, six accent colours, a compact layout, a 12- or 24-hour clock, the columns and overview cards you want, and countries or networks you never want to see (they are still blocklisted). Every attacker can be exported as JSON or CSV. Keyboard shortcuts: press `?`.
 
 Huginn uses only the Python standard library and SQLite. There are no dependencies, no build step and no JavaScript framework. It runs comfortably in a 1 core / 512 MB LXC.
+
+### Screenshots
+
+All from the demo, with made-up data. They follow your light/dark setting.
+
+| A page per attacker | Session replay |
+|---|---|
+| <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/attacker-dark.png">  <img alt="Attacker page with network info, credentials, related attackers and sessions" src="docs/screenshots/attacker-light.png"></picture> | <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/replay-dark.png">  <img alt="Replay of an attacker's shell session" src="docs/screenshots/replay-light.png"></picture> |
+
+**Blocklist feeds**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/blocklist-dark.png">
+  <img alt="Blocklist page with feed URLs for nftables, ipset, MikroTik and CSV" src="docs/screenshots/blocklist-light.png">
+</picture>
 
 ## Requirements
 
@@ -128,6 +149,7 @@ apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git &
 
 The script asks before each optional part: OpenCanary, the endlessh tarpit and hp-traps. Then it:
 - Asks which port your own admin SSH should move to (suggests 22022, any free port above 1024 works), and asks you to prove you can log in there **before** port 22 goes to the honeypot, so you cannot lock yourself out.
+- Asks what SSH should pretend to be (a **server** or a **file server**) and whether Telnet should be an **IP camera**. Each install gets its own random hostname, network, hardware and planted bait (see [Personas and bait](#personas-and-bait)).
 - Installs Cowrie and redirects the public ports to the honeypot services.
 - Ends with the list of ports to forward in your router.
 
@@ -284,15 +306,24 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 - Research scanners (Censys, Shadowserver, BinaryEdge and others) are detected from reverse DNS and network names and left out by default. Anyone who logged in, ran commands, dropped files or tried an exploit is always blocklisted, research network or not.
 - "Never block" always wins.
 
-## Making the honeypot more convincing
+## Personas and bait
 
-Huginn works with any Cowrie setup, but you learn more when attackers stay longer. Ideas that paid off here:
+Attackers stay longer, and show more of what they want, on a machine that looks real and worth something. `install-honeypot.sh` sets this up for you:
 
-- **Two personas.** Run a second Cowrie instance with its own `etc/cowrie.cfg` (`hostname`, `kernel_version`, `hardware_platform`, `arch`, a `filesystem` pickle and `honeyfs`) and list it in `COWRIE_DIRS`. For example, put an x86 "database server" on SSH and an ARM "IP camera" on Telnet. Tell Huginn the internal ports with `HUGINN_PERSONAS`.
-- **Realistic logins.** Use `auth_class = AuthRandom` with `auth_class_parameters = 2, 5, 10`: attackers get in after 2–5 tries, and the honeypot remembers each IP.
-- **Bait.** Put fake `.bash_history`, `.my.cnf`, `.env` and `.aws/credentials` files in `honeyfs`, and add them to the filesystem pickle so `ls` shows them. Use unique random values, never real ones, and list the same values in `bait.json` (see `examples/bait.example.json`).
-- **Consistency.** `uname`, `nproc`, `/proc/cpuinfo` and `free` should tell the same story. Note that Cowrie's `free` reads the *host's* `/proc/meminfo`, which gives away the real machine. Patch it to read the persona's file.
-- Never publish your own persona and bait files. They are exactly what someone would use to recognise your honeypot.
+| Persona | Port | Looks like | Bait planted in |
+|---|---|---|---|
+| `server` | SSH 22 | Ubuntu server with a web app, MySQL, Redis and backups to S3 | `.bash_history`, `.my.cnf`, `.aws/credentials`, the app's `.env`, `backup.sh` |
+| `nas` | SSH 22 | Debian file server with Samba, rsync and Nextcloud | `.bash_history`, `.smbcredentials`, `rsyncd.secrets`, `rclone.conf`, Nextcloud's `config.php` |
+| `camera` | Telnet 23 | Cheap ARM IP camera | `Account1`, `network.conf`, `wpa_supplicant.conf` |
+
+- **Different on every install.** The hostname, internal network, users, CPU, memory, kernel and every bait value are random, so two Huginn honeypots never look alike, and nobody can recognise them all by one fixed detail.
+- **Consistent.** `hostname`, `uname`, `nproc`, `lscpu`, `/proc/cpuinfo`, `free`, `/etc/passwd` and the home folders tell the same story. Cowrie's `free` normally shows the *real* machine's memory; Huginn patches it.
+- **Realistic logins.** Attackers get in after 2–5 tries (Cowrie's `AuthRandom`), and the honeypot remembers each IP's password.
+- **Bait detection works by itself.** The honeypot tells Huginn its personas and bait values through the export. Huginn tags anyone who reads a bait file (`read-bait`) and anyone who later uses one of the values anywhere, on any service (`took-bait`).
+
+Everything lives in `/etc/huginn-honeypot/` on the honeypot (root only). **Never publish it**: it is exactly what would let someone recognise your honeypot. Want a new identity? Delete that folder and Cowrie's `etc/cowrie.cfg`, then run the installer again.
+
+You can still build your own: put files in a Cowrie instance's `honeyfs`, add them with `honeypot/personas.py fs`, and list extra bait values in `bait.json` next to `app.py` (see `examples/bait.example.json`). Set `HUGINN_PERSONAS` to override the persona names the honeypot announces.
 
 ## Configuration
 
@@ -307,8 +338,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_POLL` | `120` | Seconds between syncs |
 | `HUGINN_RETENTION_DAYS` | `180` | History kept |
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
-| `HUGINN_PERSONAS` | – | `port=name,...` for several Cowrie instances |
-| `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Bait values to watch for |
+| `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
+| `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |
 | `HUGINN_TRUSTED_PROXIES` | – | Reverse proxy IPs allowed to set `X-Forwarded-*` |

@@ -227,7 +227,7 @@ for _ in range(25):
 # 11. Two humans who read the bait — one of them tried the stolen password on the fake MySQL
 for i in range(2):
     ip = new_ip("human")
-    cmds = ["w", "ls -la", "cat .bash_history", "cat /var/www/shop/.env", "cat ~/.my.cnf", "mysql -u backup -p'%s' -h 10.20.0.12" % BAIT["mysql_backup"], "exit"]
+    cmds = ["w", "ls -la", "cat .bash_history", "cat /var/www/portal/.env", "cat ~/.my.cnf", "mysql -u backup -p'%s' -h 10.40.8.12" % BAIT["mysql_backup"], "exit"]
     session(ip, rnd_ts(3), "ssh", 2225, SSH_CLIENTS[3], logins=[("root", "Summer2026!", True)], cmds=cmds if i == 0 else cmds[:5], gap=(3, 14), record=True)
     if i == 0:
         ev(rnd_ts(2), ip, "canary", "canary", None, "redis", json.dumps({"CMD": "AUTH", "ARGS": BAIT["redis"]}))

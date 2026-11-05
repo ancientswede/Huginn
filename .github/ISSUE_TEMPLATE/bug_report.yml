@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in Huginn or the install/update scripts does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Never paste your honeypot's public IP, your domain, feed tokens, bait values or passwords** — they would let anyone recognise or reach your setup. Replace them with `x.x.x.x`.
+        Security problems in Huginn itself: please do not open an issue, see [SECURITY.md](https://github.com/ancientswede/Huginn/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Huginn version
+      description: Shown in the top bar, or `curl -s http://127.0.0.1:8095/healthz`
+      placeholder: "0.10.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen?
+      options:
+        - Huginn web page
+        - Sync from the honeypot (hp-export)
+        - install-honeypot.sh
+        - install-huginn.sh
+        - update-huginn.sh / update-honeypot.sh
+        - Blocklist feed
+        - Notifications (ntfy)
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      placeholder: "1. ...\n2. ..."
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: "`journalctl -u huginn -n 50 --no-pager` on the Huginn machine, or the script output. Remove addresses and tokens first."
+      render: text
+  - type: input
+    id: os
+    attributes:
+      label: OS and setup
+      placeholder: "Debian 13 LXC on Proxmox, honeypot on its own VLAN"
