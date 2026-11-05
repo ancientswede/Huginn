@@ -106,6 +106,8 @@ src.backup(dst)          # consistent copy while Huginn keeps running
 dst.close(); src.close()
 PY
   chmod 600 "$B/huginn.db"
+  # Only the newest backup keeps a database copy: the database grows, the code backups stay tiny.
+  for old in "$BK"/*/; do [ "${old%/}" = "$B" ] || rm -f "$old/huginn.db"; done
 fi
 ok "saved in $B"
 

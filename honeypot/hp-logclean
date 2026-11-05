@@ -1,0 +1,40 @@
+#!/bin/bash
+# hp-logclean — keep the honeypot's disk from filling up (part of Huginn, AGPL-3.0-or-later).
+# Runs daily (hp-logclean.timer). Huginn copies everything within minutes and keeps it, so the honeypot only needs
+# a short history of its own:
+#   - Cowrie's rotated logs (cowrie.json.DATE, cowrie.log.DATE) are gzipped after a day, deleted after LOG_KEEP_DAYS
+#   - session recordings are deleted after TTY_KEEP_DAYS (Huginn has fetched them long before)
+#   - captured files (malware) are kept, unless DOWNLOAD_KEEP_DAYS is set
+# OpenCanary's log is rotated and compressed by logrotate, hp-traps cleans up after itself.
+# Settings in /etc/default/hp-export. "hp-logclean -n" shows what it would do.
+COWRIE_DIRS="${COWRIE_DIRS:-/home/cowrie/cowrie}"
+LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-30}"
+TTY_KEEP_DAYS="${TTY_KEEP_DAYS:-30}"
+DOWNLOAD_KEEP_DAYS="${DOWNLOAD_KEEP_DAYS:-0}"
+CONF="${HP_EXPORT_CONF:-/etc/default/hp-export}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+DRY=0; [ "${1:-}" = "-n" ] && DRY=1
+FIRST="${COWRIE_DIRS%% *}"
+act() { if [ "$DRY" = 1 ]; then echo "would: $*"; else "$@"; fi; }
+num() { [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo 30; }
+LOG_KEEP_DAYS=$(num "$LOG_KEEP_DAYS"); TTY_KEEP_DAYS=$(num "$TTY_KEEP_DAYS"); DOWNLOAD_KEEP_DAYS=$(num "${DOWNLOAD_KEEP_DAYS:-0}")
+
+for d in $COWRIE_DIRS; do
+  L="$d/var/log/cowrie"
+  [ -d "$L" ] || continue
+  # Rotated files older than a day: today's and yesterday's stay readable for hp-export.
+  find "$L" -maxdepth 1 -type f \( -name 'cowrie.json.*' -o -name 'cowrie.log.*' \) ! -name '*.gz' -mtime +0 -print0 |
+    while IFS= read -r -d '' f; do act gzip -9 "$f"; done
+  find "$L" -maxdepth 1 -type f -name 'cowrie.*.gz' -mtime +"$LOG_KEEP_DAYS" -print0 |
+    while IFS= read -r -d '' f; do act rm -f -- "$f"; done
+done
+if [ "$TTY_KEEP_DAYS" -gt 0 ] && [ -d "$FIRST/var/lib/cowrie/tty" ]; then
+  find "$FIRST/var/lib/cowrie/tty" -maxdepth 1 -type f -mtime +"$TTY_KEEP_DAYS" -print0 |
+    while IFS= read -r -d '' f; do act rm -f -- "$f"; done
+fi
+if [ "$DOWNLOAD_KEEP_DAYS" -gt 0 ] && [ -d "$FIRST/var/lib/cowrie/downloads" ]; then
+  find "$FIRST/var/lib/cowrie/downloads" -maxdepth 1 -type f -mtime +"$DOWNLOAD_KEEP_DAYS" -print0 |
+    while IFS= read -r -d '' f; do act rm -f -- "$f"; done
+fi
+[ "$DRY" = 1 ] || echo "hp-logclean: done ($(df -h --output=avail / | tail -1 | tr -d ' ') free)"

@@ -3,6 +3,7 @@
 # Runs as a forced command in /root/.ssh/authorized_keys on the honeypot:
 #   restrict,command="/usr/local/bin/hp-export" ssh-ed25519 AAAA... huginn
 # No command: prints all logs in sections. "tty <sha256>": one Cowrie session recording as base64.
+# "tty <sha256> <sha256> ...": up to 50 recordings, one line each: "<sha256> <base64>" or "<sha256> -" if gone.
 # Settings (optional) in /etc/default/hp-export:
 COWRIE_DIRS="/home/cowrie/cowrie"            # one or more Cowrie install dirs (several = several personas)
 OPENCANARY_LOG="/home/opencanary/opencanary.log"
@@ -17,16 +18,25 @@ export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downlo
 case "${SSH_ORIGINAL_COMMAND:-}" in
   "") ;;
   tty\ *)
-    sha="${SSH_ORIGINAL_COMMAND#tty }"
-    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "bad request" >&2; exit 2; }
-    f="$FIRST_COWRIE/var/lib/cowrie/tty/$sha"
-    [ -f "$f" ] && [ ! -L "$f" ] || { echo "not found" >&2; exit 3; }
-    base64 -w0 "$f"; echo; exit 0 ;;
+    read -r -a shas <<< "${SSH_ORIGINAL_COMMAND#tty }"
+    [ "${#shas[@]}" -ge 1 ] && [ "${#shas[@]}" -le 50 ] || { echo "bad request" >&2; exit 2; }
+    for sha in "${shas[@]}"; do [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "bad request" >&2; exit 2; }; done
+    if [ "${#shas[@]}" = 1 ]; then
+      f="$FIRST_COWRIE/var/lib/cowrie/tty/${shas[0]}"
+      [ -f "$f" ] && [ ! -L "$f" ] || { echo "not found" >&2; exit 3; }
+      base64 -w0 "$f"; echo; exit 0
+    fi
+    for sha in "${shas[@]}"; do
+      f="$FIRST_COWRIE/var/lib/cowrie/tty/$sha"
+      if [ -f "$f" ] && [ ! -L "$f" ]; then printf '%s ' "$sha"; base64 -w0 "$f"; echo; else echo "$sha -"; fi
+    done
+    exit 0 ;;
   *) ;;  # any other command gets the normal export
 esac
-# Print the files matching a pattern, oldest first. No match -> no output (cat must never wait on stdin).
-# shellcheck disable=SC2207  # $1 is a glob of log files; their names never contain spaces
-catfiles() { local f; f=( $(ls -tr $1 2>/dev/null) ); [ ${#f[@]} -gt 0 ] && cat "${f[@]}" 2>/dev/null; return 0; }
+# Print the files matching a pattern, oldest first, skipping old compressed ones (Huginn has had those for days).
+# No match -> no output (cat must never wait on stdin).
+# shellcheck disable=SC2207,SC2010  # $1 is a glob of our own log files; their names never contain spaces
+catfiles() { local f; f=( $(ls -tr $1 2>/dev/null | grep -v '\.gz$') ); [ ${#f[@]} -gt 0 ] && cat "${f[@]}" 2>/dev/null; return 0; }
 echo "##COWRIE"
 for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000; done
 echo "##CANARY"

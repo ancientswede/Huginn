@@ -1,0 +1,8 @@
+[Unit]
+Description=Huginn honeypot: compress and remove old logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hp-logclean
+Nice=10
+IOSchedulingClass=idle

@@ -377,7 +377,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_PORT` / `HUGINN_BIND` | `8095` / `0.0.0.0` | Web UI |
 | `HUGINN_TZ` | `UTC` | Time zone for the UI and per-day charts |
 | `HUGINN_POLL` | `120` | Seconds between syncs |
-| `HUGINN_RETENTION_DAYS` | `180` | History kept |
+| `HUGINN_RETENTION_DAYS` | `180` | Days of history kept; `0` keeps everything forever |
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
 | `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
@@ -397,7 +397,28 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported.
 - **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io. Set `HUGINN_ENRICH=0` to turn it off.
 
-**Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS`. Pick a retention you can justify.
+**Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.
+
+## Logs and disk space
+
+The honeypot only needs a short history; Huginn keeps the long one.
+
+**On the honeypot** (small disk, lots of logs), `hp-logclean` runs every night:
+
+| What | Kept on the honeypot | Setting in `/etc/default/hp-export` |
+|---|---|---|
+| Cowrie's logs | gzipped after a day, deleted after 30 days | `LOG_KEEP_DAYS` |
+| Session recordings | 30 days | `TTY_KEEP_DAYS` |
+| Captured files (malware) | forever | `DOWNLOAD_KEEP_DAYS` (`0` = keep) |
+| OpenCanary's log | logrotate: daily, compressed, 30 days | `/etc/logrotate.d/opencanary` |
+| hp-traps' logs | 30 days (cleans up itself) | – |
+| systemd journal (endlessh) | at most 200 MB | `/etc/systemd/journald.conf.d/huginn-honeypot.conf` |
+
+`hp-logclean -n` shows what it would do. Huginn syncs every two minutes, so it has everything long before the honeypot deletes it.
+
+**In Huginn**, everything lives in one SQLite database (`/opt/huginn/data/huginn.db`): events, sessions, credentials, files, enrichment. Session recordings are copied over in the background and kept compressed in `/opt/huginn/data/tty`, so replays keep working after the honeypot has deleted its copy. History older than `HUGINN_RETENTION_DAYS` (180 by default) is deleted; set it to `0` to keep everything. The Account page shows the database size, the recordings and the free disk space. Expect roughly 5–20 MB of database per day on a busy honeypot, most of it VNC and SSH password guessing.
+
+`update-huginn.sh` keeps the last three versions of the code but only one database copy (the newest), so updates do not eat the disk as the database grows.
 
 ## Uninstall
 

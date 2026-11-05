@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.11.2"
+HUGINN_VERSION = "0.12.0"
 CHANGELOG = [
+    ("0.12.0", "2026-11-05", "Disk housekeeping. Honeypot: hp-logclean gzips Cowrie's logs and keeps 30 days, OpenCanary's log is rotated compressed, the journal is capped. Huginn: copies every session recording in the background and keeps it compressed, HUGINN_RETENTION_DAYS=0 keeps the whole history forever, the Account page shows database size and free disk, updates keep only one database backup."),
     ("0.11.2", "2026-11-05", "Long cards scroll inside instead of growing the page: the four Credentials cards (now with a filter box each and more rows), Related attackers and Sessions on an attacker's page."),
     ("0.11.1", "2026-11-05", "The fake mail server (hp-traps) greets with a name that fits the persona instead of mail.example.com. README: a table of the ports to forward. install-honeypot.sh can be run again on a honeypot without internet (apt only runs when a package is missing)."),
     ("0.11.0", "2026-11-05", "Credentials: \"Is my password in here?\" checks a password against everything attackers tried, in the browser (only 4 characters of its SHA-256 hash are sent). Search all usernames and passwords, and export them as word lists or a CSV of every attempt."),
@@ -35,6 +36,7 @@ CHANGELOG = [
 
 import base64
 import getpass
+import gzip
 import hashlib
 import hmac
 import html
@@ -67,7 +69,8 @@ HP_PORT = os.environ.get("HUGINN_HP_PORT", "22022")
 HP_KEY = os.environ.get("HUGINN_HP_KEY", os.path.join(BASE, ".ssh", "honeypot_ro"))
 HP_KNOWN = os.environ.get("HUGINN_HP_KNOWN", os.path.join(BASE, ".ssh", "known_hosts"))
 POLL = max(30, int(os.environ.get("HUGINN_POLL", "120")))
-RETENTION_DAYS = max(7, int(os.environ.get("HUGINN_RETENTION_DAYS", "180")))
+_ret = int(os.environ.get("HUGINN_RETENTION_DAYS", "180") or 0)
+RETENTION_DAYS = 0 if _ret <= 0 else max(7, _ret)       # 0 = keep everything forever
 ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
 # Your own public IPs / domain names: replaced with "[self]" in everything stored (attackers often echo the target address).
@@ -481,31 +484,91 @@ def store_files(con, files):
                          str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now))
 
 
-def fetch_tty(sha):
-    # Fetches a session recording through the same locked key ("tty <sha>"), cached locally.
-    if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
-        return None
-    path = os.path.join(TTY_DIR, sha)
-    if os.path.exists(path):
-        return open(path, "rb").read()
-    cmd = ["ssh", "-T", "-i", HP_KEY, "-p", str(HP_PORT), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
-           "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + HP_KNOWN,
-           "root@" + HP_HOST, "tty " + sha]
-    rc, out, _err = run_capped(cmd, 60, MAX_TTY * 4 // 3 + 16)
-    if rc != 0:
-        return None
+def tty_path(sha):
+    return os.path.join(TTY_DIR, sha + ".gz")
+
+
+def tty_cached(sha):
+    for p, opener in ((tty_path(sha), gzip.open), (os.path.join(TTY_DIR, sha), open)):
+        if os.path.exists(p):
+            with opener(p, "rb") as fh:
+                return fh.read()
+    return None
+
+
+def tty_store(sha, data):
+    # Recordings are kept here for good (gzip, they shrink a lot), so the honeypot may delete its old ones.
+    tmp = tty_path(sha) + ".tmp"
+    with gzip.open(tmp, "wb", compresslevel=6) as fh:
+        fh.write(data)
+    os.replace(tmp, tty_path(sha))
+
+
+def hp_ssh(command):
+    return ["ssh", "-T", "-i", HP_KEY, "-p", str(HP_PORT), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + HP_KNOWN,
+            "root@" + HP_HOST, command]
+
+
+def tty_decode(b64):
     try:
-        data = base64.b64decode(out.strip(), validate=True)
+        data = base64.b64decode(b64.strip(), validate=True)
     except Exception:
         return None
     # Cowrie's "shasum" for tty logs is not the sha256 of the content (verified 2026-11-04), so only a sanity check.
-    if not data or len(data) > 50 * 1024 * 1024:
+    return data if data and len(data) <= 50 * 1024 * 1024 else None
+
+
+def fetch_tty(sha):
+    # One session recording: from the local cache, else through the same locked key ("tty <sha>").
+    if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
         return None
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-    os.replace(tmp, path)
+    data = tty_cached(sha)
+    if data is not None:
+        return data
+    rc, out, _err = run_capped(hp_ssh("tty " + sha), 60, MAX_TTY * 4 // 3 + 16)
+    if rc != 0:
+        return None
+    data = tty_decode(out)
+    if data:
+        tty_store(sha, data)
     return data
+
+
+_tty_missing = {}
+
+
+def prefetch_tty(con, batch=40, budget=40):
+    # Copy new recordings to Huginn in the background (newest first), many per SSH call, so replays keep working
+    # after the honeypot has cleaned up its own copies. Recordings the honeypot no longer has are retried once a day.
+    t0, done = time.time(), 0
+    rows = con.execute("SELECT DISTINCT tty FROM sessions WHERE tty IS NOT NULL ORDER BY start DESC").fetchall()
+    recent_miss = {k for k, v in _tty_missing.items() if v > time.time() - 86400}
+    todo = [r[0] for r in rows if re.fullmatch(r"[0-9a-f]{64}", r[0] or "") and r[0] not in recent_miss
+            and not os.path.exists(tty_path(r[0])) and not os.path.exists(os.path.join(TTY_DIR, r[0]))]
+    while todo and time.time() - t0 < budget:
+        chunk, todo = todo[:batch], todo[batch:]
+        rc, out, _err = run_capped(hp_ssh("tty " + " ".join(chunk)), 120, 64 * 1024 * 1024)
+        if rc != 0:
+            break
+        got = {}
+        if len(chunk) == 1:
+            got[chunk[0]] = out.strip()
+        else:
+            for line in out.splitlines():
+                sha, _, b64 = line.partition(" ")
+                if sha in chunk:
+                    got[sha] = b64
+        for sha in chunk:
+            data = tty_decode(got.get(sha, "")) if got.get(sha, "-") != "-" else None
+            if data:
+                tty_store(sha, data)
+                done += 1
+            else:
+                _tty_missing[sha] = time.time()
+        if len(chunk) > 1 and not got:
+            break                    # an older hp-export that only takes one recording per call: fetch on demand instead
+    return done
 
 
 def tty_frames(data):
@@ -710,6 +773,11 @@ def store(con, rows):
 
 
 def retention(con):
+    with con:
+        con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
+    if RETENTION_DAYS == 0:          # keep the whole history
+        con.execute("PRAGMA optimize")
+        return
     cutoff = time.time() - RETENTION_DAYS * 86400
     with con:
         old_ips = [r[0] for r in con.execute("SELECT ip FROM ips WHERE first < ?", (cutoff,))]
@@ -742,6 +810,10 @@ def collector_loop():
             set_meta(con, "last_error", "")
         except Exception as e:
             set_meta(con, "last_error", "%s %s" % (fmt_ts(time.time()), str(e)[:300]))
+        try:
+            prefetch_tty(con)
+        except Exception as e:
+            set_meta(con, "last_tty_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
         try:
             notify(con)
             check_update(con)
@@ -1927,6 +1999,20 @@ def v_blocklist(h, qs):
     return page("Blocklist", body, "/blocklist")
 
 
+def disk_note():
+    # Cached session recordings and the free space left for the database.
+    n = b = 0
+    try:
+        for e in os.scandir(TTY_DIR):
+            n += 1
+            b += e.stat().st_size
+    except OSError:
+        pass
+    st = os.statvfs(DATA)
+    free = st.f_bavail * st.f_frsize
+    return "%s kept here, %.1f MB · %.1f GB free on the data disk" % (num(n), b / 1048576, free / 1073741824)
+
+
 def v_account(cur, ok="", err=""):
     con = db()
     now = time.time()
@@ -1944,8 +2030,9 @@ def v_account(cur, ok="", err=""):
                          "(SELECT COUNT(*) FROM enrich WHERE ok=1), (SELECT MIN(ts) FROM events)").fetchone()
     status = kv([("Version", esc(HUGINN_VERSION)), ("Last sync", "%s <span class=muted>(%s new rows, %ss)</span>" % (esc(ago(li)), esc(get_meta(con, "last_ingest_new", "0")), esc(get_meta(con, "last_ingest_secs", "–")))),
                  ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
-                 ("History since", esc(fmt_ts(counts[4]))), ("Retention", "%d days" % RETENTION_DAYS),
+                 ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
+                 ("Session recordings", disk_note()),
                  ("Honeypot", '<span class=mono>%s:%s</span> every %ss' % (esc(HP_HOST), esc(HP_PORT), POLL)),
                  ("Updates", esc(("newest release %s" % get_meta(con, "update_latest")) if get_meta(con, "update_latest") else
                                  ("not checked yet" if UPDATE_CHECK else "check turned off (HUGINN_UPDATE_CHECK=0)"))

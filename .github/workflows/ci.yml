@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck -S warning *.sh tools/*.sh honeypot/hp-export
+        run: shellcheck -S warning *.sh tools/*.sh honeypot/*.sh honeypot/hp-export honeypot/hp-logclean
 
   upstream:
     name: Patches fit the newest Cowrie and OpenCanary

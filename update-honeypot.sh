@@ -27,7 +27,7 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/setup-housekeeping.sh; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -59,6 +59,9 @@ if [ -d /opt/hp-traps ]; then
   if cmp -s "$HERE/honeypot/hp-traps.py" /opt/hp-traps/hp-traps.py; then ok "hp-traps unchanged"
   else install -m 644 "$HERE/honeypot/hp-traps.py" /opt/hp-traps/hp-traps.py; ok "hp-traps updated"; restart_ok hp-traps; fi
 fi
+
+say "Disk housekeeping"
+bash "$HERE/honeypot/setup-housekeeping.sh"
 
 if [ "$UP_COWRIE" = 1 ]; then
   say "Cowrie"

@@ -84,6 +84,8 @@ if [ "$PURGE" = 1 ] && grep -qs "Written by Huginn" /etc/endlessh/config; then
   ok "removed the endlessh package"
 fi
 rm -rf /etc/systemd/system/hp-traps.service.d
+systemctl disable --now hp-logclean.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/hp-logclean.service /etc/systemd/system/hp-logclean.timer /etc/systemd/journald.conf.d/huginn-honeypot.conf
 systemctl daemon-reload
 rm -f /etc/logrotate.d/opencanary
 
@@ -94,7 +96,7 @@ if [ -f /root/.ssh/authorized_keys ] && grep -q 'command="/usr/local/bin/hp-expo
   sed -i '\#command="/usr/local/bin/hp-export"#d' /root/.ssh/authorized_keys
   ok "removed Huginn's key from /root/.ssh/authorized_keys"
 fi
-rm -f /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/sbin/hp-add-huginn-key /etc/default/hp-export
+rm -f /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-logclean /usr/local/sbin/hp-add-huginn-key /etc/default/hp-export
 rm -rf /var/lib/hp-export /opt/hp-traps /etc/huginn-honeypot
 ok "removed hp-export, hp-fileinfo, hp-traps and the personas/bait"
 

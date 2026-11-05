@@ -109,7 +109,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py systemd/hp-traps.service; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py honeypot/hp-logclean honeypot/setup-housekeeping.sh systemd/hp-traps.service; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -407,19 +407,7 @@ EOF
     rc=0; python3 "$HERE/honeypot/patches.py" opencanary-http "$HTTPPY" || rc=$?
     case $rc in 0) ok "OpenCanary logs every probed web path" ;; 3) ok "OpenCanary web logging already patched" ;; *) warn "OpenCanary 404 logging not patched (OpenCanary changed); harmless" ;; esac
   fi
-  # OpenCanary never rotates its log: rotate daily, uncompressed so hp-export can still read every file.
-  cat > /etc/logrotate.d/opencanary <<EOF
-$O/opencanary.log {
-    daily
-    rotate 14
-    dateext
-    missingok
-    notifempty
-    nocompress
-    copytruncate
-    su opencanary opencanary
-}
-EOF
+  # Log rotation for OpenCanary: honeypot/setup-housekeeping.sh (runs at the end).
   start_svc opencanary
 fi
 
@@ -509,6 +497,7 @@ echo "restrict,command=\"/usr/local/bin/hp-export\" $key" >> /root/.ssh/authoriz
 echo "Added. This key can only run /usr/local/bin/hp-export (no shell, no forwarding)."
 EOF
 chmod 755 /usr/local/sbin/hp-add-huginn-key
+bash "$HERE/honeypot/setup-housekeeping.sh"
 SECTIONS=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || true)
 [ "$SECTIONS" -ge 7 ] && ok "hp-export works ($SECTIONS sections)" || warn "hp-export printed $SECTIONS sections (expected 7)"
 
