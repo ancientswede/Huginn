@@ -111,9 +111,10 @@ def server():
     net = private_net()
     ip = {k: net + str(R.randint(10, 250)) for k in ("me", "db", "redis", "web", "registry", "smtp")}
     deploy = pick(["deploy", "ops", "app", "admin", "devops", "ci"])
-    cores = pick([4, 8, 12, 16, 24, 32])
-    model = pick(["Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz", "Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz",
-                  "Intel(R) Xeon(R) E-2288G CPU @ 3.70GHz", "AMD EPYC 7302P 16-Core Processor", "AMD EPYC 7443P 24-Core Processor"])
+    model, threads = pick([("Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz", 32), ("Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz", 32),
+                           ("Intel(R) Xeon(R) E-2288G CPU @ 3.70GHz", 16), ("AMD EPYC 7302P 16-Core Processor", 32),
+                           ("AMD EPYC 7443P 24-Core Processor", 48)])
+    cores = pick([n for n in (4, 8, 12, 16, 24, 32, 48) if n <= threads])   # a VM gets at most what the CPU has
     mem = pick([16, 32, 64, 128]) * 1024 * 1024 - R.randint(100000, 400000)
     region = pick(["eu-north-1", "eu-central-1", "eu-west-1", "us-east-1", "us-west-2"])
     bucket = "%s-%s-backups" % (app, pick(["prod", "live", "db"]))
@@ -160,7 +161,12 @@ def server():
     return f, {"hostname": host, "kernel_version": kernel, "kernel_build_string": "#%d-Ubuntu SMP PREEMPT_DYNAMIC" % R.randint(100, 160),
                "hardware_platform": "x86_64", "arch": "linux-x64-lsb", "ssh_version": "OpenSSH_%s, OpenSSL %s" % (sshv.split()[0], sslv),
                "ssh_banner": "SSH-2.0-OpenSSH_" + sshv, "cpus": cores, "cpu_model": model,
-               "users": ["ubuntu", deploy]}, bait
+               "users": ["ubuntu", deploy],
+               "commands": {"usr/bin/mysql": "ERROR 2003 (HY000): Can't connect to MySQL server on '%s:3306' (110)\n" % ip["db"],
+                            "usr/bin/mysqldump": "mysqldump: Got error: 2003: \"Can't connect to MySQL server on '%s:3306' (110)\" when trying to connect\n" % ip["db"],
+                            "usr/bin/redis-cli": "Could not connect to Redis at %s:6379: Connection timed out\n" % ip["redis"],
+                            "usr/local/bin/aws": "\nConnect timeout on endpoint URL: \"https://%s.s3.%s.amazonaws.com/?list-type=2&prefix=&delimiter=%%2F&encoding-type=url\"\n" % (bucket, region),
+                            "usr/bin/docker": "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n"}}, bait
 
 
 def nas():
@@ -169,9 +175,9 @@ def nas():
     ip = {k: net + str(R.randint(10, 250)) for k in ("me", "db", "offsite")}
     user = pick(["admin", "backup", "media", "files", "family", "office"])
     kernel = "6.1.0-%d-amd64" % R.randint(18, 28)
-    cores = pick([2, 4, 6, 8])
-    model = pick(["Intel(R) Celeron(R) J4125 CPU @ 2.00GHz", "Intel(R) Pentium(R) Silver N6005 @ 2.00GHz", "AMD Ryzen 5 PRO 4650G with Radeon Graphics",
-                  "Intel(R) Core(TM) i3-10100 CPU @ 3.60GHz", "Intel(R) Xeon(R) E-2224 CPU @ 3.40GHz"])
+    model, cores = pick([("Intel(R) Celeron(R) J4125 CPU @ 2.00GHz", 4), ("Intel(R) Pentium(R) Silver N6005 @ 2.00GHz", 4),
+                         ("AMD Ryzen 5 PRO 4650G with Radeon Graphics", 12), ("Intel(R) Core(TM) i3-10100 CPU @ 3.60GHz", 8),
+                         ("Intel(R) Xeon(R) E-2224 CPU @ 3.40GHz", 4)])     # bare metal: all threads
     mem = pick([4, 8, 16, 32]) * 1024 * 1024 - R.randint(100000, 300000)
     bait = {"nas_smb": password(), "nas_rsync": password(), "nc_db": password(), "nc_secret": rnd(48, string.ascii_letters + string.digits + "+/"),
             "nc_admin": password(), "b2_key_id": "005" + token(22), "b2_key": "K005" + rnd(27, string.ascii_letters + string.digits)}
@@ -209,7 +215,10 @@ def nas():
     sshv = "9.2p1 Debian-2+deb12u%d" % R.randint(2, 5)
     return f, {"hostname": host, "kernel_version": kernel, "kernel_build_string": "#1 SMP PREEMPT_DYNAMIC Debian 6.1.%d-1" % R.randint(90, 130),
                "hardware_platform": "x86_64", "arch": "linux-x64-lsb", "ssh_version": "OpenSSH_%s, OpenSSL 3.0.15 3 Sep 2024" % sshv,
-               "ssh_banner": "SSH-2.0-OpenSSH_" + sshv, "cpus": cores, "cpu_model": model, "users": [user]}, bait
+               "ssh_banner": "SSH-2.0-OpenSSH_" + sshv, "cpus": cores, "cpu_model": model, "users": [user],
+               "commands": {"usr/bin/rclone": "ERROR : : error reading source root directory: couldn't list files: Get \"https://api.backblazeb2.com/\": dial tcp: i/o timeout\n",
+                            "usr/bin/mysql": "ERROR 2002 (HY000): Can't connect to local server through socket '/run/mysqld/mysqld.sock' (2)\n",
+                            "usr/bin/smbpasswd": "Failed to find entry for user %s.\n" % user}}, bait
 
 
 def camera():
@@ -226,6 +235,8 @@ def camera():
         "etc/group": "root:x:0:\ndaemon:x:1:\nnogroup:x:65534:\n",
         "etc/shadow": "root:$1$%s$%s:%d:0:99999:7:::\n" % (rnd(8), rnd(22, string.ascii_letters + string.digits + "./"), R.randint(17000, 18500)),
         "etc/hosts": "127.0.0.1 localhost\n127.0.1.1 %s\n" % host,
+        "etc/motd": "\n\nBusyBox v1.%d.%d (2019-%02d-%02d 11:05:38 CST) built-in shell (ash)\nEnter 'help' for a list of built-in commands.\n\n"
+                    % (R.choice([20, 22, 26]), R.randint(1, 2), R.randint(1, 12), R.randint(1, 28)),
         "mnt/mtd/Config/Account1": "[user]\nname=admin\npassword=%s\ngroup=admin\n[user]\nname=user\npassword=user\ngroup=user\n" % bait["cam_admin"],
         "mnt/mtd/Config/network.conf": "[wifi]\nssid=%s\npsk=%s\n[rtsp]\nurl=rtsp://admin:%s@127.0.0.1:554/stream1\n[ftp_upload]\nhost=%s\nuser=nvr\npass=%s\n"
                                        "[cloud]\ntoken=%s\n" % (ssid, bait["cam_wifi"], bait["cam_rtsp"], nvr, bait["cam_ftp"], bait["cam_cloud"]),
@@ -248,14 +259,18 @@ PRIVATE = ("root/", "etc/shadow", "etc/rsyncd.secrets", "etc/wpa_supplicant.conf
 
 def make(persona, out):
     files, info, bait = MAKERS[persona]()
+    for rel in info.get("commands", {}):
+        files[rel] = b"\x7fELF\x02\x01\x01" + bytes(R.getrandbits(8) for _ in range(R.randint(30000, 90000)))
     for rel, text in files.items():
         p = os.path.join(out, "honeyfs", rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as fh:
+        with open(p, "wb" if isinstance(text, bytes) else "w") as fh:
             fh.write(text)
         mode = 0o600 if rel.startswith(PRIVATE) or rel.endswith((".env", "config.php", ".my.cnf")) else 0o644
         if rel.endswith(".sh"):
             mode = 0o750
+        if rel in info.get("commands", {}):
+            mode = 0o755
         os.chmod(p, mode)
     info.update({"persona": persona, "bait": bait, "created": time.strftime("%Y-%m-%d")})
     with open(os.path.join(out, "persona.json"), "w") as fh:
@@ -362,7 +377,7 @@ def txtcmds(out, dst):
     # Cowrie's canned outputs for nproc/lscpu must agree with the persona's /proc/cpuinfo.
     with open(os.path.join(out, "persona.json")) as fh:
         p = json.load(fh)
-    for rel, text in (("usr/bin/nproc", "%d\n" % p["cpus"]),):
+    for rel, text in [("usr/bin/nproc", "%d\n" % p["cpus"])] + list(p.get("commands", {}).items()):
         os.makedirs(os.path.join(dst, os.path.dirname(rel)), exist_ok=True)
         with open(os.path.join(dst, rel), "w") as fh:
             fh.write(text)

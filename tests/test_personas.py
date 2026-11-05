@@ -38,7 +38,7 @@ class Personas(unittest.TestCase):
             text = ""
             for root, _d, files in os.walk(os.path.join(out, "honeyfs")):
                 for fn in files:
-                    with open(os.path.join(root, fn)) as fh:
+                    with open(os.path.join(root, fn), errors="replace") as fh:
                         text += fh.read()
             values = app.bait_values(info["bait"])
             self.assertEqual(len(values), len(info["bait"]), name)          # all values long enough to be watched
@@ -48,7 +48,7 @@ class Personas(unittest.TestCase):
             for root, _d, files in os.walk(os.path.join(out, "honeyfs")):
                 for fn in files:
                     p = os.path.join(root, fn)
-                    with open(p) as fh:
+                    with open(p, errors="replace") as fh:
                         if any(v in fh.read() for v in info["bait"].values()):
                             self.assertRegex("cat /" + os.path.relpath(p, os.path.join(out, "honeyfs")), app.BAIT_FILES_RE, p)
 
@@ -91,6 +91,30 @@ class Personas(unittest.TestCase):
         self.assertEqual(sorted(homes), sorted(info["users"]))             # Cowrie's "phil" is gone
         self.assertIn(b"root:x:0:0:root", node(fs, "/etc/passwd")[personas.A_CONTENTS])
 
+    def test_fake_commands(self):
+        # Tools the persona's history uses must exist (file in the filesystem + canned output), not "command not found".
+        out, info = self.make("server")
+        self.assertIn("usr/bin/mysql", info["commands"])
+        self.assertTrue(os.access(os.path.join(out, "honeyfs", "usr", "bin", "mysql"), os.X_OK))
+        dst = os.path.join(self.d, "txtcmds")
+        personas.txtcmds(out, dst)
+        with open(os.path.join(dst, "usr", "bin", "mysql")) as fh:
+            self.assertIn("Can't connect to MySQL server", fh.read())
+        with open(os.path.join(dst, "usr", "bin", "nproc")) as fh:
+            self.assertEqual(int(fh.read()), info["cpus"])
+
+    def test_cpu_count_fits_model(self):
+        for _ in range(30):
+            _, info = self.make("server", "cpu")
+            if "E-2288G" in info["cpu_model"]:
+                self.assertLessEqual(info["cpus"], 16)
+            shutil.rmtree(os.path.join(self.d, "cpu"))
+
+    def test_camera_banner(self):
+        out, _ = self.make("camera")
+        with open(os.path.join(out, "honeyfs", "etc", "motd")) as fh:
+            self.assertIn("BusyBox", fh.read())
+
     def test_cowrie_cfg(self):
         out, info = self.make("camera")
         os.makedirs(os.path.join(self.d, "cowrie", "etc"))
@@ -125,6 +149,18 @@ class Announced(unittest.TestCase):
         finally:
             app.set_meta(con, "hp_bait", "[]")
             app.set_meta(con, "hp_personas", "{}")
+            app.load_honeypot_meta(con)
+
+    def test_new_identity_keeps_old_bait(self):
+        con = app.connect()
+        try:
+            for v in ("First-Identity-Bait-1", "Second-Identity-Bait-2"):
+                app.parse_export("##BAIT\n" + json.dumps({"x": v}) + "\n", set())
+                app.apply_honeypot_meta(con, app.parse_export.meta)
+            self.assertIn("First-Identity-Bait-1", app.BAIT)
+            self.assertIn("Second-Identity-Bait-2", app.BAIT)
+        finally:
+            app.set_meta(con, "hp_bait", "[]")
             app.load_honeypot_meta(con)
 
     def test_no_sections_keeps_old(self):
