@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.14.1"
+HUGINN_VERSION = "0.14.2"
 CHANGELOG = [
+    ("0.14.2", "2026-11-05", "Session replays are easy to find: a Replay button on every recorded shell session of an attacker (no need to open it first) and in Latest shell sessions on the overview."),
     ("0.14.1", "2026-11-05", "Malware families from real honeypot data: loaders hidden as \\x escapes or base64 are decoded (their C2 addresses show up too), more dropper shapes (busybox wget, wget -O- | sh, ftpget), \"competitor killer\" scripts, SSH keys written to authorized_keys."),
     ("0.14.0", "2026-11-05", "Malware families: captured files are recognised as Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors or dropper scripts (strings in the file, its name or URL, optionally MalwareBazaar with HUGINN_MALWAREBAZAAR_KEY). Overview: New this week, and When they attack (a heat map per hour of the week). Weekly ntfy summary on Sunday evening."),
     ("0.13.0", "2026-11-05", "Huginn runs in Docker: Dockerfile and docker-compose.yml (one volume for everything, unprivileged, read-only, health check), the container makes its SSH key and learns the honeypot's host key on first start. Image for amd64 and arm64 at ghcr.io/ancientswede/huginn from each release."),
@@ -1358,10 +1359,11 @@ def v_overview():
     srows = ""
     for s in shells:
         first = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts LIMIT 1", (s["session"],)).fetchone()
-        srows += "<tr><td>%s</td><td>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td></tr>" % (
-            esc(ago(s["start"])), ip_link(s["ip"], "#s-" + s["session"]), cc_html(s["cc"]), s["cmds"], esc(clean(first[0] if first else "", 140)))
+        srows += "<tr><td>%s</td><td>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td><td>%s</td></tr>" % (
+            esc(ago(s["start"])), ip_link(s["ip"], "#s-" + s["session"]), cc_html(s["cc"]), s["cmds"], esc(clean(first[0] if first else "", 140)),
+            ('<a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(s["ip"])))) if s["tty"] else "")
     shells_html = ('<div class="card span2"><h3>Latest shell sessions</h3><table><thead><tr><th>When</th><th>IP</th><th>CC</th>'
-                   '<th class=num>Cmds</th><th>First command</th></tr></thead><tbody>%s</tbody></table></div>' % srows)
+                   '<th class=num>Cmds</th><th>First command</th><th></th></tr></thead><tbody>%s</tbody></table></div>' % srows)
 
     creds = con.execute("SELECT a,b,COUNT(*) n FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 10", (d7,)).fetchall()
     crows = "".join("<tr><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td></tr>" % (esc(clean(r["a"], 60)), esc(clean(r["b"], 60)), num(r["n"])) for r in creds)
@@ -1759,7 +1761,8 @@ def v_ip(ip):
                       esc(" · ".join(x for x in ["%d logins" % (s["logins_ok"] + s["logins_fail"]) if (s["logins_ok"] + s["logins_fail"]) else "",
                                                   "%d cmds" % s["cmds"] if s["cmds"] else "", "%d files" % s["files"] if s["files"] else "",
                                                   "%d proxy" % s["tcpip"] if s["tcpip"] else ""] if x) or "connect only"),
-                      esc(clean(s["version"] or "", 60)), human))
+                      esc(clean(s["version"] or "", 60)), human)
+                   + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] and s["cmds"] else ""))
         meta_ = '<div class="smeta">Session <span class=mono>%s</span>%s%s' % (
             esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (esc(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
             (' · script <a class=mono href="/campaign/script/%s">%s</a>' % (esc(s["cmdhash"]), esc(s["cmdhash"]))) if s["cmdhash"] else "") \
@@ -2594,7 +2597,10 @@ CSS += (".theme-btn{display:flex;align-items:center;gap:6px}.ti{display:inline-b
         ".hdr-right{gap:10px}.theme-btn{font-size:0}.theme-btn .ti{font-size:14px}.sync{display:none}}")
 CSS += (".pctl{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.pctl label{display:flex;gap:6px;align-items:center;color:var(--muted)}"
         ".player{min-height:420px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0;border-radius:8px}"
-        ".iocs{line-height:1.5;max-width:420px;overflow-wrap:anywhere}.replay{font-weight:600}")
+        ".iocs{line-height:1.5;max-width:420px;overflow-wrap:anywhere}.replay{font-weight:600}"
+        ".replay-btn{display:inline-block;padding:2px 10px;border:1px solid var(--accent);border-radius:999px;color:var(--accent);font-size:12px;"
+        "font-weight:600;white-space:nowrap;text-decoration:none}.replay-btn:hover{background:var(--accent);color:var(--bg)}"
+        "details.sess summary .replay-btn{margin-left:auto}")
 CSS += (".hdr-link{color:var(--muted)}.hdr-link:hover,.hdr-link.on{color:var(--text)}"
         ".stack{display:flex;flex-direction:column;gap:12px;max-width:420px}.stack label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:13px}"
         ".stack button{align-self:flex-start}.okmsg{color:var(--green);margin:0 0 14px}.err{margin:0 0 14px}"
