@@ -141,9 +141,15 @@ decide WITH_TRAPS  "Install hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, S
 # ------------------------------------------------------------------ packages
 say "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git python3 python3-venv python3-dev build-essential libssl-dev libffi-dev \
-  nftables openssh-server util-linux ca-certificates >/dev/null
+APT_READY=0
+need_pkgs() {  # need_pkgs PKG... -> installs only what is missing, so a re-run works on a honeypot without internet
+  local missing=() p
+  for p in "$@"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  if [ "$APT_READY" = 0 ]; then apt-get update -qq || die "apt-get update failed (no internet?). Needed: ${missing[*]}"; APT_READY=1; fi
+  apt-get install -y -qq "${missing[@]}" >/dev/null
+}
+need_pkgs git python3 python3-venv python3-dev build-essential libssl-dev libffi-dev nftables openssh-server util-linux ca-certificates
 ok "base packages"
 
 # ------------------------------------------------------------------ 1. admin SSH port
@@ -311,7 +317,7 @@ fi
 # ------------------------------------------------------------------ 3a. endlessh
 if [ "$WITH_TARPIT" = yes ]; then
   say "endlessh (tarpit)"
-  apt-get install -y -qq endlessh >/dev/null
+  need_pkgs endlessh
   install -d /etc/endlessh
   cat > /etc/endlessh/config <<EOF
 # Written by Huginn install-honeypot.sh. Public port 2222 is redirected here.
