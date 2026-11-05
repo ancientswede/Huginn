@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.12.1"
+HUGINN_VERSION = "0.12.2"
 CHANGELOG = [
+    ("0.12.2", "2026-11-05", "The bar charts show the number above each bar (no need to hover), sharp at any screen size."),
     ("0.12.1", "2026-11-05", "Fix: copying session recordings in batches stopped at the first batch (bytes vs. text)."),
     ("0.12.0", "2026-11-05", "Disk housekeeping. Honeypot: hp-logclean gzips Cowrie's logs and keeps 30 days, OpenCanary's log is rotated compressed, the journal is capped. Huginn: copies every session recording in the background and keeps it compressed, HUGINN_RETENTION_DAYS=0 keeps the whole history forever, the Account page shows database size and free disk, updates keep only one database backup."),
     ("0.11.2", "2026-11-05", "Long cards scroll inside instead of growing the page: the four Credentials cards (now with a filter box each and more rows), Related attackers and Sessions on an attacker's page."),
@@ -1108,20 +1109,26 @@ def ext(url, label):
     return '<a href="%s" target="_blank" rel="noopener noreferrer">%s</a>' % (esc(url), esc(label))
 
 
+def short_num(v):
+    # 1234 -> 1.2k, so the value fits above a narrow bar.
+    if v >= 10000:
+        return "%dk" % round(v / 1000)
+    if v >= 1000:
+        return ("%.1fk" % (v / 1000)).replace(".0k", "k")
+    return str(v)
+
+
 def bars(values, labels, h=90, cls="bar"):
+    # Bars in plain HTML/CSS (not a stretched SVG), so the number above each bar stays sharp at any width.
     if not values:
         return ""
     mx = max(values) or 1
-    n = len(values)
-    w = 12
-    gap = 4
-    width = n * (w + gap)
-    out = ['<svg class="bars" viewBox="0 0 %d %d" preserveAspectRatio="none" role="img">' % (width, h + 2)]
-    for i, (v, lab) in enumerate(zip(values, labels)):
-        bh = max(1, round(v / mx * h)) if v else 0
-        out.append('<rect class="%s" x="%d" y="%d" width="%d" height="%d" rx="2"><title>%s: %s</title></rect>'
-                   % (cls, i * (w + gap), h - bh + 1, w, bh, esc(lab), num(v)))
-    out.append("</svg>")
+    out = ['<div class="bars" style="--bh:%dpx" role="img">' % h]
+    for v, lab in zip(values, labels):
+        pct = (v / mx * 100) if v else 0
+        out.append('<div class="bcol" title="%s: %s"><span class="bval">%s</span><i class="%s" style="height:calc((100%% - 16px) * %.3f)"></i></div>'
+                   % (esc(lab), num(v), short_num(v) if v else "", cls, max(pct, 1.5) / 100 if v else 0))
+    out.append("</div>")
     return "".join(out)
 
 
@@ -2216,7 +2223,12 @@ tbody tr:hover{background:var(--panel2)}tr:last-child td{border-bottom:0}
 .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:500;border:1px solid currentColor;margin:1px 2px 1px 0;color:var(--muted)}
 .t-red{color:var(--red)}.t-orange{color:var(--orange)}.t-yellow{color:var(--yellow)}.t-blue{color:var(--blue)}.t-purple{color:var(--purple)}
 .t-teal{color:var(--teal)}.t-grey{color:var(--grey)}.t-green{color:var(--green)}
-.bars{width:100%;height:90px;display:block}.bar{fill:var(--accent);opacity:.85}.bar:hover{opacity:1}
+.bars{display:flex;align-items:flex-end;gap:4px;width:100%;height:calc(var(--bh,90px) + 18px)}
+.bcol{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
+.bval{font-size:11px;line-height:1;color:var(--muted);margin-bottom:4px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bcol i{display:block;width:100%;max-width:44px;border-radius:3px 3px 0 0;background:var(--accent);opacity:.85;flex:none}
+.bcol:hover i{opacity:1}.bcol:hover .bval{color:var(--text)}
+@media (max-width:700px){.bars .bval{font-size:9px}}
 .axis{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}.filters input[name=q]{min-width:280px}
 .filters label{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:13px}
@@ -2349,7 +2361,7 @@ CSS += (".site-foot{max-width:2200px;margin:0 auto;padding:18px 24px 28px;color:
 CSS += (".upd{font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 9px}")
 CSS += (".vtabs{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;text-transform:none;letter-spacing:0}"
         ".vtabs button{background:none;color:var(--muted);border:0;border-radius:0;padding:3px 12px;font-size:12px}.vtabs button.on{background:var(--accent2);color:var(--accent)}"
-        ".wm-svg{width:100%;height:auto;max-height:420px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:90px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"
+        ".wm-svg{width:100%;height:auto;max-height:420px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:108px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"
         ".wm-hit{fill:var(--accent);cursor:pointer}.wm-hit:hover,.wm-dot:hover{fill-opacity:1}.wm-dot{fill:var(--accent);stroke:var(--panel);stroke-width:1.5;cursor:pointer}"
         ".wm-legend{display:flex;align-items:center;gap:8px;justify-content:flex-end;font-size:11px;color:var(--muted);margin-top:6px}"
         ".wm-legend i{display:inline-block;width:90px;height:8px;border-radius:4px;background:linear-gradient(90deg,var(--accent2),var(--accent))}")
