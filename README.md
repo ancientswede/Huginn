@@ -359,6 +359,6 @@ If Huginn is useful in your homelab, you can [buy me a coffee](https://buymeacof
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
+Copyright © 2026 Ancientswede. Licensed under [AGPL-3.0-or-later](LICENSE). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
 
-You may use, change and share Huginn. If you share a modified version, or run one as a service for others, you must publish your changes under the same license.
+You may use, change and share Huginn. If you share a modified version, or run one as a service for others, you must publish your changes under the same license and keep the copyright notice (the footer on every page counts as one).

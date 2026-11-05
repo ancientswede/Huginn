@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.9.0"
+HUGINN_VERSION = "0.9.1"
 CHANGELOG = [
+    ("0.9.1", "2026-11-05", "Footer on every page: copyright, license (AGPL-3.0, no warranty) and a link to the source code, as the AGPL asks of network software."),
     ("0.9.0", "2026-11-05", "Updates: update-huginn.sh (backup, health check, automatic rollback, --rollback) and update-honeypot.sh (also upgrades Cowrie/OpenCanary and re-applies Huginn's patches). Huginn shows when a newer version is out."),
     ("0.8.4", "2026-11-05", "ntfy servers with access control: HUGINN_NTFY_TOKEN. The installer asks about ntfy and sends a test notification."),
     ("0.8.3", "2026-11-05", "Web decoy: HTTPS port and readable web requests (method, path, status). The address the attacker connected to is no longer stored, and HUGINN_MASK hides your own IPs/domains in everything stored."),
@@ -1022,6 +1023,14 @@ def hidden_sql(st, alias="e"):
     return (" AND " + " AND ".join(parts)) if parts else "", args
 
 
+def footer():
+    # AGPL section 5 and 13: show copyright, license, no warranty and where the source is.
+    # Modified versions may add their own notice here, but must keep this one.
+    return ("<footer class='site-foot'>Huginn %s · © 2026 Ancientswede · "
+            "<a href='https://www.gnu.org/licenses/agpl-3.0.html' target='_blank' rel='noopener noreferrer'>AGPL-3.0</a>, no warranty · "
+            "<a href='https://github.com/%s' target='_blank' rel='noopener noreferrer'>Source on GitHub</a></footer>" % (HUGINN_VERSION, esc(REPO)))
+
+
 def html_attrs(st):
     a = ' data-accent="%s" data-density="%s"' % (esc(st["accent"]), esc(st["density"]))
     if st["theme"] in ("light", "dark"):
@@ -1053,9 +1062,9 @@ def page(title, body, active="/"):
             "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
-            "<main>%s</main></body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
+            "<main>%s</main>%s</body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
                                                   esc(st["title"]), nav, status, HUGINN_VERSION, update_badge(con), theme_btn,
-                                                  " on" if active == "/settings" else "", " on" if active == "/account" else "", body)
+                                                  " on" if active == "/settings" else "", " on" if active == "/account" else "", body, footer())
 
 
 # ---------------------------------------------------------------- pages
@@ -1853,8 +1862,8 @@ def v_login(err=""):
             "<title>%s</title><link rel=icon href='/static/icon.svg'><link rel=stylesheet href='/static/app.css?v=%s'></head><body class=login>"
             "<form method=post action='/login' class='card loginbox'><h1>%s</h1>%s"
             "<input type=password name=password placeholder=Password autofocus autocomplete=current-password required>"
-            "<button>Log in</button></form></body></html>") % (html_attrs(st), esc(st["title"]), HUGINN_VERSION, esc(st["title"]),
-                                                              '<p class=err>%s</p>' % esc(err) if err else "")
+            "<button>Log in</button></form>%s</body></html>") % (html_attrs(st), esc(st["title"]), HUGINN_VERSION, esc(st["title"]),
+                                                              '<p class=err>%s</p>' % esc(err) if err else "", footer())
 
 
 # ---------------------------------------------------------------- static files
@@ -2005,6 +2014,9 @@ CSS += ("[data-density=compact] th,[data-density=compact] td{padding:3px 6px}[da
         "[data-density=compact] .kpi{padding:9px 12px}[data-density=compact] .kpi-v{font-size:21px}[data-density=compact] .grid,"
         "[data-density=compact] .kpis,[data-density=compact] .grid3{gap:9px}[data-density=compact] main{padding-top:14px}"
         "[data-density=compact] body{font-size:13px}")
+CSS += (".site-foot{max-width:2200px;margin:0 auto;padding:18px 24px 28px;color:var(--muted);font-size:12px;text-align:center}"
+        ".site-foot a{color:var(--muted);text-decoration:underline}.site-foot a:hover{color:var(--text)}"
+        "body.login{grid-template-rows:1fr auto}body.login .site-foot{padding-bottom:16px}")
 CSS += (".upd{font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 9px}")
 CSS += (".vtabs{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;text-transform:none;letter-spacing:0}"
         ".vtabs button{background:none;color:var(--muted);border:0;border-radius:0;padding:3px 12px;font-size:12px}.vtabs button.on{background:var(--accent2);color:var(--accent)}"
