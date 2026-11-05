@@ -117,6 +117,20 @@ All from the demo, with made-up data. They follow your light/dark setting.
 |---|---|
 | <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/attacker-dark.png">  <img alt="Attacker page with network info, credentials, related attackers and sessions" src="docs/screenshots/attacker-light.png"></picture> | <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/replay-dark.png">  <img alt="Replay of an attacker's shell session" src="docs/screenshots/replay-light.png"></picture> |
 
+**New this week and when they attack**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/week-dark.png">
+  <img alt="New this week card next to a heat map of attacker IPs per hour of the week" src="docs/screenshots/week-light.png">
+</picture>
+
+**Captured malware, with the family it looks like**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/malware-dark.png">
+  <img alt="Files page with captured malware tagged as XMRig, Mirai, Gafgyt and a dropper script" src="docs/screenshots/malware-light.png">
+</picture>
+
 **Blocklist feeds**
 
 <picture>
