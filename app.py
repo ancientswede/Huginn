@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.12.0"
+HUGINN_VERSION = "0.12.1"
 CHANGELOG = [
+    ("0.12.1", "2026-11-05", "Fix: copying session recordings in batches stopped at the first batch (bytes vs. text)."),
     ("0.12.0", "2026-11-05", "Disk housekeeping. Honeypot: hp-logclean gzips Cowrie's logs and keeps 30 days, OpenCanary's log is rotated compressed, the journal is capped. Huginn: copies every session recording in the background and keeps it compressed, HUGINN_RETENTION_DAYS=0 keeps the whole history forever, the Account page shows database size and free disk, updates keep only one database backup."),
     ("0.11.2", "2026-11-05", "Long cards scroll inside instead of growing the page: the four Credentials cards (now with a filter box each and more rows), Related attackers and Sessions on an attacker's page."),
     ("0.11.1", "2026-11-05", "The fake mail server (hp-traps) greets with a name that fits the persona instead of mail.example.com. README: a table of the ports to forward. install-honeypot.sh can be run again on a honeypot without internet (apt only runs when a package is missing)."),
@@ -551,6 +552,8 @@ def prefetch_tty(con, batch=40, budget=40):
         rc, out, _err = run_capped(hp_ssh("tty " + " ".join(chunk)), 120, 64 * 1024 * 1024)
         if rc != 0:
             break
+        if isinstance(out, bytes):
+            out = out.decode("ascii", "replace")
         got = {}
         if len(chunk) == 1:
             got[chunk[0]] = out.strip()

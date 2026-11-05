@@ -60,7 +60,7 @@ class Recordings(unittest.TestCase):
             calls.append(cmd[-1])
             asked = cmd[-1].split()[1:]
             lines = ["%s %s" % (s, base64.b64encode(b"rec-" + s.encode()).decode()) if s != shas[2] else s + " -" for s in asked]
-            return 0, "\n".join(lines) + "\n", ""
+            return 0, ("\n".join(lines) + "\n").encode(), b""          # like run_capped: bytes
 
         orig = app.run_capped
         app.run_capped = fake
