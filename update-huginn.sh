@@ -32,6 +32,13 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -f "$DIR/app.py" ] || die "Huginn is not installed in $DIR — run install-huginn.sh first."
 
+# Backups are folders named <version>-<YYYYmmdd-HHMMSS>: sort by that name, never by file times (which change
+# when an old backup's database copy is removed).
+backups_newest_first() {
+  local d
+  for d in "$BK"/*/; do [ -d "$d" ] && echo "${d%/}"; done | awk -F- '{print $(NF-1) $NF "\t" $0}' | sort -r | cut -f2
+}
+
 ver() { sed -nE 's/^HUGINN_VERSION = "([^"]+)".*/\1/p' "$1" | head -1; }
 PORT=$(sed -nE 's/^HUGINN_PORT=([0-9]+).*/\1/p' "$DIR/.env" 2>/dev/null | head -1); PORT="${PORT:-8095}"
 
@@ -68,14 +75,14 @@ restore() {  # restore BACKUPDIR: put the code from a backup back and restart (d
 
 # ------------------------------------------------------------------ rollback
 if [ "$ROLLBACK" = 1 ]; then
-  LAST=$(ls -1dt "$BK"/*/ 2>/dev/null | head -1)
+  LAST=$(backups_newest_first | head -1)
   [ -n "$LAST" ] || die "No backup found in $BK."
   OLDV=$(ver "$LAST/app.py")
   say "Rolling back to $OLDV"
   restore "$LAST"
   wait_for "$OLDV" || die "Huginn did not come up as $OLDV — see: journalctl -u $SVC -n 30"
   ok "running $OLDV again"
-  echo "    The database was not touched. Its copy from before the update is $LAST""huginn.db if you ever need it."
+  echo "    The database was not touched. Its copy from before the update is $LAST/huginn.db if you ever need it."
   exit 0
 fi
 
@@ -106,8 +113,6 @@ src.backup(dst)          # consistent copy while Huginn keeps running
 dst.close(); src.close()
 PY
   chmod 600 "$B/huginn.db"
-  # Only the newest backup keeps a database copy: the database grows, the code backups stay tiny.
-  for old in "$BK"/*/; do [ "${old%/}" = "$B" ] || rm -f "$old/huginn.db"; done
 fi
 ok "saved in $B"
 
@@ -130,8 +135,9 @@ else
                   || die "Update failed and $OLD did not come back either — see: journalctl -u $SVC -n 50"
 fi
 
-# keep the newest $KEEP backups
-ls -1dt "$BK"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do rm -rf -- "$old"; done
+# keep the newest $KEEP backups, and a database copy only in the newest one (the database grows, the code stays tiny)
+backups_newest_first | tail -n +$((KEEP + 1)) | while read -r old; do rm -rf -- "$old"; done
+backups_newest_first | tail -n +2 | while read -r old; do rm -f -- "$old/huginn.db"; done
 
 say "What is new since $OLD"
 python3 - "$HERE/app.py" "$OLD" <<'PY'
