@@ -283,6 +283,20 @@ Forward these **TCP** ports from the internet to the honeypot, and only the rows
 
 **Never forward** the honeypot's admin SSH port (22022 by default), and never forward anything to Huginn. Forward a port to the same port number on the honeypot (22 → 22, not 22 → 2225): the redirects inside take care of the rest. Some providers block port 25; the rest still works. All of this is TCP; UDP is not needed.
 
+### Router security features can hide the attacks
+
+Many routers and firewalls inspect incoming traffic and silently drop what looks like an attack: an **IPS** (intrusion prevention), "threat management" or "active protection". For a honeypot, that is exactly the traffic you want. Typical sign: the encrypted or less common ports (443, VNC, MySQL) still get visits, but SSH (22, 2222) and plain HTTP (80, 8080) go quiet, even though the port forwards are right.
+
+**Exclude the honeypot's network (VLAN) or address from the IPS**, or set it to detect only, never block. Leave the IPS on for the rest of your network.
+
+- **UniFi:** Settings → Security → Threat Management: add the honeypot's network or IP as an exclusion. Found out the hard way: with prevention on, the honeypot saw almost no SSH or web attacks.
+- **OPNsense / pfSense with Suricata or Snort in blocking mode:** add the honeypot's address to a pass list, or don't run blocking mode on that interface.
+- **Others** (Firewalla, consumer routers with "security" or "threat protection" add-ons): look for an exclusion per device or network.
+
+Some routers also have a **built-in honeypot**. It is unrelated to this one and only watches your own networks. Leave it as it is; it does not need to be on the honeypot's VLAN.
+
+To test from outside: turn off Wi-Fi and VPN on your phone and open `http://<your public IP>/`. You should see the fake NAS login page, and the visit shows up in Huginn within two minutes. Then mark your phone's address as "never block" on its Huginn page.
+
 ## Updating
 
 Get the new version, then run the update script on each machine. Your settings, keys, login and collected data are never replaced.
