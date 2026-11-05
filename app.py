@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.11.1"
+HUGINN_VERSION = "0.11.2"
 CHANGELOG = [
+    ("0.11.2", "2026-11-05", "Long cards scroll inside instead of growing the page: the four Credentials cards (now with a filter box each and more rows), Related attackers and Sessions on an attacker's page."),
     ("0.11.1", "2026-11-05", "The fake mail server (hp-traps) greets with a name that fits the persona instead of mail.example.com. README: a table of the ports to forward. install-honeypot.sh can be run again on a honeypot without internet (apt only runs when a package is missing)."),
     ("0.11.0", "2026-11-05", "Credentials: \"Is my password in here?\" checks a password against everything attackers tried, in the browser (only 4 characters of its SHA-256 hash are sent). Search all usernames and passwords, and export them as word lists or a CSV of every attempt."),
     ("0.10.1", "2026-11-05", "Personas look more real: CPU count fits the CPU model, the tools in the bash history exist (and fail like a real network problem), the camera shows a BusyBox banner. Huginn remembers bait from earlier honeypot identities, so old attackers keep their took-bait tag. New uninstall-huginn.sh and uninstall-honeypot.sh."),
@@ -1432,7 +1433,7 @@ def v_ip(ip):
             rel.append(("Same /24 network", n24))
     rel_html = ""
     if rel:
-        rel_html = '<div class="card span2"><h3>Related attackers</h3>%s</div>' % "".join(
+        rel_html = '<div class="card span2"><h3>Related attackers</h3><div class="scroll">%s</div></div>' % "".join(
             '<div class="rel"><div class="rel-l">%s <span class=muted>%s</span></div><div class="rel-ips">%s</div></div>' % (esc(l), len(x), " ".join(ip_link(i) for i in x)) for l, x in rel)
 
     # Sessions
@@ -1482,7 +1483,7 @@ def v_ip(ip):
         meta_ += "</div>"
         sblocks.append('<details class="sess" id="s-%s"><summary>%s</summary>%s<div class="term">%s</div></details>'
                        % (esc(s["session"]), summary, meta_, "".join(lines) or '<div class="ln muted">No interaction recorded.</div>'))
-    sess_html = ('<div class="card span2"><h3>Sessions <span class=muted>%s total%s</span></h3>%s</div>'
+    sess_html = ('<div class="card span2"><h3>Sessions <span class=muted>%s total%s</span></h3><div class="scroll tall">%s</div></div>'
                  % (num(r["sessions"]), ", latest 150 shown" if r["sessions"] > 150 else "", "".join(sblocks) or "<p class=muted>No SSH/Telnet sessions.</p>"))
 
     # Other services (OpenCanary, hp-traps) + tarpit
@@ -1574,10 +1575,10 @@ def v_creds(qs):
     if days not in ("1", "7", "30", "all"):
         days = "7"
     since = 0 if days == "all" else time.time() - int(days) * 86400
-    users = con.execute("SELECT a, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a ORDER BY n DESC LIMIT 50", (since,)).fetchall()
-    pws = con.execute("SELECT b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY b ORDER BY n DESC LIMIT 50", (since,)).fetchall()
-    pairs = con.execute("SELECT a,b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 100", (since,)).fetchall()
-    canary = con.execute("SELECT a svc, b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='canary' AND b LIKE '% / %' AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 50", (since,)).fetchall()
+    users = con.execute("SELECT a, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a ORDER BY n DESC LIMIT 300", (since,)).fetchall()
+    pws = con.execute("SELECT b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY b ORDER BY n DESC LIMIT 300", (since,)).fetchall()
+    pairs = con.execute("SELECT a,b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 500", (since,)).fetchall()
+    canary = con.execute("SELECT a svc, b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='canary' AND b LIKE '% / %' AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 300", (since,)).fetchall()
     t = lambda rows, cols: "".join("<tr>%s</tr>" % "".join(c(r) for c in cols) for r in rows)
     td = lambda k, n=80: (lambda r: "<td class=mono>%s</td>" % esc(clean(r[k], n)))
     tn = lambda k: (lambda r: "<td class=num>%s</td>" % num(r[k]))
@@ -1605,13 +1606,18 @@ def v_creds(qs):
              '<p class="muted small">For words like your name, domain or company. Do not type real passwords here: the search is sent to Huginn. '
              'Use the check on the left instead.</p><p class=small>Export (%s): %s</p></div></div>'
              % (CRED_PREFIX, CRED_PREFIX, esc(q), esc(days), {"1": "24h", "7": "7 days", "30": "30 days", "all": "all"}[days], exp))
-    body = ('<h1>Credentials</h1><div class="chips">%s</div>' % tabs) + check + search + ('<div class="grid3">'
-            '<div class="card"><h3>Usernames</h3><table><thead><tr><th>User</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<div class="card"><h3>Passwords</h3><table><thead><tr><th>Password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<div class="card"><h3>Pairs (SSH/Telnet)</h3><table><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<div class="card"><h3>Other services (FTP, HTTP, MySQL…)</h3><table><thead><tr><th>Service</th><th>User / password</th><th class=num>Tries</th><th class=num>IPs</th></tr></thead><tbody>%s</tbody></table></div></div>'
-            % (t(users, [td("a"), tn("n"), tn("nip")]), t(pws, [td("b"), tn("n"), tn("nip")]),
-               t(pairs, [td("a", 40), td("b", 40), tn("n"), tn("nip")]), t(canary, [td("svc", 10), td("b", 80), tn("n"), tn("nip")])))
+    def card(title, tid, heads, rows):
+        # Fixed height, scrolls inside, header row stays visible, own filter box.
+        return ('<div class="card"><h3>%s <span class=muted>top %s</span></h3><input class="qf" data-filter="%s" placeholder="Filter">'
+                '<div class="scroll tall"><table id="%s"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div></div>'
+                % (title, num(rows.count("<tr>")), tid, tid, heads, rows or '<tr><td colspan=4 class=muted>None</td></tr>'))
+    nums = '<th class=num>Tries</th><th class=num>IPs</th>'
+    body = (('<h1>Credentials</h1><div class="chips">%s</div>' % tabs) + check + search + '<div class="grid3">'
+            + card("Usernames", "t-cu", "<th>User</th>" + nums, t(users, [td("a"), tn("n"), tn("nip")]))
+            + card("Passwords", "t-cp", "<th>Password</th>" + nums, t(pws, [td("b"), tn("n"), tn("nip")]))
+            + card("Pairs (SSH/Telnet)", "t-cpair", "<th>User</th><th>Password</th>" + nums, t(pairs, [td("a", 40), td("b", 40), tn("n"), tn("nip")]))
+            + card("Other services", "t-cother", "<th>Service</th><th>User / password</th>" + nums, t(canary, [td("svc", 10), td("b", 80), tn("n"), tn("nip")]))
+            + '</div>')
     return page("Credentials", body, "/creds")
 
 
@@ -2114,7 +2120,8 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;
 th{font-size:12px;font-weight:600;color:var(--muted);position:sticky;top:0;background:var(--panel)}th a{color:var(--muted)}
 tbody tr:hover{background:var(--panel2)}tr:last-child td{border-bottom:0}
 .num{text-align:right;font-variant-numeric:tabular-nums}.trunc{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.scroll{max-height:420px;overflow:auto}
+.scroll{max-height:420px;overflow:auto;overscroll-behavior:contain}.scroll.tall{max-height:560px}
+.rel-ips{max-height:120px;overflow:auto}
 .cc{display:inline-block;min-width:24px;padding:0 4px;border-radius:4px;background:var(--panel2);border:1px solid var(--line);font-size:11px;font-weight:600;text-align:center}
 .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:500;border:1px solid currentColor;margin:1px 2px 1px 0;color:var(--muted)}
 .t-red{color:var(--red)}.t-orange{color:var(--orange)}.t-yellow{color:var(--yellow)}.t-blue{color:var(--blue)}.t-purple{color:var(--purple)}
