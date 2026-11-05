@@ -29,6 +29,7 @@ COWRIE_TELNET=2323
 TARPIT=2224
 CANARY_FTP=2121
 CANARY_HTTP=8080
+CANARY_HTTPS=8443
 
 usage() {
   cat <<EOF
@@ -97,7 +98,7 @@ fi
 [ -r /etc/debian_version ] || die "This script supports Debian 12/13 (and derivatives) only."
 command -v systemctl >/dev/null || die "systemd is required."
 [[ "$ADMIN_PORT" =~ ^[0-9]+$ ]] && [ "$ADMIN_PORT" -gt 1024 ] && [ "$ADMIN_PORT" -lt 65536 ] || die "--admin-port must be 1025-65535."
-for p in 22 23 2222 25 587 110 143 21 80 5432 1080 $COWRIE_SSH $COWRIE_TELNET $TARPIT $CANARY_FTP $CANARY_HTTP; do
+for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_TELNET $TARPIT $CANARY_FTP $CANARY_HTTP $CANARY_HTTPS; do
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py systemd/hp-traps.service; do
@@ -112,7 +113,7 @@ cat <<EOF
   with no route to your LAN. Your admin SSH moves to port $ADMIN_PORT.
 EOF
 ask "Continue?" yes || exit 0
-decide WITH_CANARY "Install OpenCanary (fake FTP, HTTP, MySQL, Redis, VNC)?"
+decide WITH_CANARY "Install OpenCanary (fake FTP, HTTP/HTTPS, MySQL, Redis, VNC)?"
 decide WITH_TARPIT "Install endlessh (SSH tarpit on public port 2222)?"
 decide WITH_TRAPS  "Install hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, SOCKS5)?"
 
@@ -294,6 +295,9 @@ for k in list(c):
         c[k] = False
 c["device.node_id"] = host
 c.update({"ftp.enabled": True, "ftp.port": ftp, "http.enabled": True, "http.port": http, "http.skin": "nasLogin",
+          "http.banner": "Apache/2.4.41 (Ubuntu)", "http.log_redirect_request": True,
+          "https.enabled": True, "https.port": 8443, "https.skin": "nasLogin",
+          "https.certificate": "/home/opencanary/https.pem", "https.key": "/home/opencanary/https.key",
           "mysql.enabled": True, "mysql.port": 3306, "redis.enabled": True, "redis.port": 6379,
           "vnc.enabled": True, "vnc.port": 5900})
 c["logger"] = {"class": "PyLogger", "kwargs": {"formatters": {"plain": {"format": "%(message)s"}},
@@ -336,6 +340,62 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Self-signed certificate with a generic NAS name — never your real certificate (it would link your IP to your domain).
+  if [ ! -f "$O/https.key" ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DiskStation" -addext "subjectAltName=DNS:DiskStation" \
+      -keyout "$O/https.key" -out "$O/https.pem" 2>/dev/null
+    chown opencanary:opencanary "$O/https.key" "$O/https.pem"; chmod 600 "$O/https.key"
+    ok "self-signed certificate CN=DiskStation"
+  fi
+  # OpenCanary answers unknown paths with 404 and never logs them, so most scanner traffic is invisible: log them.
+  HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
+  if [ -n "$HTTPPY" ] && ! grep -q "Huginn patch" "$HTTPPY"; then
+    python3 - "$HTTPPY" <<'PY' && ok "OpenCanary logs every probed web path" || warn "OpenCanary 404 logging not patched (OpenCanary changed); harmless"
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """    def render(self, request):
+        request.setHeader(b"Server", self.factory.banner)
+        request.setResponseCode(int(self.error_code))
+        return Resource.render(self, request)"""
+new = """    def render(self, request):
+        # Huginn patch: log every probed path. Scanners mostly ask for paths that do not exist (404),
+        # which OpenCanary never logged, so the most interesting web traffic was invisible.
+        try:
+            ua = request.getHeader("user-agent") or "<not supplied>"
+            logdata = {"PATH": request.uri.decode("utf-8", "replace")[:500],
+                       "METHOD": request.method.decode("ascii", "replace")[:10],
+                       "STATUS": self.error_code, "USERAGENT": ua}
+            if request.method in (b"POST", b"PUT") and request.content is not None:
+                request.content.seek(0)
+                body = request.content.read(500)
+                request.content.seek(0)
+                if body:
+                    logdata["BODY"] = body.decode("utf-8", "replace")
+            self.factory.log(logdata, transport=request.transport, logtype=self.factory.logger.LOG_HTTP_GET)
+        except Exception:
+            pass
+        request.setHeader(b"Server", self.factory.banner)
+        request.setResponseCode(int(self.error_code))
+        return Resource.render(self, request)"""
+if s.count(old) != 1:
+    sys.exit(1)
+open(p + ".orig", "w").write(s)
+open(p, "w").write(s.replace(old, new))
+PY
+  fi
+  # OpenCanary never rotates its log: rotate daily, uncompressed so hp-export can still read every file.
+  cat > /etc/logrotate.d/opencanary <<EOF
+$O/opencanary.log {
+    daily
+    rotate 14
+    dateext
+    missingok
+    notifempty
+    nocompress
+    copytruncate
+    su opencanary opencanary
+}
+EOF
   start_svc opencanary
 fi
 
@@ -356,7 +416,8 @@ RULES="    tcp dport 22 counter redirect to :$COWRIE_SSH
     tcp dport 2222 counter redirect to :$TARPIT"
 [ "$WITH_CANARY" = yes ] && RULES="$RULES
     tcp dport 21 counter redirect to :$CANARY_FTP
-    tcp dport 80 counter redirect to :$CANARY_HTTP"
+    tcp dport 80 counter redirect to :$CANARY_HTTP
+    tcp dport 443 counter redirect to :$CANARY_HTTPS"
 [ "$WITH_TRAPS" = yes ] && RULES="$RULES
     tcp dport 25 counter redirect to :2525
     tcp dport 587 counter redirect to :2587
@@ -425,7 +486,7 @@ for s in cowrie $( [ "$WITH_TARPIT" = yes ] && echo endlessh ) $( [ "$WITH_CANAR
 done
 FWD="22, 23"
 [ "$WITH_TARPIT" = yes ] && FWD="$FWD, 2222"
-[ "$WITH_CANARY" = yes ] && FWD="$FWD, 21, 80, 3306, 5900, 6379"
+[ "$WITH_CANARY" = yes ] && FWD="$FWD, 21, 80, 443, 8080, 3306, 5900, 6379"
 [ "$WITH_TRAPS" = yes ] && FWD="$FWD, 25, 587, 110, 143, 1080, 5432"
 cat <<EOF
 

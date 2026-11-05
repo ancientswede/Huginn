@@ -280,6 +280,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Bait values to watch for |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_TRUSTED_PROXIES` | – | Reverse proxy IPs allowed to set `X-Forwarded-*` |
+| `HUGINN_MASK` | – | Your own public IPs/domains, replaced with `[self]` in everything stored (attackers often echo the address they target) |
 | `HUGINN_ALLOW_PRIVATE` | `0` | `1` = also record LAN source addresses (testing only; never blocklisted) |
 
 ## Security model

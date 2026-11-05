@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.8.2"
+HUGINN_VERSION = "0.8.3"
 CHANGELOG = [
+    ("0.8.3", "2026-11-05", "Web decoy: HTTPS port and readable web requests (method, path, status). The address the attacker connected to is no longer stored, and HUGINN_MASK hides your own IPs/domains in everything stored."),
     ("0.8.2", "2026-11-05", "Clicking a country on the map shows exactly that country (new country filter on the Attackers list)."),
     ("0.8.1", "2026-11-05", "Map and chart cards line up."),
     ("0.8.0", "2026-11-05", "Countries card: switch between a world map and the list. Click a country to see its attackers."),
@@ -61,6 +62,8 @@ POLL = max(30, int(os.environ.get("HUGINN_POLL", "120")))
 RETENTION_DAYS = max(7, int(os.environ.get("HUGINN_RETENTION_DAYS", "180")))
 ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
+# Your own public IPs / domain names: replaced with "[self]" in everything stored (attackers often echo the target address).
+MASK = [x.strip() for x in os.environ.get("HUGINN_MASK", "").split(",") if x.strip()]
 # Testing only: also record private/LAN source addresses (normally dropped so you never block yourself).
 ALLOW_PRIVATE = os.environ.get("HUGINN_ALLOW_PRIVATE", "0") == "1"
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
@@ -92,7 +95,7 @@ BAIT_FILES_RE = re.compile(r"\.env\b|\.my\.cnf|\.aws/credentials|\.bash_history|
 BENIGN_IOC = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "208.67.222.222", "208.67.220.220", "4.2.2.2"}
 
 PORTNAME = {22: "ssh", 2222: "ssh", 2223: "ssh", 23: "telnet", 2323: "telnet", 21: "ftp", 2121: "ftp",
-            80: "http", 8080: "http", 3306: "mysql", 6379: "redis", 5900: "vnc"}
+            80: "http", 8080: "http", 443: "https", 8443: "https", 3306: "mysql", 6379: "redis", 5900: "vnc"}
 
 # Known research/internet scanners (rDNS/org/tags). Left out of the blocklist by default.
 RESEARCH_RE = re.compile(
@@ -198,6 +201,9 @@ def trunc(s, n=4000):
     if s is None:
         return None
     s = str(s)
+    for m in MASK:
+        if m in s:
+            s = s.replace(m, "[self]")
     return s if len(s) <= n else s[:n] + "…"
 
 
@@ -263,9 +269,18 @@ def p_canary(line):
     ld = ev.get("logdata") or {}
     if not isinstance(ld, dict):
         ld = {"data": ld}
+    # The address the attacker connected to is our own public IP or hostname: never store it.
+    for k in ("HOSTNAME", "SKIN"):
+        ld.pop(k, None)
     user, pw = ld.get("USERNAME") or ld.get("USER"), ld.get("PASSWORD")
     if user or pw:
         b = "%s / %s" % (user or "", pw or "")
+    elif svc in ("http", "https") and ld.get("PATH"):
+        b = "%s %s%s" % (ld.get("METHOD") or "GET", ld.get("PATH"), " (%s)" % ld["STATUS"] if ld.get("STATUS") else "")
+        if ld.get("BODY"):
+            b += "  body: " + str(ld["BODY"])[:300]
+        if ld.get("USERAGENT"):
+            b += "  · " + str(ld["USERAGENT"])[:120]
     else:
         ld2 = {k: v for k, v in ld.items() if "Challenge" not in k and "Response" not in k}
         b = json.dumps(ld2, ensure_ascii=False) if ld2 else ""
