@@ -360,8 +360,21 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 
 ## Uninstall
 
-- **Huginn:** `systemctl disable --now huginn`, then `rm -rf /opt/huginn /etc/systemd/system/huginn.service`, then `userdel huginn`.
-- **Honeypot:** `systemctl disable --now cowrie opencanary endlessh hp-traps`. Remove the `include "/etc/huginn-honeypot.nft"` line from `/etc/nftables.conf`, then `nft -f /etc/nftables.conf`. Delete the `restrict,command="/usr/local/bin/hp-export"` line in `/root/.ssh/authorized_keys`.
+Run from the repository folder as root. Both scripts ask you to type `remove` first (`--yes` skips that).
+
+```bash
+# Huginn machine: the database is kept in /root/huginn-data-<date> unless you add --purge
+./uninstall-huginn.sh [--purge]
+
+# Honeypot: port redirects go first, then the services, the export, Huginn's key and the personas/bait
+./uninstall-honeypot.sh [--purge] [--restore-ssh]
+```
+
+- `--purge` on the honeypot also deletes Cowrie, OpenCanary, their users, all logs and captured files, and the endlessh package (only if the installer set it up).
+- `--restore-ssh` puts your admin SSH back on port 22 only. Without it, both 22 and your admin port reach the real sshd.
+- You can run the honeypot script again later with `--purge` or `--restore-ssh`.
+- Not removed: the Debian packages the installer added (git, python3-venv, build-essential, …), which other software may use, and the backups of `/etc/nftables.conf` it made.
+- Delete the port forwards in your router, and the jobs on your firewalls that fetch Huginn's blocklists.
 
 ## Try it without a honeypot
 
@@ -382,6 +395,8 @@ app.py import FILE...        # import full cowrie.json* / opencanary.log* files
 
 ./update-huginn.sh [--rollback]          # update / go back (Huginn machine)
 ./update-honeypot.sh [--cowrie] [--opencanary]   # update the honeypot side
+./uninstall-huginn.sh [--purge]                  # remove Huginn (keeps the data unless --purge)
+./uninstall-honeypot.sh [--purge] [--restore-ssh]   # remove the honeypot side
 ```
 
 ## Support
