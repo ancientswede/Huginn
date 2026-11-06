@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.15.0"
+HUGINN_VERSION = "0.16.0"
 CHANGELOG = [
+    ("0.16.0", "2026-11-06", "SSHole detection (CVE-2026-123158): an SSH login with a password of 257-1024 bytes tags the attacker sshole-probe (+10 score), stands out in the session log and counts as an exploit attempt in ntfy. Attackers already in the database are tagged at the first start."),
     ("0.15.0", "2026-11-05", "Overview: a banner with the raven and what Huginn has seen so far (since when, attackers, countries, login attempts, last sync). It is a card like the others: switch it off in Settings."),
     ("0.14.3", "2026-11-05", "Security review: data from ipwho.is, Shodan and reverse DNS is validated, the CSV blocklist uses real CSV quoting, a negative Content-Length can no longer hang a request, extra security headers, harder systemd sandbox, hp-export never follows symlinks, hp-logclean runs as the cowrie user. New tests plant HTML/JS in every attacker-controlled field."),
     ("0.14.2", "2026-11-05", "Session replays are easy to find: a Replay button on every recorded shell session of an attacker (no need to open it first) and in Latest shell sessions on the overview."),
@@ -227,6 +228,12 @@ def init_db():
     if not get_meta(con, "feed_token"):
         set_meta(con, "feed_token", secrets.token_urlsafe(24))
     load_honeypot_meta(con)
+    # One time only: attackers stored before this detection existed get their tag. Later rows are handled by store().
+    if not get_meta(con, "sshole_backfilled"):
+        with con:
+            for (ip,) in con.execute("SELECT DISTINCT e.ip FROM events e WHERE %s" % SSHOLE_SQL).fetchall():
+                recompute_ip(con, ip)
+        set_meta(con, "sshole_backfilled", "1")
     con.close()
 
 
@@ -777,8 +784,21 @@ def bait_flags(rows):
     return took, read
 
 
-def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False):
+# SSHole (CVE-2026-123158): musl's crypt() rejects passwords over 256 bytes, which sshd up to 10.6p1 could take for a match.
+# Only SSH sessions count: telnet bots paste whole shell scripts into the login prompt, which would be false alarms.
+SSHOLE_MIN, SSHOLE_MAX = 257, 1024
+SSHOLE_SQL = ("e.kind IN ('login_ok','login_fail') AND length(CAST(e.b AS BLOB)) BETWEEN %d AND %d "
+              "AND EXISTS(SELECT 1 FROM sessions s WHERE s.session=e.session AND s.proto='ssh')" % (SSHOLE_MIN, SSHOLE_MAX))
+
+
+def sshole_password(proto, password):
+    return proto == "ssh" and SSHOLE_MIN <= len((password or "").encode("utf-8", "surrogatepass")) <= SSHOLE_MAX
+
+
+def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False):
     s = 1
+    if sshole:
+        s += 10
     if took:
         s += 20
     if read:
@@ -811,6 +831,8 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("proxy")
     if expl:
         tags.append("exploit")
+    if sshole:
+        tags.append("sshole-probe")
     if len(set(protos) | set(csvcs)) >= 2:
         tags.append("multi-service")
     if tarpit_s >= 60:
@@ -837,7 +859,8 @@ def recompute_ip(con, ip):
         protos.append("ssh-tarpit")
     csvcs = sorted({x for x in (c["svcs"] or "").split(",") if x})
     took, read = bait_flags(con.execute("SELECT kind,a,b FROM events WHERE ip=? AND kind IN ('cmd','login_ok','login_fail','canary')", (ip,)).fetchall())
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read)
+    sshole = con.execute("SELECT 1 FROM events e WHERE e.ip=? AND %s LIMIT 1" % SSHOLE_SQL, (ip,)).fetchone() is not None
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -997,6 +1020,9 @@ def notify(con):
     ex = con.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>? AND kind='exploit'", (last,)).fetchone()[0]
     if ex and "exploit" in ev:
         lines.append("Exploit attempts from %d IP(s)" % ex)
+    sshole = con.execute("SELECT COUNT(DISTINCT e.ip) FROM events e WHERE e.ts>? AND %s" % SSHOLE_SQL, (last,)).fetchone()[0]
+    if sshole and "exploit" in ev:
+        lines.append("SSHole probes from %d IP(s)" % sshole)
     set_meta(con, "ntfy_last", now)
     if not lines:
         return
@@ -1176,7 +1202,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "server": "t-blue", "camera": "t-teal"}
+             "sshole-probe": "t-red", "server": "t-blue", "camera": "t-teal"}
 
 
 def tag_html(tags):
@@ -1649,7 +1675,7 @@ def v_ips(qs):
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["shell", "dropper", "proxy", "exploit", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["shell", "dropper", "proxy", "exploit", "sshole-probe", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
                ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else ""))
     pager = ""
     if total > 100:
@@ -1778,6 +1804,8 @@ def v_ip(ip):
             k = x["kind"]
             if k == "cmd":
                 lines.append('<div class="ln"><span class=t>%s</span><span class="pr">$</span><code>%s</code></div>' % (rel_t, esc(clean(x["a"]))))
+            elif k in ("login_ok", "login_fail") and sshole_password(s["proto"], x["b"]):
+                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">sshole</span><code>%s / %s (%d bytes, %s)</code></div>' % (rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100)), len(x["b"].encode("utf-8", "surrogatepass")), "accepted" if k == "login_ok" else "refused"))
             elif k in ("login_ok", "login_fail"):
                 lines.append('<div class="ln %s"><span class=t>%s</span><span class="pr">login</span><code>%s / %s</code></div>' % ("ok" if k == "login_ok" else "fail", rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100))))
             elif k == "file":
