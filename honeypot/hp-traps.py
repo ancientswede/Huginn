@@ -34,7 +34,8 @@ def log(peer, service, event, **kw):
     except OSError:
         pass
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # ASCII only: an attacker's U+2028 and the like must never reach the log as a raw character.
+        fh.write(json.dumps(rec) + "\n")
 
 
 def cleanup():

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.16.0"
+HUGINN_VERSION = "0.16.1"
 CHANGELOG = [
+    ("0.16.1", "2026-11-06", "Security fixes: text sent to a decoy service could add fake lines to the honeypot export and break pages. The export is now split on real line ends only, impossible times and durations are refused, and pages tolerate bad values. The web server has a time limit and a cap on connections, the login limit holds under parallel requests, and an unread request body closes the connection. Update the honeypot too (hp-traps)."),
     ("0.16.0", "2026-11-06", "SSHole detection (CVE-2026-123158): an SSH login with a password of 257-1024 bytes tags the attacker sshole-probe (+10 score), stands out in the session log and counts as an exploit attempt in ntfy. Attackers already in the database are tagged at the first start."),
     ("0.15.0", "2026-11-05", "Overview: a banner with the raven and what Huginn has seen so far (since when, attackers, countries, login attempts, last sync). It is a card like the others: switch it off in Settings."),
     ("0.14.3", "2026-11-05", "Security review: data from ipwho.is, Shodan and reverse DNS is validated, the CSV blocklist uses real CSV quoting, a negative Content-Length can no longer hang a request, extra security headers, harder systemd sandbox, hp-export never follows symlinks, hp-logclean runs as the cowrie user. New tests plant HTML/JS in every attacker-controlled field."),
@@ -53,6 +54,7 @@ import hmac
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -290,6 +292,27 @@ def iso_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
+MIN_TS = 946684800.0                 # 2000-01-01: anything older is not a real event
+MAX_DURATION = 366 * 86400.0
+SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def sane_duration(d):
+    try:
+        f = float(d)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return str(d) if math.isfinite(f) and 0 <= f <= MAX_DURATION else None
+
+
+def sane_row(r):
+    # Last check before anything is stored, whatever the parser: a bad value must never reach the pages.
+    ts, session = r[0], r[4]
+    if not isinstance(ts, (int, float)) or not MIN_TS <= ts <= time.time() + 86400:
+        return False
+    return session is None or (isinstance(session, str) and SESSION_RE.fullmatch(session) is not None)
+
+
 def p_cowrie(line):
     if not line.startswith("{"):
         return None
@@ -326,7 +349,7 @@ def p_cowrie(line):
     elif k == "cowrie.session.closed":
         d = ev.get("duration_ms")
         d = d / 1000.0 if isinstance(d, (int, float)) else ev.get("duration")
-        kind, a = "closed", str(d) if d is not None else None
+        kind, a = "closed", sane_duration(d)
     else:
         return None
     return (iso_ts(ev["timestamp"]), ip, "cowrie", kind, ev.get("session"), trunc(a), trunc(b))
@@ -367,8 +390,8 @@ def p_canary(line):
     return (ts, ip, "canary", "canary", None, svc, trunc(b, 600))
 
 
-RE_ENDLESSH = re.compile(r"^(\S+) CLOSE host=(\S+) port=(\d+) fd=\d+ time=([\d.]+)")
-RE_ENDLESSH_OPEN = re.compile(r"^(\S+) ACCEPT host=(\S+) port=(\d+) ")
+RE_ENDLESSH = re.compile(r"^(\S+) CLOSE host=(\S+) port=(\d{1,5}) fd=\d+ time=(\d{1,8}(?:\.\d{1,6})?)(?:\s|$)")
+RE_ENDLESSH_OPEN = re.compile(r"^(\S+) ACCEPT host=(\S+) port=(\d{1,5}) ")
 
 
 def p_endlessh(line):
@@ -414,9 +437,12 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
     files, personas, bait = [], [], {}
-    for line in text.splitlines():
+    seen = set()
+    # Only "\n" ends a line. str.splitlines() also breaks on characters such as U+2028, which an attacker can send.
+    for line in text.split("\n"):
         if line.startswith("##"):
             section = line[2:].strip()
+            seen.add(section)
             continue
         if section == "FILES" and line.startswith("{"):
             try:
@@ -444,11 +470,11 @@ def parse_export(text, skip):
             r = fn(line)
         except Exception:
             r = None
-        if r:
+        if r and sane_row(r):
             rows.append((h,) + r)
     parse_export.files = files
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait),
-                         "has_personas": "##PERSONAS" in text, "has_bait": "##BAIT" in text}
+                         "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen}
     return rows, hashes
 
 
@@ -695,7 +721,7 @@ def fetch_export():
            "-o", "ServerAliveInterval=15", "root@" + HP_HOST]
     rc, raw, err = run_capped(cmd, 240, MAX_EXPORT)
     out = raw.decode("utf-8", "replace")
-    if rc != 0 or "##END" not in out:
+    if rc != 0 or out.rstrip().rsplit("\n", 1)[-1] != "##END":   # the last line, so logged attacker text cannot pass for it
         raise RuntimeError("export failed (rc=%s): %s" % (rc, err.decode("utf-8", "replace")[-300:].strip()))
     return out
 
@@ -759,10 +785,7 @@ def recompute_session(con, sid):
         elif k == "tty":
             tty = a
         elif k == "closed":
-            try:
-                dur = float(a)
-            except (TypeError, ValueError):
-                pass
+            dur = float(a) if sane_duration(a) is not None else dur
     if proto is None and port is None and version:
         proto = "ssh"
     cmdhash = hashlib.sha1("\n".join(cmds).encode("utf-8", "replace")).hexdigest()[:16] if cmds else None
@@ -1121,10 +1144,14 @@ def hash_pw(pw, salt=None):
     return "scrypt$%s$%s" % (base64.b64encode(salt).decode(), base64.b64encode(h).decode())
 
 
+_pw_slots = threading.BoundedSemaphore(2)      # scrypt takes 16 MB and real CPU: never many at once
+
+
 def check_pw(pw, stored):
     try:
         _, s, h = stored.split("$")
-        calc = hash_pw(pw, base64.b64decode(s)).split("$")[2]
+        with _pw_slots:
+            calc = hash_pw(pw, base64.b64decode(s)).split("$")[2]
         return hmac.compare_digest(calc, h)
     except Exception:
         return False
@@ -1134,17 +1161,28 @@ _fails = {}
 _fails_lock = threading.Lock()
 
 
-def too_many_fails(ip):
+def reserve_attempt(ip):
+    # Counts the attempt BEFORE the password check, so parallel requests cannot get past the limit.
     with _fails_lock:
         now = time.time()
+        if len(_fails) > 10000:
+            for k in [k for k, v in _fails.items() if not v or now - v[-1] >= 900]:
+                del _fails[k]
         lst = [t for t in _fails.get(ip, []) if now - t < 900]
+        if len(lst) >= 5:
+            _fails[ip] = lst
+            return False
+        lst.append(now)
         _fails[ip] = lst
-        return len(lst) >= 5
+        return True
 
 
-def note_fail(ip):
+def release_attempt(ip):
+    # The password was right: this attempt does not count.
     with _fails_lock:
-        _fails.setdefault(ip, []).append(time.time())
+        lst = _fails.get(ip)
+        if lst:
+            lst.pop()
 
 
 # ---------------------------------------------------------------- formatting
@@ -1159,16 +1197,21 @@ def clean(s, n=3000):
     return out + ("…" if len(s) > n else "")
 
 
-def fmt_ts(ts):
+def fmt_time(ts, fmt):
     if not ts:
         return "–"
-    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %I:%M %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M")
+    try:
+        return datetime.fromtimestamp(ts, TZ).strftime(fmt)
+    except (OverflowError, OSError, ValueError):
+        return "–"
+
+
+def fmt_ts(ts):
+    return fmt_time(ts, "%Y-%m-%d %I:%M %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M")
 
 
 def fmt_tss(ts):
-    if not ts:
-        return "–"
-    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %I:%M:%S %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M:%S")
+    return fmt_time(ts, "%Y-%m-%d %I:%M:%S %p" if getattr(_local, "h12", False) else "%Y-%m-%d %H:%M:%S")
 
 
 def ago(ts):
@@ -1188,6 +1231,8 @@ def dur(secs):
     if secs is None:
         return "–"
     secs = float(secs)
+    if not math.isfinite(secs):
+        return "–"
     if secs < 60:
         return "%.1fs" % secs
     if secs < 3600:
@@ -2699,6 +2744,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "Huginn"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    timeout = 30                 # seconds per socket operation: a stalled client cannot hold a thread for ever
 
     def log_message(self, fmt, *args):
         pass
@@ -2764,6 +2810,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return {}
         raw = self.rfile.read(n).decode("utf-8", "replace")
+        self._body_read = True
         parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
         if lists is not None:
             lists.update(parsed)
@@ -2781,19 +2828,33 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def finish_body(self):
+        # A body nobody read must not be parsed as the next request on this connection, so hang up instead.
+        lengths = self.headers.get_all("Content-Length") or []
+        if self.headers.get("Transfer-Encoding") or len(lengths) > 1 or (not self._body_read and lengths and lengths[0].strip() != "0"):
+            self.close_connection = True
+
     def do_GET(self):
+        self._body_read = False
         try:
             self.route_get()
         except Exception as e:
             sys.stderr.write("GET %s: %r\n" % (self.path, e))
+            self.close_connection = True
             self.send(500, "Internal error", "text/plain")
+        finally:
+            self.finish_body()
 
     def do_POST(self):
+        self._body_read = False
         try:
             self.route_post()
         except Exception as e:
             sys.stderr.write("POST %s: %r\n" % (self.path, e))
+            self.close_connection = True
             self.send(500, "Internal error", "text/plain")
+        finally:
+            self.finish_body()
 
     def route_get(self):
         _local.h12 = settings().get("clock") == "12"
@@ -2914,14 +2975,14 @@ class Handler(BaseHTTPRequestHandler):
         con = db()
         if path == "/login":
             ip = self.client_ip()
-            if too_many_fails(ip):
-                return self.send(429, v_login("Too many attempts. Wait 15 minutes."))
             f = self.form()
+            if not reserve_attempt(ip):
+                return self.send(429, v_login("Too many attempts. Wait 15 minutes."))
             stored = get_meta(con, "pw")
             if not stored or not check_pw(f.get("password", ""), stored):
-                note_fail(ip)
                 time.sleep(1)
                 return self.send(401, v_login("Wrong password."))
+            release_attempt(ip)
             tok = secrets.token_urlsafe(32)
             with con:
                 con.execute("INSERT INTO logins VALUES(?,?)", (hashlib.sha256(tok.encode()).hexdigest(), time.time() + SESSION_DAYS * 86400))
@@ -2950,13 +3011,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/settings?ok=test")
         if path == "/account/password":
             ip = self.client_ip()
-            if too_many_fails(ip):
-                return self.send(429, v_account(cur, err="Too many attempts. Wait 15 minutes."))
             f = self.form()
+            if not reserve_attempt(ip):
+                return self.send(429, v_account(cur, err="Too many attempts. Wait 15 minutes."))
             if not check_pw(f.get("current", ""), get_meta(con, "pw") or ""):
-                note_fail(ip)
                 time.sleep(1)
                 return self.send(400, v_account(cur, err="Current password is wrong."))
+            release_attempt(ip)
             new = f.get("new", "")
             if len(new) < 10:
                 return self.send(400, v_account(cur, err="New password must be at least 10 characters."))
@@ -3002,13 +3063,42 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(404, "Not found", "text/plain")
 
 
+MAX_CLIENTS = 64
+
+
+class HuginnServer(ThreadingHTTPServer):
+    # One thread per connection, but never more than max_clients: extra connections are closed at once.
+    daemon_threads = True
+    request_queue_size = 64
+    max_clients = MAX_CLIENTS
+
+    def __init__(self, *a, **kw):
+        self._slots = threading.BoundedSemaphore(self.max_clients)
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def serve():
     init_db()
     threading.Thread(target=collector_loop, daemon=True, name="collector").start()
     if ENRICH:
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    srv.daemon_threads = True
+    srv = HuginnServer((BIND, PORT), Handler)
     print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
     srv.serve_forever()
 
