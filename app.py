@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.16.1"
+HUGINN_VERSION = "0.16.2"
 CHANGELOG = [
+    ("0.16.2", "2026-11-06", "More security and reliability fixes from a deep review. Honeypot: root no longer changes or writes files the honeypot users control (update it, this one matters), Cowrie and OpenCanary run in a filesystem sandbox, the real sshd leaves port 22 on new installs. Huginn: addresses with an IPv6 scope are refused and can no longer add lines to a feed. The C2 list only has addresses seen from at least 2 attackers, never from failed downloads (HUGINN_C2_EXCLUDE removes more): treat it as advice. A bad file, port or recording can no longer stop the sync or a thread. update-huginn.sh rolls back when the restart itself fails. Optional HUGINN_ALLOWED_HOSTS."),
     ("0.16.1", "2026-11-06", "Security fixes: text sent to a decoy service could add fake lines to the honeypot export and break pages. The export is now split on real line ends only, impossible times and durations are refused, and pages tolerate bad values. The web server has a time limit and a cap on connections, the login limit holds under parallel requests, and an unread request body closes the connection. Update the honeypot too (hp-traps)."),
     ("0.16.0", "2026-11-06", "SSHole detection (CVE-2026-123158): an SSH login with a password of 257-1024 bytes tags the attacker sshole-probe (+10 score), stands out in the session log and counts as an exploit attempt in ntfy. Attackers already in the database are tagged at the first start."),
     ("0.15.0", "2026-11-05", "Overview: a banner with the raven and what Huginn has seen so far (since when, attackers, countries, login attempts, last sync). It is a card like the others: switch it off in Settings."),
@@ -66,6 +67,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http import cookies
@@ -97,6 +99,9 @@ DEMO = os.environ.get("HUGINN_DEMO", "0") == "1"
 
 def is_public(a):
     return a.is_global or (DEMO and any(a in n for n in DEMO_NETS))
+ALLOWED_HOSTS = {x.strip().lower() for x in os.environ.get("HUGINN_ALLOWED_HOSTS", "").split(",") if x.strip()}  # empty = any Host
+C2_EXCLUDE = {x.strip() for x in os.environ.get("HUGINN_C2_EXCLUDE", "").split(",") if x.strip()}
+C2_MIN_SOURCES = 2      # attackers choose what they download: one attacker alone never puts an address on the C2 list
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
 os.environ["TZ"] = os.environ.get("HUGINN_TZ", "UTC")  # SQLite "localtime" (per-day grouping) follows the process TZ
@@ -148,10 +153,10 @@ PERSONA = dict(PERSONA_ENV)
 
 # Bait: fake credentials that only exist in the honeypot's bait files. From bait.json next to app.py (optional) plus
 # the values the honeypot announces in its export (##BAIT). Treated as untrusted data: only strings, sane lengths.
-def bait_values(d):
+def bait_values(d, limit=100):
     if not isinstance(d, dict):
         return []
-    return sorted({v for v in list(d.values())[:100] if isinstance(v, str) and 8 <= len(v) <= 200})
+    return sorted({v for v in list(d.values())[:limit] if isinstance(v, str) and 8 <= len(v) <= 200})
 
 
 try:
@@ -271,6 +276,8 @@ def norm_ip(s):
         a = ipaddress.ip_address(s)
     except ValueError:
         return None
+    if a.version == 6 and a.scope_id:   # "addr%anything" may hold line breaks, which would end up in firewall feeds
+        return None
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
     if not is_public(a) and not (ALLOW_PRIVATE and a.is_private and not a.is_loopback):  # private addresses are dropped unless testing
@@ -292,6 +299,7 @@ def iso_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
+MAX_LINE = 65536                     # no real log line is this long, hp-export already drops most of them
 MIN_TS = 946684800.0                 # 2000-01-01: anything older is not a real event
 MAX_DURATION = 366 * 86400.0
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -444,6 +452,8 @@ def parse_export(text, skip):
             section = line[2:].strip()
             seen.add(section)
             continue
+        if len(line) > MAX_LINE:
+            continue
         if section == "FILES" and line.startswith("{"):
             try:
                 files.append(json.loads(line))
@@ -474,7 +484,8 @@ def parse_export(text, skip):
             rows.append((h,) + r)
     parse_export.files = files
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait),
-                         "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen}
+                         "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
+                         "warnings": sorted(x[5:] for x in seen if x.startswith("WARN "))[:10]}
     return rows, hashes
 
 
@@ -507,7 +518,7 @@ def load_honeypot_meta(con):
     PERSONA.clear()
     PERSONA.update(PERSONA_ENV or announced)
     try:
-        hp_bait = bait_values({str(i): v for i, v in enumerate(json.loads(get_meta(con, "hp_bait", "[]")))})
+        hp_bait = bait_values({str(i): v for i, v in enumerate(json.loads(get_meta(con, "hp_bait", "[]")))}, 2000)
     except (ValueError, TypeError):
         hp_bait = []
     BAIT[:] = sorted(set(BAIT_LOCAL) | set(hp_bait))
@@ -526,7 +537,9 @@ def store_files(con, files):
                 iocs = f.get("iocs") if isinstance(f.get("iocs"), list) else []
                 iocs = [str(x)[:300] for x in iocs][:60]
                 size, mtime = int(f.get("size") or 0), float(f.get("mtime") or 0)
-            except (TypeError, ValueError):
+                if not 0 <= size < 2 ** 53 or not math.isfinite(mtime) or not 0 <= mtime < 2 ** 40:
+                    continue
+            except (TypeError, ValueError, OverflowError):
                 continue
             con.execute("INSERT INTO files(sha, src, size, type, arch, packed, iocs, mtime, updated, family) VALUES(?,?,?,?,?,?,?,?,?,?) "
                         "ON CONFLICT(sha) DO UPDATE SET src=excluded.src, size=excluded.size, type=excluded.type, arch=excluded.arch, "
@@ -610,17 +623,27 @@ def tty_path(sha):
 def tty_cached(sha):
     for p, opener in ((tty_path(sha), gzip.open), (os.path.join(TTY_DIR, sha), open)):
         if os.path.exists(p):
-            with opener(p, "rb") as fh:
-                return fh.read()
+            try:
+                with opener(p, "rb") as fh:
+                    return fh.read()
+            except (OSError, EOFError, zlib.error):      # damaged copy: fetch it again
+                return None
     return None
 
 
 def tty_store(sha, data):
     # Recordings are kept here for good (gzip, they shrink a lot), so the honeypot may delete its old ones.
-    tmp = tty_path(sha) + ".tmp"
-    with gzip.open(tmp, "wb", compresslevel=6) as fh:
-        fh.write(data)
-    os.replace(tmp, tty_path(sha))
+    tmp = "%s.%d.%d.tmp" % (tty_path(sha), os.getpid(), threading.get_ident())      # one per writer: two may store the same one
+    try:
+        with gzip.open(tmp, "wb", compresslevel=6) as fh:
+            fh.write(data)
+        os.replace(tmp, tty_path(sha))
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def hp_ssh(command):
@@ -700,6 +723,8 @@ def tty_frames(data):
     while i + hs <= len(data):
         op, _tty, ln, d, sec, usec = _st.unpack("<iLiiLL", data[i:i + hs])
         i += hs
+        if op == 3 and (ln < 0 or i + ln > len(data)):
+            break                # a broken record: a negative length would loop for ever
         chunk = data[i:i + ln] if op == 3 else b""
         i += ln if op == 3 else 0
         t = sec + usec / 1e6
@@ -731,6 +756,19 @@ def run_capped(cmd, timeout, limit):
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     timer = threading.Timer(timeout, p.kill)
     timer.start()
+    errbuf = bytearray()
+
+    def drain_stderr():
+        # Read stderr all the time (keep the first 64 KB): a full pipe would block the child until the timeout.
+        while True:
+            b = p.stderr.read(1 << 16)
+            if not b:
+                return
+            if len(errbuf) < 65536:
+                errbuf.extend(b[:65536 - len(errbuf)])
+
+    drainer = threading.Thread(target=drain_stderr, daemon=True)
+    drainer.start()
     try:
         chunks, total = [], 0
         while True:
@@ -743,10 +781,12 @@ def run_capped(cmd, timeout, limit):
                 p.wait()
                 return 1, b"", b"output larger than %d MB, refused" % (limit // 1048576)
             chunks.append(b)
-        err = p.stderr.read(65536)
-        return p.wait(), b"".join(chunks), err
+        rc = p.wait()
+        drainer.join(5)
+        return rc, b"".join(chunks), bytes(errbuf)
     finally:
         timer.cancel()
+        p.stdout.close()
 
 
 # ---------------------------------------------------------------- aggregation
@@ -764,7 +804,8 @@ def recompute_session(con, sid):
         k, a = r["kind"], r["a"]
         if k == "connect":
             proto = a
-            port = int(r["b"]) if (r["b"] or "").isdigit() else None
+            b = r["b"] or ""
+            port = int(b) if b.isascii() and b.isdigit() and len(b) <= 5 else None
         elif k == "login_ok":
             lo += 1
         elif k == "login_fail":
@@ -893,16 +934,18 @@ def store(con, rows):
     if not rows:
         return 0
     before = con.total_changes
-    with con:
-        con.executemany("INSERT OR IGNORE INTO events(h,ts,ip,src,kind,session,a,b) VALUES(?,?,?,?,?,?,?,?)", rows)
-    inserted = con.total_changes - before
     sess = {r[5] for r in rows if r[5]}
     ips = {r[2] for r in rows}
+    # One transaction: events and their totals are saved together. One bad session or IP must not stop the whole sync.
     with con:
-        for sid in sess:
-            recompute_session(con, sid)
-        for ip in ips:
-            recompute_ip(con, ip)
+        con.executemany("INSERT OR IGNORE INTO events(h,ts,ip,src,kind,session,a,b) VALUES(?,?,?,?,?,?,?,?)", rows)
+        inserted = con.total_changes - before
+        for fn, keys in ((recompute_session, sess), (recompute_ip, ips)):
+            for k in keys:
+                try:
+                    fn(con, k)
+                except (ValueError, TypeError, OverflowError, sqlite3.Error) as e:
+                    sys.stderr.write("recompute %s: %r\n" % (k, e))
     return inserted
 
 
@@ -915,9 +958,12 @@ def retention(con):
     cutoff = time.time() - RETENTION_DAYS * 86400
     with con:
         old_ips = [r[0] for r in con.execute("SELECT ip FROM ips WHERE first < ?", (cutoff,))]
+        touched = [r[0] for r in con.execute("SELECT DISTINCT session FROM events WHERE ts < ? AND session IS NOT NULL", (cutoff,))]
         con.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         con.execute("DELETE FROM sessions WHERE end < ?", (cutoff,))
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
+        for sid in touched:              # a session across the limit keeps only its newer events: count again
+            recompute_session(con, sid)
         for ip in old_ips:
             recompute_ip(con, ip)
     con.execute("PRAGMA optimize")
@@ -942,6 +988,7 @@ def collector_loop():
             set_meta(con, "last_ingest_new", n)
             set_meta(con, "last_ingest_secs", round(time.time() - t0, 1))
             set_meta(con, "last_error", "")
+            set_meta(con, "last_export_warn", ", ".join(parse_export.meta["warnings"])[:200])
         except Exception as e:
             set_meta(con, "last_error", "%s %s" % (fmt_ts(time.time()), str(e)[:300]))
         try:
@@ -2184,7 +2231,7 @@ def blocklist_ips(con, min_score, days, research, v6):
     out = []
     for (ip,) in rows:
         a = ipaddress.ip_address(ip)
-        if not is_public(a) or (a.version == 6 and not v6):
+        if not is_public(a) or getattr(a, "scope_id", None) or (a.version == 6 and not v6):
             continue
         out.append(a)
     out.sort(key=lambda a: (a.version, int(a)))
@@ -2193,26 +2240,35 @@ def blocklist_ips(con, min_score, days, research, v6):
 
 def c2_list(con):
     # IP addresses of the attackers' servers: embedded in captured files + hosts in download URLs. Harmless ones removed.
-    out = {}
-    def add(host, why):
+    # Attackers choose both, so an address needs at least C2_MIN_SOURCES different attackers, and a failed download never counts.
+    out, sources = {}, {}
+
+    def host_of(x):
+        try:
+            return urllib.parse.urlsplit(x).hostname if "://" in x else x.rsplit(":", 1)[0] if x.count(":") == 1 else x
+        except ValueError:
+            return None
+
+    def add(host, why, ips):
         host = (host or "").strip().strip("[]")
         try:
             a = ipaddress.ip_address(host)
         except ValueError:
             return
-        if not is_public(a) or str(a) in BENIGN_IOC:
+        if not is_public(a) or getattr(a, "scope_id", None) or str(a) in BENIGN_IOC or str(a) in C2_EXCLUDE:
             return
         out.setdefault(str(a), set()).add(why)
+        sources.setdefault(str(a), set()).update(ips)
+
+    dropped = {}
+    for sha, ip in con.execute("SELECT DISTINCT b, ip FROM events WHERE kind='file' AND b IS NOT NULL"):
+        dropped.setdefault(sha, set()).add(ip)
     for r in con.execute("SELECT sha, iocs FROM files WHERE iocs IS NOT NULL AND iocs!='[]'"):
         for x in json.loads(r["iocs"]):
-            host = urllib.parse.urlsplit(x).hostname if "://" in x else x.rsplit(":", 1)[0] if x.count(":") == 1 else x
-            add(host, "embedded in " + r["sha"][:12])
-    for r in con.execute("SELECT DISTINCT a FROM events WHERE kind IN ('file','file_fail') AND a LIKE '%://%'"):
-        try:
-            add(urllib.parse.urlsplit(r["a"]).hostname, "malware download host")
-        except ValueError:
-            pass
-    return out
+            add(host_of(x), "embedded in " + r["sha"][:12], dropped.get(r["sha"], ()))
+    for url, ip in con.execute("SELECT DISTINCT a, ip FROM events WHERE kind='file' AND a LIKE '%://%'"):
+        add(host_of(url), "malware download host", (ip,))
+    return {k: v for k, v in out.items() if len(sources[k]) >= C2_MIN_SOURCES}
 
 
 def bl_params(qs):
@@ -2314,12 +2370,12 @@ def v_blocklist(h, qs):
             '<div class="grid"><div class="card span2"><h3>Feeds</h3><p class="muted small">Feed URLs contain a secret token and need no login — keep them on the LAN. '
             'Score: 1 connect, +2 login attempts, +2 brute force, +½ per command (max 10), +15 files, +10 proxy, +10 exploit, +3 per other decoy service.</p>%s'
             '<form method=post action="/blocklist/rotate" class="inline"><button class="btn-s danger">Rotate token</button> <span class="muted small">Old feed URLs stop working.</span></form></div>'
-            '<div class="card span2"><h3>C2 and malware hosts <span class=muted>%s IPs</span></h3><p class="muted small">Addresses found inside captured malware and in its download URLs — the servers attackers control. Separate list, no score.</p>'
+            '<div class="card span2"><h3>C2 and malware hosts <span class=muted>%s IPs</span></h3><p class="muted small">Addresses found inside captured malware and in its download URLs, seen from at least %d attackers. Attackers can choose these addresses, so treat this as advice and do not block from it automatically.</p>'
             '<div class="feed"><div class="feed-h"><b>Plain list</b><button class="btn-s" data-copy="%s">Copy URL</button></div><div class="mono url">%s</div></div>'
             '<div class="preview">%s</div></div>'
             '<div class="card span2"><h3>Manual overrides</h3><table><thead><tr><th>IP</th><th>CC</th><th>Rule</th><th>Note</th><th>Updated</th></tr></thead><tbody>%s</tbody></table></div>'
             '<div class="card span2"><h3>Preview%s</h3><div class="preview">%s</div></div></div>'
-            % (num(len(ips)), form, feeds, num(len(c2)), esc("%s/feed/%s/c2" % (base_url(h), token)), esc("%s/feed/••••/c2" % base_url(h)),
+            % (num(len(ips)), form, feeds, num(len(c2)), C2_MIN_SOURCES, esc("%s/feed/%s/c2" % (base_url(h), token)), esc("%s/feed/••••/c2" % base_url(h)),
                " ".join('<span class=mono title="%s">%s</span>' % (esc("; ".join(sorted(w))), esc(i)) for i, w in sorted(c2.items())) or "<span class=muted>None yet</span>",
                frows or "<tr><td colspan=5 class=muted>None — set them on an attacker page.</td></tr>",
                " (first 300)" if len(ips) > 300 else "", preview or "<span class=muted>Empty</span>"))
@@ -2356,7 +2412,7 @@ def v_account(cur, ok="", err=""):
     counts = con.execute("SELECT (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM ips), "
                          "(SELECT COUNT(*) FROM enrich WHERE ok=1), (SELECT MIN(ts) FROM events)").fetchone()
     status = kv([("Version", esc(HUGINN_VERSION)), ("Last sync", "%s <span class=muted>(%s new rows, %ss)</span>" % (esc(ago(li)), esc(get_meta(con, "last_ingest_new", "0")), esc(get_meta(con, "last_ingest_secs", "–")))),
-                 ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
+                 ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Export warning", esc(get_meta(con, "last_export_warn", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
@@ -2825,6 +2881,9 @@ class Handler(BaseHTTPRequestHandler):
             return "/"
         return target
 
+    def host_ok(self):
+        return not ALLOWED_HOSTS or (self.headers.get("Host") or "").lower() in ALLOWED_HOSTS
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -2866,6 +2925,8 @@ class Handler(BaseHTTPRequestHandler):
             li = float(get_meta(con, "last_ingest", "0") or 0)
             ok = (time.time() - li) < POLL * 3
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None}), "application/json")
+        if not self.host_ok():
+            return self.send(421, "Unknown host", "text/plain")
         if path == "/static/app.css":
             return self.send(200, CSS, "text/css; charset=utf-8", cache=True)
         if path == "/static/world-map.json":
@@ -2970,6 +3031,8 @@ class Handler(BaseHTTPRequestHandler):
     def route_post(self):
         _local.h12 = settings().get("clock") == "12"
         path = urllib.parse.urlsplit(self.path).path
+        if not self.host_ok():
+            return self.send(421, "Unknown host", "text/plain")
         if not self.same_origin():
             return self.send(403, "Forbidden", "text/plain")
         con = db()
@@ -3063,34 +3126,50 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(404, "Not found", "text/plain")
 
 
-MAX_CLIENTS = 64
-
-
 class HuginnServer(ThreadingHTTPServer):
-    # One thread per connection, but never more than max_clients: extra connections are closed at once.
+    # One thread per connection, with limits: extra connections are closed at once, and one address cannot take every slot.
     daemon_threads = True
     request_queue_size = 64
-    max_clients = MAX_CLIENTS
+    max_clients = 64
+    max_per_ip = 24
 
     def __init__(self, *a, **kw):
-        self._slots = threading.BoundedSemaphore(self.max_clients)
+        self._lock = threading.Lock()
+        self._per_ip = {}
+        self._total = 0
         super().__init__(*a, **kw)
 
+    def _release(self, ip):
+        with self._lock:
+            self._total -= 1
+            left = self._per_ip.get(ip, 1) - 1
+            if left > 0:
+                self._per_ip[ip] = left
+            else:
+                self._per_ip.pop(ip, None)
+
     def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
+        ip = client_address[0]
+        with self._lock:
+            n = self._per_ip.get(ip, 0)
+            refused = self._total >= self.max_clients or (n >= self.max_per_ip and ip not in TRUSTED_PROXIES)
+            if not refused:
+                self._total += 1
+                self._per_ip[ip] = n + 1
+        if refused:
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
-            self._slots.release()
+            self._release(ip)
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._release(client_address[0])
 
 
 def serve():

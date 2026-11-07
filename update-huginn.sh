@@ -68,7 +68,7 @@ wait_for() {  # wait_for VERSION -> 0 when Huginn answers with that version
 restore() {  # restore BACKUPDIR: put the code from a backup back and restart (data is left alone)
   install -m 644 "$1/app.py" "$DIR/app.py"
   if [ -d "$1/static" ]; then rm -rf "$DIR/static"; cp -a "$1/static" "$DIR/static"; fi
-  [ -f "$1/huginn.service" ] && install -m 644 "$1/huginn.service" "/etc/systemd/system/$SVC.service"
+  if [ -f "$1/huginn.service" ]; then install -m 644 "$1/huginn.service" "/etc/systemd/system/$SVC.service"; fi
   systemctl daemon-reload
   systemctl restart "$SVC"
 }
@@ -106,33 +106,45 @@ cp -p "$DIR/app.py" "$B/app.py"
 [ -d "$DIR/static" ] && cp -a "$DIR/static" "$B/static"
 cp -p "/etc/systemd/system/$SVC.service" "$B/huginn.service" 2>/dev/null || true
 if [ -f "$DIR/data/huginn.db" ]; then
-  python3 - "$DIR/data/huginn.db" "$B/huginn.db" <<'PY'
+  # As the database's owner: root must not open files in a folder the service user controls. The copy is streamed out.
+  OWNER=$(stat -c %U "$DIR/data")
+  T=$(mktemp -d)
+  chown "$OWNER" "$T"
+  runuser -u "$OWNER" -- python3 -I - "$DIR/data/huginn.db" "$T/huginn.db" <<'PY'
 import sqlite3, sys
 src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2])
 src.backup(dst)          # consistent copy while Huginn keeps running
 dst.close(); src.close()
 PY
+  runuser -u "$OWNER" -- cat "$T/huginn.db" > "$B/huginn.db"
   chmod 600 "$B/huginn.db"
+  rm -rf "$T"
 fi
 ok "saved in $B"
 
 say "Installing $NEW"
-install -m 644 "$HERE/app.py" "$DIR/app.py"
-if [ -d "$HERE/static" ]; then install -d -m 755 "$DIR/static"; install -m 644 "$HERE"/static/* "$DIR/static/"; fi
-if ! cmp -s "$HERE/systemd/huginn.service" "/etc/systemd/system/$SVC.service"; then
-  install -m 644 "$HERE/systemd/huginn.service" "/etc/systemd/system/$SVC.service"
-  ok "updated the systemd service"
-fi
-systemctl daemon-reload
-systemctl restart "$SVC"
-if wait_for "$NEW"; then
+install_new() {  # everything that can leave a half-finished update: any failure goes to the rollback below
+  install -m 644 "$HERE/app.py" "$DIR/app.py" || return 1
+  if [ -d "$HERE/static" ]; then
+    install -d -m 755 "$DIR/static" && install -m 644 "$HERE"/static/* "$DIR/static/" || return 1
+  fi
+  if ! cmp -s "$HERE/systemd/huginn.service" "/etc/systemd/system/$SVC.service"; then
+    install -m 644 "$HERE/systemd/huginn.service" "/etc/systemd/system/$SVC.service" || return 1
+    ok "updated the systemd service"
+  fi
+  systemctl daemon-reload || return 1
+  systemctl restart "$SVC" || return 1
+}
+if install_new && wait_for "$NEW"; then
   ok "Huginn $NEW is running"
 else
   warn "Huginn $NEW did not come up — rolling back to $OLD"
-  journalctl -u "$SVC" -n 15 --no-pager -o cat | sed 's/^/      /'
-  restore "$B"
-  wait_for "$OLD" && die "Update failed; $OLD is running again (nothing lost). Please report the log above." \
-                  || die "Update failed and $OLD did not come back either — see: journalctl -u $SVC -n 50"
+  journalctl -u "$SVC" -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/      /' || true
+  restore "$B" || warn "the rollback had errors, see above"
+  if wait_for "$OLD"; then
+    die "Update failed; $OLD is running again (nothing lost). Please report the log above."
+  fi
+  die "Update failed and $OLD did not come back either — see: journalctl -u $SVC -n 50"
 fi
 
 # keep the newest $KEEP backups, and a database copy only in the newest one (the database grows, the code stays tiny)

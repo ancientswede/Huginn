@@ -166,8 +166,7 @@ if ! runuser -u huginn -- ssh-keygen -F "[$HP_HOST]:$HP_PORT" -f "$KNOWN" >/dev/
   echo "$SCAN" | ssh-keygen -lf - | sed 's/^/      /'
   echo "    Compare on the honeypot with:  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
   ask "Trust this key?" yes || die "Stopped."
-  echo "$SCAN" >> "$KNOWN"
-  chown huginn:huginn "$KNOWN"; chmod 644 "$KNOWN"
+  echo "$SCAN" | runuser -u huginn -- tee -a "$KNOWN" >/dev/null     # as huginn: root must not write in its .ssh folder
   ok "saved"
 else
   ok "already known"

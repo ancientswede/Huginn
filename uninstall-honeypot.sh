@@ -127,5 +127,5 @@ say "Done"
 echo "    Delete the port forwards to this machine in your router."
 [ "$PURGE" = 1 ] || echo "    Logs and captured files are still in /home/cowrie, /home/opencanary and /var/log/hp-traps (--purge removes them)."
 if [ "$RESTORE_SSH" != 1 ] && [ -n "$ADMIN_PORT" ]; then
-  echo "    Admin SSH: ports 22 and $ADMIN_PORT both reach the real sshd now. --restore-ssh keeps only 22."
+  echo "    Admin SSH stays on port $ADMIN_PORT. --restore-ssh moves it back to port 22."
 fi

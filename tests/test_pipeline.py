@@ -90,6 +90,8 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(app.render_feed("nope", ips), (None, None))
 
     def test_c2_list(self):
+        self.assertNotIn("192.0.2.99", app.c2_list(self.con))              # one attacker is not enough
+        app.store(self.con, [row("203.0.113.31", "cowrie", "file", "s6", "http://192.0.2.99/bins/x86", "ef" * 32, 2)])
         self.assertIn("192.0.2.99", app.c2_list(self.con))
 
     def test_export_and_csv_injection(self):

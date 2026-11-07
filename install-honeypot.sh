@@ -109,7 +109,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py honeypot/hp-logclean honeypot/setup-housekeeping.sh systemd/hp-traps.service; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/personas.py honeypot/hp-logclean honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh systemd/hp-traps.service; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -204,25 +204,32 @@ fi
 P=/etc/huginn-honeypot
 install -d -m 700 "$P"
 PY_P="python3 $HERE/honeypot/personas.py"
+personas_as() { runuser -u cowrie -- python3 -I - "$@" < "$HERE/honeypot/personas.py"; }
+patch_as() { local u="$1"; shift; runuser -u "$u" -- python3 -I - "$@" < "$HERE/honeypot/patches.py"; }
 CAM=/home/cowrie/cowrie-camera
 TELNET_ON_MAIN=true
 [ "$WITH_CAMERA" = yes ] && TELNET_ON_MAIN=false
 
 persona_instance() {  # persona_instance NAME DIR [cfg options...]: honeyfs, filesystem, txtcmds and cowrie.cfg for one persona
   local name="$1" dir="$2"; shift 2
-  local out="$P/persona-$name"
+  local out="$P/persona-$name" build="$dir/.huginn-build"
   if [ ! -f "$out/persona.json" ]; then $PY_P make "$name" "$out" | sed 's/^/    /'; fi
+  # Everything inside Cowrie's folders happens as the cowrie user. Root must never write there or read a pickle from there:
+  # after an escape from Cowrie those paths can be symlinks, and a pickle runs code when it is loaded.
   runuser -u cowrie -- install -d "$dir/etc" "$dir/var/log/cowrie" "$dir/var/lib/cowrie" "$dir/var/run"
-  rm -rf "$dir/honeyfs" && cp -a "$out/honeyfs" "$dir/honeyfs"
-  rm -rf "$dir/txtcmds" && cp -a "$C/src/cowrie/data/txtcmds" "$dir/txtcmds"
-  $PY_P txtcmds "$out" "$dir/txtcmds"
+  runuser -u cowrie -- rm -rf "$build" "$dir/honeyfs" "$dir/txtcmds"
+  runuser -u cowrie -- install -d -m 700 "$build"
+  tar -C "$out" -cf - persona.json honeyfs | runuser -u cowrie -- tar -C "$build" -xpf -
+  runuser -u cowrie -- cp -a "$C/src/cowrie/data/txtcmds" "$dir/txtcmds"
+  personas_as txtcmds "$build" "$dir/txtcmds"
   if [ -f "$C/src/cowrie/data/fs.pickle" ]; then
-    $PY_P fs "$C/src/cowrie/data/fs.pickle" "$dir/var/lib/cowrie/fs-$name.pickle" "$out/honeyfs" | sed 's/^/    /'
+    personas_as fs "$C/src/cowrie/data/fs.pickle" "$dir/var/lib/cowrie/fs-$name.pickle" "$build/honeyfs" | sed 's/^/    /'
   else
     warn "Cowrie's fs.pickle not found: the bait files exist but 'ls' will not show them"
   fi
-  $PY_P cfg "$out" "$dir" "$@"
-  chown -R cowrie:cowrie "$dir/etc" "$dir/var" "$dir/honeyfs" "$dir/txtcmds"
+  personas_as cfg "$build" "$dir" "$@"
+  runuser -u cowrie -- mv "$build/honeyfs" "$dir/honeyfs"
+  runuser -u cowrie -- rm -rf "$build"
   ok "$name persona: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostname"])' "$out/persona.json")"
 }
 
@@ -233,7 +240,7 @@ if [ -f "$C/etc/cowrie.cfg" ]; then
     WITH_CAMERA=no
   fi
 elif [ "$PERSONA" = none ]; then
-  cat > "$C/etc/cowrie.cfg" <<EOF
+  runuser -u cowrie -- tee "$C/etc/cowrie.cfg" >/dev/null <<EOF
 # Written by Huginn install-honeypot.sh. Full list of settings: src/cowrie/data/etc/cowrie.cfg.dist
 [honeypot]
 hostname = $PERSONA_HOSTNAME
@@ -248,7 +255,6 @@ listen_endpoints = tcp:$COWRIE_SSH:interface=0.0.0.0
 enabled = $TELNET_ON_MAIN
 listen_endpoints = tcp:$COWRIE_TELNET:interface=0.0.0.0
 EOF
-  chown cowrie:cowrie "$C/etc/cowrie.cfg"
   ok "wrote $C/etc/cowrie.cfg (plain Cowrie, no persona)"
 else
   if [ "$TELNET_ON_MAIN" = true ]; then
@@ -286,7 +292,7 @@ PYEOF
 # Cowrie's "free" reads the host's real /proc/meminfo, which gives the honeypot away: read the fake one first.
 FREE="$C/src/cowrie/commands/free.py"
 if [ -f "$FREE" ]; then
-  rc=0; python3 "$HERE/honeypot/patches.py" cowrie-free "$FREE" || rc=$?
+  rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
   case $rc in 0) ok "patched free.py to read the fake /proc/meminfo" ;; 3) ok "free.py already patched" ;; *) warn "free.py not patched (Cowrie changed); harmless" ;; esac
 fi
 cat > /etc/systemd/system/cowrie.service <<EOF
@@ -353,7 +359,7 @@ if [ "$WITH_CANARY" = yes ]; then
   if [ ! -f "$O/.opencanary.conf" ]; then
     DEFAULT=$(find "$O/oc-env" -path "*opencanary/data/settings.json" | head -1)
     [ -n "$DEFAULT" ] || die "OpenCanary default settings.json not found."
-    python3 - "$DEFAULT" "$O/.opencanary.conf" "$CANARY_FTP" "$CANARY_HTTP" "$(hostname)" <<'PY'
+    runuser -u opencanary -- python3 -I - "$DEFAULT" "$O/.opencanary.conf" "$CANARY_FTP" "$CANARY_HTTP" "$(hostname)" <<'PY'
 import json, sys
 src, dst, ftp, http, host = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 c = json.load(open(src))
@@ -371,11 +377,10 @@ c["logger"] = {"class": "PyLogger", "kwargs": {"formatters": {"plain": {"format"
                "handlers": {"file": {"class": "logging.FileHandler", "filename": "/home/opencanary/opencanary.log"}}}}
 json.dump(c, open(dst, "w"), indent=2)
 PY
-    chown opencanary:opencanary "$O/.opencanary.conf"
     ok "wrote $O/.opencanary.conf"
   fi
   # OpenCanary refuses to start if two modules share a port, even when one is disabled: move disabled ones away.
-  python3 "$HERE/honeypot/patches.py" opencanary-ports "$O/.opencanary.conf" || true
+  patch_as opencanary opencanary-ports "$O/.opencanary.conf" || true
   cat > /etc/systemd/system/opencanary.service <<EOF
 [Unit]
 Description=OpenCanary honeypot
@@ -396,15 +401,15 @@ WantedBy=multi-user.target
 EOF
   # Self-signed certificate with a generic NAS name — never your real certificate (it would link your IP to your domain).
   if [ ! -f "$O/https.key" ]; then
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DiskStation" -addext "subjectAltName=DNS:DiskStation" \
+    runuser -u opencanary -- openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DiskStation" -addext "subjectAltName=DNS:DiskStation" \
       -keyout "$O/https.key" -out "$O/https.pem" 2>/dev/null
-    chown opencanary:opencanary "$O/https.key" "$O/https.pem"; chmod 600 "$O/https.key"
+    runuser -u opencanary -- chmod 600 "$O/https.key"
     ok "self-signed certificate CN=DiskStation"
   fi
   # OpenCanary answers unknown paths with 404 and never logs them, so most scanner traffic is invisible: log them.
   HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
   if [ -n "$HTTPPY" ]; then
-    rc=0; python3 "$HERE/honeypot/patches.py" opencanary-http "$HTTPPY" || rc=$?
+    rc=0; patch_as opencanary opencanary-http "$HTTPPY" || rc=$?
     case $rc in 0) ok "OpenCanary logs every probed web path" ;; 3) ok "OpenCanary web logging already patched" ;; *) warn "OpenCanary 404 logging not patched (OpenCanary changed); harmless" ;; esac
   fi
   # Log rotation for OpenCanary: honeypot/setup-housekeeping.sh (runs at the end).
@@ -463,6 +468,20 @@ nft -c -f /etc/nftables.conf || die "nftables check failed — no rules were loa
 nft -f /etc/nftables.conf
 systemctl enable nftables >/dev/null 2>&1
 ok "port 22 -> Cowrie from now on (admin: port $ADMIN_PORT)"
+# The redirect works, so the real sshd has no reason to stay on port 22 (reachable over IPv6, or if nftables ever fails).
+ADMIN_CONF=/etc/ssh/sshd_config.d/10-huginn-admin.conf
+if [ -f "$ADMIN_CONF" ] && grep -qx 'Port 22' "$ADMIN_CONF"; then
+  cp -p "$ADMIN_CONF" "$ADMIN_CONF.bak-huginn"
+  sed -i '/^Port 22$/d' "$ADMIN_CONF"
+  if sshd -t && systemctl restart ssh.service && sleep 2 && ss -ltnH "sport = :$ADMIN_PORT" | grep -q .; then
+    rm -f "$ADMIN_CONF.bak-huginn"
+    ok "the real sshd now listens only on $ADMIN_PORT"
+  else
+    mv "$ADMIN_CONF.bak-huginn" "$ADMIN_CONF"
+    systemctl restart ssh.service || true
+    warn "could not take the real sshd off port 22: it stays on 22 and $ADMIN_PORT"
+  fi
+fi
 
 # ------------------------------------------------------------------ 5. export for Huginn
 say "Export for Huginn"
@@ -498,6 +517,7 @@ echo "Added. This key can only run /usr/local/bin/hp-export (no shell, no forwar
 EOF
 chmod 755 /usr/local/sbin/hp-add-huginn-key
 bash "$HERE/honeypot/setup-housekeeping.sh"
+bash "$HERE/honeypot/setup-sandbox.sh"
 SECTIONS=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || true)
 [ "$SECTIONS" -ge 7 ] && ok "hp-export works ($SECTIONS sections)" || warn "hp-export printed $SECTIONS sections (expected 7)"
 

@@ -21,29 +21,38 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     read -r -a shas <<< "${SSH_ORIGINAL_COMMAND#tty }"
     [ "${#shas[@]}" -ge 1 ] && [ "${#shas[@]}" -le 50 ] || { echo "bad request" >&2; exit 2; }
     for sha in "${shas[@]}"; do [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "bad request" >&2; exit 2; }; done
-    if [ "${#shas[@]}" = 1 ]; then
-      f="$FIRST_COWRIE/var/lib/cowrie/tty/${shas[0]}"
-      [ -f "$f" ] && [ ! -L "$f" ] || { echo "not found" >&2; exit 3; }
-      base64 -w0 "$f"; echo; exit 0
-    fi
-    for sha in "${shas[@]}"; do
-      f="$FIRST_COWRIE/var/lib/cowrie/tty/$sha"
-      if [ -f "$f" ] && [ ! -L "$f" ]; then printf '%s ' "$sha"; base64 -w0 "$f"; echo; else echo "$sha -"; fi
-    done
-    exit 0 ;;
+    # Recordings belong to the Cowrie user, so read them as that user: root must not open what an attacker can swap.
+    exec timeout 300 setpriv --reuid="${FILEINFO_USER:-cowrie}" --regid="${FILEINFO_USER:-cowrie}" --clear-groups --no-new-privs bash -c '
+      dir="$1"; shift
+      if [ "$#" = 1 ]; then
+        f="$dir/$1"
+        [ -f "$f" ] && [ ! -L "$f" ] || { echo "not found" >&2; exit 3; }
+        base64 -w0 "$f"; echo; exit 0
+      fi
+      for sha in "$@"; do
+        f="$dir/$sha"
+        if [ -f "$f" ] && [ ! -L "$f" ]; then printf "%s " "$sha"; base64 -w0 "$f"; echo; else echo "$sha -"; fi
+      done
+    ' tty "$FIRST_COWRIE/var/lib/cowrie/tty" "${shas[@]}" ;;
   *) ;;  # any other command gets the normal export
 esac
 # Print the files matching a pattern, oldest first, skipping old compressed ones (Huginn has had those for days).
 # Never follows a symlink: this runs as root, and an attacker who got out of Cowrie (as the cowrie user) could replace a
 # log with a link to /etc/shadow. Files are opened with O_NOFOLLOW and must be regular files. No match -> no output.
-# shellcheck disable=SC2010  # $1 is a glob of our own log files; their names never contain spaces
 catfiles() {
-  local list
-  list=$(ls -tr $1 2>/dev/null | grep -v '\.gz$')
-  [ -n "$list" ] || return 0
-  printf '%s\n' "$list" | python3 -I -c '
-import os, stat, sys
-for p in sys.stdin.read().splitlines():
+  python3 -I -c '
+import glob, os, stat, sys
+names = []
+for p in glob.glob(sys.argv[1]):
+    if p.endswith(".gz"):
+        continue
+    try:
+        st = os.lstat(p)
+    except OSError:
+        continue
+    if stat.S_ISREG(st.st_mode):
+        names.append((st.st_mtime, p))
+for _mtime, p in sorted(names):
     try:
         fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -56,19 +65,23 @@ for p in sys.stdin.read().splitlines():
             if not b:
                 break
             sys.stdout.buffer.write(b)
-'
+' "$1"
   return 0
 }
+# Attackers choose how long a logged line is: drop the absurd ones and cap each log, so they cannot make the export refused.
+keep() { LC_ALL=C awk 'length($0) <= 16384' | tail -c 50331648; }
+WARNS=()
 echo "##COWRIE"
-for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000; done
+for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000 | keep; done
 echo "##CANARY"
-catfiles "$OPENCANARY_LOG*" | tail -n 10000
+catfiles "$OPENCANARY_LOG*" | tail -n 10000 | keep
 echo "##ENDLESSH"
 journalctl -u "$ENDLESSH_UNIT" --no-pager -o cat --since "30 days ago" 2>/dev/null | grep -E " (ACCEPT|CLOSE) host=" | tail -n 20000
+[ "${PIPESTATUS[0]}" = 0 ] || WARNS+=("journal")
 echo "##NFT"
 nft list ruleset 2>/dev/null | grep -o "dport [0-9]* counter packets [0-9]*"
 echo "##TRAPS"
-catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000
+catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000 | keep
 # Personas and bait, so Huginn needs no extra settings. The bait is fake and already sits in the fake file systems.
 if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
 if [ -r "$BAIT_FILE" ]; then echo "##BAIT"; head -c 20000 "$BAIT_FILE" | tr -d '\n'; echo; fi
@@ -76,7 +89,7 @@ echo "##FILES"
 # The captured files are attacker data: analyse them as the Cowrie user (who already owns them), never as root.
 FILEINFO_USER="${FILEINFO_USER:-cowrie}"
 install -d -m 700 -o "$FILEINFO_USER" -g "$FILEINFO_USER" /var/lib/hp-export 2>/dev/null
-chown "$FILEINFO_USER:$FILEINFO_USER" /var/lib/hp-export/fileinfo.json 2>/dev/null
 timeout 120 setpriv --reuid="$FILEINFO_USER" --regid="$FILEINFO_USER" --clear-groups --no-new-privs \
-  env HP_DOWNLOAD_DIRS="$HP_DOWNLOAD_DIRS" python3 -I /usr/local/bin/hp-fileinfo 2>/dev/null
+  env HP_DOWNLOAD_DIRS="$HP_DOWNLOAD_DIRS" python3 -I /usr/local/bin/hp-fileinfo 2>/dev/null || WARNS+=("fileinfo")
+for w in "${WARNS[@]}"; do echo "##WARN $w"; done
 echo "##END"

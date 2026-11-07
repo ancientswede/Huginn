@@ -383,7 +383,7 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 | `ipset` | `curl -fsS URL \| ipset restore -exist`, then `iptables -I INPUT -m set --match-set huginn4 src -j DROP` |
 | `mikrotik` | `/tool fetch url=URL dst-path=huginn.rsc; /import huginn.rsc` |
 | `csv` | IP with score, last seen, country and tags (CrowdSec `cscli decisions import -i`) |
-| `c2` | Malware download hosts and addresses embedded in captured malware |
+| `c2` | Malware download hosts and addresses embedded in captured malware, seen from at least 2 attackers. Attackers can choose these addresses, so use it as advice, not as an automatic block |
 
 **Score:**
 - connection: 1
@@ -437,6 +437,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
 | `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
 | `HUGINN_MALWAREBAZAAR_KEY` | – | Look captured files up on MalwareBazaar by SHA-256 (only the hash is sent). Free key at [auth.abuse.ch](https://auth.abuse.ch) |
+| `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
+| `HUGINN_ALLOWED_HOSTS` | (empty) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |

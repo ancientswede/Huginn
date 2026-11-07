@@ -27,7 +27,7 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/setup-housekeeping.sh; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -35,10 +35,10 @@ COWRIE_DIRS="/home/cowrie/cowrie"
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
 C="${COWRIE_DIRS%% *}"
 O=/home/opencanary
-PATCH="python3 $HERE/honeypot/patches.py"
+patch_as() { local u="$1"; shift; runuser -u "$u" -- python3 -I - "$@" < "$HERE/honeypot/patches.py"; }   # as the file's owner, never root
 
 restart_ok() {  # restart_ok UNIT
-  systemctl restart "$1"; sleep 4
+  systemctl restart "$1" || true; sleep 4
   systemctl is-active --quiet "$1" && ok "$1 is running" || { journalctl -u "$1" -n 15 --no-pager -o cat | sed 's/^/      /'; warn "$1 did not start (log above)"; FAILED=1; }
 }
 FAILED=0
@@ -63,6 +63,9 @@ fi
 say "Disk housekeeping"
 bash "$HERE/honeypot/setup-housekeeping.sh"
 
+say "Filesystem sandbox for Cowrie and OpenCanary"
+bash "$HERE/honeypot/setup-sandbox.sh"
+
 if [ "$UP_COWRIE" = 1 ]; then
   say "Cowrie"
   [ -d "$C/.git" ] || die "$C is not a git checkout of Cowrie."
@@ -74,7 +77,7 @@ if [ "$UP_COWRIE" = 1 ]; then
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
   runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ."
   ok "Cowrie $BEFORE -> $AFTER"
-  rc=0; $PATCH cowrie-free "$FREE" || rc=$?
+  rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
   case $rc in 0|3) ok "free.py patch in place" ;; *) warn "free.py patch no longer fits the new Cowrie (harmless: free shows the host's memory)" ;; esac
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
@@ -87,9 +90,9 @@ if [ "$UP_CANARY" = 1 ]; then
   AFTER=$(runuser -u opencanary -- "$O/oc-env/bin/pip" show opencanary 2>/dev/null | sed -n 's/^Version: //p')
   ok "OpenCanary $BEFORE -> $AFTER"
   HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
-  rc=0; [ -n "$HTTPPY" ] && $PATCH opencanary-http "$HTTPPY" || rc=$?
+  rc=0; [ -n "$HTTPPY" ] && patch_as opencanary opencanary-http "$HTTPPY" || rc=$?
   case $rc in 0|3) ok "web logging patch in place" ;; *) warn "web logging patch no longer fits the new OpenCanary (only start-page visits are logged)" ;; esac
-  $PATCH opencanary-ports "$O/.opencanary.conf" || true
+  patch_as opencanary opencanary-ports "$O/.opencanary.conf" || true
   restart_ok opencanary
 fi
 
