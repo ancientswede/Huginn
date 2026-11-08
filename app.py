@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.19.0"
+HUGINN_VERSION = "0.19.1"
 CHANGELOG = [
+    ("0.19.1", "2026-11-08", "Overview: the banner is back to its full size on computers. It stays low on phones."),
     ("0.19.0", "2026-11-08", "Campaigns: scripts that differ only in addresses, numbers or random markers are now one campaign (old links to a script campaign stop working). Attacker page: a one-line summary, sessions first with the facts in a side column on wide screens, related attackers as a count and the five latest. Sync gaps: the day charts and the Account page show when Huginn did not collect."),
     ("0.18.0", "2026-11-08", "New page: everything Huginn has never seen before since you last reviewed (files, scripts, commands, password patterns, SSH clients), with Mark all reviewed and Undo. Overview: a low banner so more fits on the first screen, today's unfinished bar is striped, rare events stand out, a change against the prior 7 days. Files: steady columns and two IOCs with the rest behind Show more. Attacker page: what the score is made of. Phone: three key numbers first, sync status back, larger touch targets. Replay: short sessions no longer leave an empty terminal."),
     ("0.17.0", "2026-11-07", "Automatic database backups: once a day Huginn saves a checked, compressed copy of its database in data/backups and keeps the last 3 (HUGINN_DB_BACKUPS, HUGINN_DB_BACKUP_HOURS). A damaged database never pushes out the good copies, you get a warning on the Account page and through ntfy. Bring one back with: app.py restore-db."),
@@ -3000,11 +3001,12 @@ def v_login(err=""):
 
 CSS = r"""
 .hero{position:relative;border-radius:12px;overflow:hidden;margin-bottom:14px;background:#06080d;border:1px solid var(--line)}
-.hero img{display:block;width:100%;height:96px;object-fit:cover;object-position:20% 30%}
-.hero-txt{position:absolute;inset:0;display:flex;align-items:center;gap:22px;padding:0 32px 0 34%;color:#e8ecf2}
-.hero-name{font-size:30px;font-weight:800;letter-spacing:.5px;line-height:1.05}
-.hero-tag{display:none}.hero-facts{font-size:13px;color:#7aa2f7}
-@media (max-width:800px){.hero img{height:64px;object-position:15% 30%}.hero-txt{padding:0 14px 0 34%}.hero-name{font-size:22px}.hero-facts{display:none}}
+.hero img{display:block;width:100%;height:190px;object-fit:cover;object-position:20% 35%}
+@media (min-width:1600px){.hero img{height:230px}.hero-name{font-size:48px}}
+.hero-txt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 32px 0 46%;color:#e8ecf2}
+.hero-name{font-size:42px;font-weight:800;letter-spacing:.5px;line-height:1.05}
+.hero-tag{font-size:17px;color:#c8cfd9;margin-top:6px}.hero-facts{font-size:13px;color:#7aa2f7;margin-top:12px}
+@media (max-width:800px){.hero img{height:64px;object-position:15% 30%}.hero-txt{flex-direction:row;align-items:center;justify-content:flex-start;padding:0 14px 0 34%}.hero-name{font-size:22px}.hero-tag,.hero-facts{display:none}}
 .heat{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
 .hm-row{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;align-items:center}
 .hm-row i{display:block;aspect-ratio:1;border-radius:3px;background:var(--panel2);min-height:10px}.hm-head span{text-align:left}
