@@ -103,19 +103,21 @@ Replies to connections that were made *to* the honeypot still work, because the 
 - **Overview:** attackers per day, top attackers, latest shell sessions, top passwords, countries as a world map or a list (click a country to see its attackers), how many took the bait, and **time wasted** (hours attackers spent stuck in the tarpit and in the fake shells, and who is stuck right now).
 - **New:** everything Huginn has never seen before since you last looked: files, scripts, commands, password patterns and SSH clients. Commands and scripts that differ only in addresses, numbers or random markers count as one. Click **Mark all reviewed** when you are done (Undo is one click away).
 - **A page per attacker IP:**
+  - a one-line summary of what they did, with their sessions first
   - country, network, reverse DNS, open ports and known CVEs (from Shodan InternetDB)
   - every password they tried
   - every session as a terminal log, plus a **replay** that plays the session back exactly as they saw it
   - files they dropped, decoy services they touched and time spent in the tarpit
   - **related attackers** (same SSH client fingerprint, same command script, same file, same /24)
   - an "always block" / "never block" switch
-- **Campaigns:** IPs grouped by identical command scripts and SSH client fingerprints (HASSH), so one botnet shows up as one group.
+- **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH), so one botnet shows up as one group.
 - **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up on [MalwareBazaar](https://bazaar.abuse.ch) by its hash.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
   - **Is my password in here?** Check whether attackers have tried one of your own passwords. The check runs in your browser: only the first 4 characters of the password's SHA-256 hash go to Huginn (the same idea as Have I Been Pwned), so the password itself never leaves your machine.
   - Search every username and password, and export them as word lists (for your own password policy or audits) or as a CSV of every attempt.
 - **Personas and bait detection:** the installer makes the honeypot look like a real server, file server or IP camera, with fake credentials planted where attackers look. Huginn tags anyone who reads them (`read-bait`) or later tries one of them anywhere (`took-bait`).
 - **SSHole detection:** an SSH login with a password of 257-1024 bytes, the shape of a [CVE-2026-123158](https://www.cve.org/CVERecord?id=CVE-2026-123158) attempt, tags the attacker `sshole-probe`. It shows what was tried, not that it would have worked: Cowrie is a fake server, and the bug only affects musl systems such as Alpine.
+- **Sync gaps:** the day charts and the Account page show when Huginn did not collect, so a dip in a chart is not mistaken for a quiet day.
 - **Blocklists** as plain text, nftables, ipset, MikroTik or CSV, filtered by score and age. There is also a separate **C2 list**: the servers attackers download from and the addresses found inside their malware.
 - **New this week** and **When they attack:** what was new in the last seven days (attackers, countries, campaigns, malware, bait), and a heat map of attacker IPs per hour of the week.
 - **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt, SSHole probe), plus a weekly summary on Sunday evening.

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.18.0"
+HUGINN_VERSION = "0.19.0"
 CHANGELOG = [
+    ("0.19.0", "2026-11-08", "Campaigns: scripts that differ only in addresses, numbers or random markers are now one campaign (old links to a script campaign stop working). Attacker page: a one-line summary, sessions first with the facts in a side column on wide screens, related attackers as a count and the five latest. Sync gaps: the day charts and the Account page show when Huginn did not collect."),
     ("0.18.0", "2026-11-08", "New page: everything Huginn has never seen before since you last reviewed (files, scripts, commands, password patterns, SSH clients), with Mark all reviewed and Undo. Overview: a low banner so more fits on the first screen, today's unfinished bar is striped, rare events stand out, a change against the prior 7 days. Files: steady columns and two IOCs with the rest behind Show more. Attacker page: what the score is made of. Phone: three key numbers first, sync status back, larger touch targets. Replay: short sessions no longer leave an empty terminal."),
     ("0.17.0", "2026-11-07", "Automatic database backups: once a day Huginn saves a checked, compressed copy of its database in data/backups and keeps the last 3 (HUGINN_DB_BACKUPS, HUGINN_DB_BACKUP_HOURS). A damaged database never pushes out the good copies, you get a warning on the Account page and through ntfy. Bring one back with: app.py restore-db."),
     ("0.16.2", "2026-11-06", "More security and reliability fixes from a deep review. Honeypot: root no longer changes or writes files the honeypot users control (update it, this one matters), Cowrie and OpenCanary run in a filesystem sandbox, the real sshd leaves port 22 on new installs. Huginn: addresses with an IPv6 scope are refused and can no longer add lines to a feed. The C2 list only has addresses seen from at least 2 attackers, never from failed downloads (HUGINN_C2_EXCLUDE removes more): treat it as advice. A bad file, port or recording can no longer stop the sync or a thread. update-huginn.sh rolls back when the restart itself fails. Optional HUGINN_ALLOWED_HOSTS."),
@@ -73,7 +74,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -215,6 +216,7 @@ CREATE TABLE IF NOT EXISTS files(sha TEXT PRIMARY KEY, src TEXT, size INTEGER, t
 CREATE TABLE IF NOT EXISTS seen(kind TEXT, key TEXT, observed REAL, ip TEXT, session TEXT, ex TEXT, n INTEGER DEFAULT 1,
   PRIMARY KEY(kind, key));
 CREATE INDEX IF NOT EXISTS seen_obs ON seen(observed);
+CREATE TABLE IF NOT EXISTS gaps(start REAL PRIMARY KEY, end REAL);
 """
 
 
@@ -254,6 +256,12 @@ def init_db():
             for (ip,) in con.execute("SELECT DISTINCT e.ip FROM events e WHERE %s" % SSHOLE_SQL).fetchall():
                 recompute_ip(con, ip)
         set_meta(con, "sshole_backfilled", "1")
+    # One time only, all or nothing: script campaigns are grouped by the shape of their commands since 0.19.
+    if not get_meta(con, "cmdhash_shapes"):
+        with con:
+            for (sid,) in con.execute("SELECT session FROM sessions WHERE cmdhash IS NOT NULL").fetchall():
+                con.execute("UPDATE sessions SET cmdhash=? WHERE session=?", (script_hash(session_commands(con, sid)), sid))
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('cmdhash_shapes','1')")
     con.close()
 
 
@@ -805,7 +813,7 @@ def run_capped(cmd, timeout, limit):
 # ---------------------------------------------------------------- aggregation
 
 def recompute_session(con, sid):
-    rows = con.execute("SELECT ts,ip,kind,a,b FROM events WHERE session=? ORDER BY ts", (sid,)).fetchall()
+    rows = con.execute("SELECT ts,ip,kind,a,b FROM events WHERE session=? ORDER BY ts,rowid", (sid,)).fetchall()
     if not rows:
         con.execute("DELETE FROM sessions WHERE session=?", (sid,))
         return
@@ -842,7 +850,7 @@ def recompute_session(con, sid):
             dur = float(a) if sane_duration(a) is not None else dur
     if proto is None and port is None and version:
         proto = "ssh"
-    cmdhash = hashlib.sha1("\n".join(cmds).encode("utf-8", "replace")).hexdigest()[:16] if cmds else None
+    cmdhash = script_hash(cmds)
     con.execute("INSERT OR REPLACE INTO sessions(session,ip,start,end,proto,port,version,hassh,duration,logins_ok,"
                 "logins_fail,cmds,files,tcpip,exploits,cmdhash,tty) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, ip, start, end, proto, port, version, hassh, dur, lo, lf, c, f, t, x, cmdhash, tty))
@@ -1015,6 +1023,17 @@ def pw_shape(p):
     return "".join(out)
 
 
+def script_hash(cmds):
+    # The same list of commands, in shapes: one script, one campaign. None when there is nothing to compare.
+    if not any(cmds):
+        return None
+    return hashlib.sha1("\n".join(cmd_shape(c) for c in cmds).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def session_commands(con, sid):
+    return [x[0] or "" for x in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts,rowid", (sid,))]
+
+
 def note_seen(con, after):
     # Remembers when Huginn first saw each thing. Time of arrival, not of the log line, so late or imported lines are
     # never missed, and the list survives retention. `after` is the highest rowid before this store: SQLite can reuse
@@ -1026,10 +1045,8 @@ def note_seen(con, after):
     for rid, ts, ip, sess, kind, a, b in con.execute("SELECT rowid,ts,ip,session,kind,a,b FROM events WHERE rowid>? AND "
                                                      "kind IN ('cmd','file','login_ok','login_fail','closed') ORDER BY rowid", (after,)):
         if kind == "closed":                # a finished session: its whole command list, in shapes, is one script
-            cmds = [x[0] or "" for x in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sess,))]
-            if not any(cmds):
-                continue
-            k, key, ex = "script", hashlib.sha1("\n".join(cmd_shape(c) for c in cmds).encode("utf-8", "replace")).hexdigest()[:16], cmds[0]
+            cmds = session_commands(con, sess)
+            k, key, ex = "script", script_hash(cmds), next((c for c in cmds if c), "")
         else:
             k, key, ex = ("cmd", cmd_shape(a), a) if kind == "cmd" else ("file", b, a) if kind == "file" else ("pw", pw_shape(b), b)
         if not key:
@@ -1094,6 +1111,49 @@ def undo_review(con):
 
 # ---------------------------------------------------------------- background threads
 
+GAP_MIN = max(600, POLL * 5)
+
+
+def note_sync(con, t0):
+    # A long time since the last good sync is a gap, whatever the reason (honeypot away, Huginn stopped). Measured from
+    # the end of the last good sync to the start of this one, so a slow export is no gap. No earlier sync known: no gap.
+    prev = get_meta(con, "last_success")
+    with con:
+        if prev and t0 - float(prev) >= GAP_MIN:
+            con.execute("INSERT OR IGNORE INTO gaps(start,end) VALUES(?,?)", (float(prev), t0))
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_success',?)", (repr(time.time()),))
+
+
+def gap_spans(con, since):
+    # One statement, one snapshot: a sync finishing in between must not make a gap vanish or count twice.
+    rows = con.execute("SELECT start,end FROM gaps WHERE end>? UNION ALL SELECT CAST(v AS REAL),NULL FROM meta WHERE k='last_success' ORDER BY 1", (since,)).fetchall()
+    spans, now = [(r[0], r[1]) for r in rows if r[1] is not None], time.time()
+    last = next((r[0] for r in rows if r[1] is None), 0)
+    if last and now - last >= GAP_MIN:             # still going on
+        spans.append((last, now))
+    return spans
+
+
+def gap_days(con, labels):
+    # Seconds without a sync on each local day. Days are cut at local midnight: not every day has 24 hours.
+    if not labels:
+        return {}
+    start = lambda lab: datetime.strptime(lab, "%Y-%m-%d").replace(tzinfo=TZ)
+    spans = gap_spans(con, start(labels[0]).timestamp())
+    out = {}
+    for lab in labels:
+        a = start(lab).timestamp()
+        b = (start(lab).replace(tzinfo=None) + timedelta(days=1)).replace(tzinfo=TZ).timestamp()
+        secs = sum(max(0, min(e, b) - max(s, a)) for s, e in spans)
+        if secs >= 60:
+            out[lab] = secs
+    return out
+
+
+def gap_note(gaps):
+    return '<div class="gap-note"><i></i>No sync for part of the day</div>' if gaps else ""
+
+
 def collector_loop():
     con = connect()
     skip = set()
@@ -1106,6 +1166,7 @@ def collector_loop():
             apply_honeypot_meta(con, parse_export.meta)
             n = store(con, rows)
             store_files(con, parse_export.files)
+            note_sync(con, t0)
             skip = hashes  # only set once everything is stored
             set_meta(con, "last_ingest", t0)
             set_meta(con, "last_ingest_new", n)
@@ -1584,7 +1645,7 @@ def short_num(v):
     return str(v)
 
 
-def bars(values, labels, h=90, cls="bar", partial_last=False):
+def bars(values, labels, h=90, cls="bar", partial_last=False, gaps=None):
     # Bars in plain HTML/CSS (not a stretched SVG), so the number above each bar stays sharp at any width.
     if not values:
         return ""
@@ -1595,8 +1656,10 @@ def bars(values, labels, h=90, cls="bar", partial_last=False):
         pct = (v / mx * 100) if v else 0
         step = max(2, round(pct / 2) * 2) if v else 0          # 2 % steps: 51 classes cover every bar
         part = partial_last and i == len(values) - 1
-        out.append('<div class="bcol" title="%s: %s%s"><span class="bval">%s</span><i class="%s h%d%s"></i></div>'
-                   % (esc(lab), num(v), " so far" if part else "", short_num(v) if v else "", cls, step, " partial" if part else ""))
+        gap = (gaps or {}).get(lab)
+        out.append('<div class="bcol%s" title="%s: %s%s%s"><span class="bval">%s</span><i class="%s h%d%s"></i></div>'
+                   % (" gapd" if gap else "", esc(lab), num(v), " so far" if part else "", " · no sync for %s" % dur(gap) if gap else "",
+                      short_num(v) if v else "", cls, step, " partial" if part else ""))
     out.append("</div>")
     return "".join(out)
 
@@ -1738,8 +1801,9 @@ def v_overview():
     q = {r[0]: (r[1], r[2]) for r in con.execute(
         "SELECT date(start,'unixepoch','localtime') d, COUNT(*), COUNT(DISTINCT ip) FROM sessions WHERE start>=? GROUP BY d",
         (now - 15 * 86400,))}
-    chart = ('<div class="card chart-card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
-             % (bars([q.get(d, (0, 0))[1] for d in days], days, partial_last=True), esc(days[0])))
+    gaps = gap_days(con, days)
+    chart = ('<div class="card chart-card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div>%s</div>'
+             % (bars([q.get(d, (0, 0))[1] for d in days], days, partial_last=True, gaps=gaps), esc(days[0]), gap_note(gaps)))
 
     hs, ha = hidden_sql(st)
     top = con.execute("SELECT i.*, e.cc, e.org, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
@@ -2062,6 +2126,39 @@ def score_html(r):
         segs, esc(" · ".join("%s %d" % p for p in parts)))
 
 
+def ip_story(con, r):
+    # One line of plain facts, nothing guessed. "Accepted" is the honeypot's doing: it lets attackers in on purpose.
+    plural = lambda n, word: "%s %s%s" % (num(n), word, "" if n == 1 else "s")
+    tried, ok = (r["logins_ok"] or 0) + (r["logins_fail"] or 0), r["logins_ok"] or 0
+    captured = con.execute("SELECT COUNT(DISTINCT b) FROM events WHERE ip=? AND kind='file' AND b IS NOT NULL", (r["ip"],)).fetchone()[0]
+    failed = con.execute("SELECT COUNT(*) FROM events WHERE ip=? AND kind='file_fail'", (r["ip"],)).fetchone()[0]
+    tags = set((r["tags"] or "").split(","))
+    svcs = [c for c in (r["canary_svcs"] or "").split(",") if c]
+    bits = []
+    if tried:
+        bits.append("tried %s%s" % (plural(tried, "login"), ", %s accepted" % num(ok) if ok else ""))
+    if r["cmds"]:
+        bits.append("ran %s" % plural(r["cmds"], "command"))
+    if captured:
+        bits.append("left %s" % plural(captured, "file"))
+    elif failed:
+        bits.append("failed to fetch %s" % plural(failed, "file"))
+    if "took-bait" in tags:
+        bits.append("used planted credentials")
+    if "read-bait" in tags:
+        bits.append("read planted files")
+    if r["tcpip"]:
+        bits.append("tried to use it as a proxy")
+    if r["exploits"]:
+        bits.append(plural(r["exploits"], "exploit attempt"))
+    if svcs:
+        bits.append("touched " + ", ".join(svcs[:5]))
+    if r["tarpit_s"]:
+        bits.append("spent %s in the tarpit" % dur(r["tarpit_s"]))
+    text = ", ".join(bits) if bits else "connected, nothing more"
+    return text[0].upper() + text[1:] + "."
+
+
 def v_ip(ip):
     con = db()
     try:
@@ -2109,7 +2206,8 @@ def v_ip(ip):
     # Activity, 30 days
     days = [datetime.fromtimestamp(now - i * 86400, TZ).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
     q = {x[0]: x[1] for x in con.execute("SELECT date(ts,'unixepoch','localtime') d, COUNT(*) FROM events WHERE ip=? AND ts>=? AND kind IN ('connect','canary','tarpit') GROUP BY d", (ip, now - 31 * 86400))}
-    act = '<div class="card"><h3>Activity, 30 days</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>' % (bars([q.get(d, 0) for d in days], days, 60), esc(days[0]))
+    gaps = gap_days(con, days)
+    act = '<div class="card"><h3>Activity, 30 days</h3>%s<div class="axis"><span>%s</span><span>today</span></div>%s</div>' % (bars([q.get(d, 0) for d in days], days, 60, gaps=gaps), esc(days[0]), gap_note(gaps))
 
     # Credentials
     creds = con.execute("SELECT a,b,SUM(kind='login_ok') ok, COUNT(*) n, MAX(ts) l FROM events WHERE ip=? AND kind IN ('login_ok','login_fail') GROUP BY a,b ORDER BY n DESC, l DESC LIMIT 200", (ip,)).fetchall()
@@ -2131,24 +2229,26 @@ def v_ip(ip):
     files_html = ('<div class="card span2"><h3>Files and URLs</h3><table><thead><tr><th>Name / URL</th><th>SHA-256</th><th>Last</th><th>Count</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>' % frows) if frows else ""
 
     # Related IPs
-    rel = []
-    for label, sql, a in [
-        ("Same SSH client (HASSH)", "SELECT DISTINCT s2.ip FROM sessions s1 JOIN sessions s2 ON s1.hassh=s2.hassh AND s2.ip!=s1.ip WHERE s1.ip=? AND s1.hassh IS NOT NULL LIMIT 40", (ip,)),
-        ("Same command script", "SELECT DISTINCT s2.ip FROM sessions s1 JOIN sessions s2 ON s1.cmdhash=s2.cmdhash AND s2.ip!=s1.ip WHERE s1.ip=? AND s1.cmdhash IS NOT NULL LIMIT 40", (ip,)),
-        ("Same file", "SELECT DISTINCT e2.ip FROM events e1 JOIN events e2 ON e1.b=e2.b AND e2.kind='file' AND e2.ip!=e1.ip WHERE e1.ip=? AND e1.kind='file' LIMIT 40", (ip,)),
-    ]:
-        ips_ = [x[0] for x in con.execute(sql, a)]
-        if ips_:
-            rel.append((label, ips_))
+    same = "SELECT DISTINCT ip FROM sessions WHERE %s IN (SELECT DISTINCT %s FROM sessions WHERE ip=? AND %s IS NOT NULL) AND ip!=?"
+    relations = [("Same SSH client (HASSH)", same % ("hassh", "hassh", "hassh"), (ip, ip)),
+                 ("Same command script", same % ("cmdhash", "cmdhash", "cmdhash"), (ip, ip)),
+                 ("Same file", "SELECT DISTINCT ip FROM events WHERE kind='file' AND b IN (SELECT DISTINCT b FROM events WHERE ip=? AND kind='file' AND b IS NOT NULL) AND ip!=?", (ip, ip))]
     if ":" not in ip:
-        pre = ".".join(ip.split(".")[:3]) + "."
-        n24 = [x[0] for x in con.execute("SELECT ip FROM ips WHERE ip LIKE ? AND ip!=? LIMIT 40", (pre + "%", ip))]
-        if n24:
-            rel.append(("Same /24 network", n24))
-    rel_html = ""
-    if rel:
-        rel_html = '<div class="card span2"><h3>Related attackers</h3><div class="scroll">%s</div></div>' % "".join(
-            '<div class="rel"><div class="rel-l">%s <span class=muted>%s</span></div><div class="rel-ips">%s</div></div>' % (esc(l), len(x), " ".join(ip_link(i) for i in x)) for l, x in rel)
+        relations.append(("Same /24 network", "SELECT ip FROM ips WHERE ip LIKE ? AND ip!=?", (".".join(ip.split(".")[:3]) + ".%", ip)))
+    rel = []
+    for label, sql, a in relations:
+        total = con.execute("SELECT COUNT(*) FROM (%s)" % sql, a).fetchone()[0]
+        if total:
+            rel.append((label, total, [x[0] for x in con.execute("SELECT r.ip FROM (%s) r JOIN ips i ON i.ip=r.ip ORDER BY i.last DESC, r.ip LIMIT 200" % sql, a)]))
+
+    def rel_row(label, total, ips_):
+        links_r = lambda xs: '<div class="rel-ips">%s</div>' % " ".join(ip_link(i) for i in xs)
+        more = ""
+        if len(ips_) > 5:
+            note = '<div class="muted small">Latest 200 of %s</div>' % num(total) if total > len(ips_) else ""
+            more = '<details class="rel-more"><summary>Show %s more</summary>%s%s</details>' % (num(len(ips_) - 5), links_r(ips_[5:]), note)
+        return '<div class="rel"><div class="rel-l">%s <span class=muted>%s</span></div><div class="rel-r">%s%s</div></div>' % (esc(label), num(total), links_r(ips_[:5]), more)
+    rel_html = '<div class="card"><h3>Related attackers</h3>%s</div>' % "".join(rel_row(*x) for x in rel) if rel else ""
 
     # Sessions
     sess = con.execute("SELECT * FROM sessions WHERE ip=? ORDER BY start DESC LIMIT 150", (ip,)).fetchall()
@@ -2210,11 +2310,13 @@ def v_ip(ip):
         can_html = ('<div class="card span2"><h3>Other services (decoys)</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
                     % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
 
-    body = ('<div class="iphead"><h1 class=mono>%s</h1><div>%s</div><div class="score">Score <b>%s</b></div></div>%s'
+    # Sessions come first in the page itself, so reading and keyboard order match what a phone shows.
+    body = ('<div class="iphead"><h1 class=mono>%s</h1><div>%s</div><div class="score">Score <b>%s</b></div></div>%s<p class="story">%s</p>'
             '<div class="links">%s</div>'
-            '<div class="grid"><div class="card"><h3>Activity</h3>%s</div><div class="card"><h3>Network</h3>%s</div>'
-            '<div class="card span2">%s</div>%s%s%s%s%s%s</div>'
-            % (esc(ip), tag_html(tags.strip(",")), r["score"], score_html(r), links, left, right, flag_form, act, creds_html, rel_html, files_html, sess_html, can_html))
+            '<div class="ip-w"><div class="ip-main">%s%s%s%s</div><div class="ip-side"><div class="card"><h3>Activity</h3>%s</div>'
+            '<div class="card"><h3>Network</h3>%s</div><div class="card flagcard">%s</div>%s%s</div></div>'
+            % (esc(ip), tag_html(tags.strip(",")), r["score"], score_html(r), esc(ip_story(con, r)), links,
+               sess_html, files_html, can_html, rel_html, left, right, flag_form, act, creds_html))
     return page(ip, body, "/ips")
 
 
@@ -2294,10 +2396,9 @@ def v_new(qs):
         return "<td>%s</td><td>%s</td><td class='mono trunc'>%s</td>%s<td>%s</td>" % (
             camp("file", r["key"]), family_tag(fam, how) if fam else (esc(f["type"]) if f else "–"), esc(r["ex"] or ""), when(r), who(r))
 
-    def r_script(r):
-        c = con.execute("SELECT cmdhash FROM sessions WHERE session=?", (r["session"],)).fetchone()          # gone after retention
-        return "<td>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (
-            camp("script", c[0]) if c and c[0] else "–", esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
+    live = lambda key: con.execute("SELECT 1 FROM sessions WHERE cmdhash=? LIMIT 1", (key,)).fetchone()     # gone after retention: no dead link
+    r_script = lambda r: "<td>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (
+        camp("script", r["key"]) if live(r["key"]) else '<span class=mono>%s</span>' % esc(r["key"]), esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
 
     r_cmd = lambda r: "<td class='mono wrap'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
     r_pw = lambda r: "<td class=mono>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["key"]), esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
@@ -2517,7 +2618,7 @@ def v_campaigns():
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                     % (esc(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by identical command scripts and SSH client fingerprints (HASSH) — many IPs, same operator or botnet.</p>'
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH).</p>'
             '<h2>Command scripts</h2><div class="card"><table class="wide"><thead><tr><th>Script</th><th>First command</th><th class=num>Cmds</th><th class=num>IPs</th>'
             '<th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
             '<h2>SSH clients (HASSH)</h2><div class="card"><table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
@@ -2533,7 +2634,7 @@ def v_campaign(kind, val):
         ips = con.execute("SELECT ip, COUNT(*) n, MAX(start) l FROM sessions WHERE cmdhash=? GROUP BY ip ORDER BY l DESC", (val,)).fetchall()
         sid = con.execute("SELECT session FROM sessions WHERE cmdhash=? LIMIT 1", (val,)).fetchone()
         cmds = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid[0],)).fetchall() if sid else []
-        detail = '<div class="card"><h3>Script</h3><div class="term">%s</div></div>' % "".join('<div class="ln"><span class="pr">$</span><code>%s</code></div>' % esc(clean(c[0])) for c in cmds)
+        detail = '<div class="card"><h3>Script <span class=muted>one example</span></h3><div class="term">%s</div></div>' % "".join('<div class="ln"><span class="pr">$</span><code>%s</code></div>' % esc(clean(c[0])) for c in cmds)
         title = "Script " + val
     elif kind == "hassh":
         ips = con.execute("SELECT ip, COUNT(*) n, MAX(start) l FROM sessions WHERE hassh=? GROUP BY ip ORDER BY l DESC", (val,)).fetchall()
@@ -2736,6 +2837,14 @@ def disk_note():
     return "%s kept here, %.1f MB · %.1f GB free on the data disk" % (num(n), b / 1048576, free / 1073741824)
 
 
+def gap_summary(con):
+    spans = gap_spans(con, time.time() - 30 * 86400)
+    if not spans:
+        return "none in 30 days"
+    start, end = spans[-1]
+    return "%d in 30 days, latest %s for %s" % (len(spans), esc(fmt_ts(start)), esc(dur(end - start)))
+
+
 def v_account(cur, ok="", err=""):
     con = db()
     now = time.time()
@@ -2756,6 +2865,7 @@ def v_account(cur, ok="", err=""):
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
+                 ("Sync gaps", gap_summary(con)),
                  ("Database backups", esc(backup_note(con))),
                  ("Backup error", '<span class="err">%s</span>' % esc(get_meta(con, "backup_error", "")) if get_meta(con, "backup_error", "") else "none"),
                  ("Honeypot", '<span class=mono>%s:%s</span> every %ss' % (esc(HP_HOST), esc(HP_PORT), POLL)),
@@ -3138,6 +3248,14 @@ CSS += (".sbar{display:flex;gap:2px;height:8px;margin:12px 0 4px}.sbar i{display
         ".kpi-sw:checked~.kpi-more .a,.kpi-sw:not(:checked)~.kpi-more .b{display:none}.kpi-sw:focus-visible~.kpi-more{outline:2px solid var(--accent);border-radius:6px}"
         "nav a,button.link,.hdr-link,.vtabs button{min-height:44px;display:inline-flex;align-items:center}.btn-s{min-height:44px;padding:8px 12px}"
         "button.kbd-btn{position:relative;min-height:22px}.kbd-btn::after{content:'';position:absolute;inset:-11px}.replay-btn{padding:10px 14px}}")
+CSS += (".story{font-size:15px;margin:8px 0}.ip-w{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}"
+        ".ip-main{display:flex;flex-direction:column;gap:14px;min-width:0}.ip-main>*{min-width:0}"
+        ".ip-side{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-content:start;min-width:0}.ip-side>*{min-width:0}.ip-side .flagcard{grid-column:1/-1}"
+        "@media (min-width:1500px){.ip-w{grid-template-columns:minmax(0,1fr) 400px}.ip-side{grid-template-columns:minmax(0,1fr)}.ip-main .scroll.tall{max-height:72vh}}"
+        "@media (max-width:1000px){.ip-side{grid-template-columns:minmax(0,1fr)}}"
+        ".rel-r{flex:1;min-width:0}.rel-more summary{cursor:pointer;color:var(--accent);font-size:13px;margin-top:4px}.rel-more .rel-ips{margin-top:4px;max-height:none}"
+        ".bcol{position:relative}.bcol.gapd::after{content:'';position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);width:100%;max-width:44px;height:3px;background:var(--orange)}"
+        ".gap-note{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-top:6px}.gap-note i{display:block;width:14px;height:3px;background:var(--orange)}")
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -3647,6 +3765,7 @@ def ingest_once():
     apply_honeypot_meta(con, parse_export.meta)
     n = store(con, rows)
     store_files(con, parse_export.files)
+    note_sync(con, t0)
     set_meta(con, "last_ingest", t0)
     print("parsed %d rows, %d new, %.1fs" % (len(rows), n, time.time() - t0))
 
