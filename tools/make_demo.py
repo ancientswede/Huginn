@@ -308,6 +308,7 @@ BANNER = ('<div class="demo-banner">Demo with made-up data &middot; Huginn turns
 
 
 def fix(html):
+    html = re.sub(r"""<a href="/search"[^>]*>Search</a>""", "", html)          # needs a server
     html = re.sub(r"""(href|src|action|data-src)=(["'])(.*?)\2""", link, html)
     html = html.replace("<body>", "<body>" + BANNER, 1).replace("<body class=login>", "<body class=login>" + BANNER, 1)
     html = re.sub(r"<a class='hdr-link' href=[^>]*>Account</a>", "", html)

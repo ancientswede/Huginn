@@ -108,7 +108,7 @@ class Web(unittest.TestCase):
 
     def test_no_inline_styles(self):
         # The CSP has style-src 'self': style="" attributes are silently ignored by browsers, so never render any.
-        for p in ("/", "/new", "/personas", "/ips", "/campaigns", "/files", "/creds", "/blocklist", "/settings", "/account", "/ip/198.51.100.10"):
+        for p in ("/", "/search", "/search?q=root", "/new", "/personas", "/ips", "/campaigns", "/files", "/creds", "/blocklist", "/settings", "/account", "/ip/198.51.100.10"):
             r, body = self.get(p)
             if r.status == 200:
                 self.assertNotRegex(body, r"\sstyle=", p)

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.20.0"
+HUGINN_VERSION = "0.21.0"
 CHANGELOG = [
+    ("0.21.0", "2026-11-08", "New page, Search: commands, file hashes and names, addresses inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history. Press / on any page without a filter to get there."),
     ("0.20.0", "2026-11-08", "New page, Personas: how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof."),
     ("0.19.1", "2026-11-08", "Overview: the banner is back to its full size on computers. It stays low on phones."),
     ("0.19.0", "2026-11-08", "Campaigns: scripts that differ only in addresses, numbers or random markers are now one campaign (old links to a script campaign stop working). Attacker page: a one-line summary, sessions first with the facts in a side column on wide screens, related attackers as a count and the five latest. Sync gaps: the day charts and the Account page show when Huginn did not collect."),
@@ -1736,7 +1737,7 @@ def html_attrs(st):
     return a
 
 
-NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/personas", "Personas"), ("/files", "Files"),
+NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/personas", "Personas"), ("/search", "Search"), ("/files", "Files"),
        ("/creds", "Credentials"), ("/blocklist", "Blocklist")]
 
 
@@ -2501,6 +2502,112 @@ def v_personas():
     return page("Personas", body, "/personas")
 
 
+SEARCH_ROWS = 50
+
+
+def snippet(text, q, width=260):
+    # Log text around the match, with the match marked. Every piece is escaped on its own.
+    s = clean(text or "", 4000)
+    at = s.lower().find(q.lower())
+    if at > 80:
+        s = "…" + s[at - 60:]
+    width = max(width, len(q) + 120)         # the whole match always fits
+    if len(s) > width:
+        s = s[:width] + "…"
+    return "".join("<mark>%s</mark>" % esc(p) if i % 2 else esc(p) for i, p in enumerate(re.split("(%s)" % re.escape(q), s, flags=re.I)))
+
+
+def v_search(qs):
+    con = db()
+    q = (qs.get("q") or "").strip()[:200]
+    days = qs.get("days") if qs.get("days") in ("7", "30") else "all"
+    since = time.time() - int(days) * 86400 if days != "all" else 0
+    tabs = " ".join('<a class="chip%s" href="/search?q=%s&days=%s">%s</a>' % (" on" if d == days else "", esc(urllib.parse.quote(q)), d, l)
+                    for d, l in (("all", "All"), ("30", "30 days"), ("7", "7 days")))
+    form = ('<h1>Search</h1><form class="filters" method=get action="/search"><input name=q value="%s" maxlength=200 placeholder="Command, URL, hash, IP or session" autofocus>'
+            '<input type=hidden name=days value="%s"><button>Search</button></form><div class="chips">%s</div>' % (esc(q), esc(days), tabs))
+    if len(q) < 3:
+        return page("Search", form + '<p class=muted>Type at least 3 characters.</p>', "/search")
+    pat = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like, pre = "%" + pat + "%", pat + "%"
+    n = lambda v: "<td class='num nw'>%s</td>" % num(v)
+    when = lambda ts: "<td class=nw>%s</td>" % esc(ago(ts))
+    who = lambda ip, sid: "<td>%s</td>" % ip_link(ip, "#s-" + sid if sid else "")
+
+    def section(title, total, head, rows):
+        if not total:
+            return ""
+        more = ' <span class=muted>latest %d shown</span>' % SEARCH_ROWS if total > SEARCH_ROWS else ""
+        return '<div class="card"><h3>%s <span class=muted>%s</span>%s</h3><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>' % (
+            esc(title), num(total), more, head, "".join("<tr>%s</tr>" % r for r in rows))
+
+    # Commands: the same shape once, with every attacker who ran a variant of it.
+    groups = {}
+    for r in con.execute("SELECT a,ip,session,MAX(ts) l,COUNT(*) c FROM events WHERE kind='cmd' AND ts>=? AND a LIKE ? ESCAPE '\\' GROUP BY a,ip ORDER BY l DESC", (since, like)):
+        g = groups.setdefault(cmd_shape(r["a"]), {"ex": r["a"], "n": 0, "ips": set(), "l": r["l"], "ip": r["ip"], "s": r["session"]})
+        g["n"] += r["c"]
+        g["ips"].add(r["ip"])
+    cmds = section("Commands", len(groups), "<th>Example</th><th class=num>Runs</th><th class=num>IPs</th><th>Last</th><th>IP</th>",
+                   ["<td class='mono wrap'>%s</td>%s%s%s%s" % (snippet(g["ex"], q), n(g["n"]), n(len(g["ips"])), when(g["l"]), who(g["ip"], g["s"])) for g in list(groups.values())[:SEARCH_ROWS]])
+
+    # Files: by hash, name or an address found inside the file. Few enough to compare in Python, on the real values
+    # (the stored addresses are JSON text and several names can belong to one hash). A file known only from its metadata counts too.
+    needle, seen_f = q.lower(), {}
+    for b, a, ip, ts in con.execute("SELECT b,a,ip,ts FROM events WHERE kind='file' AND b IS NOT NULL AND ts>=?", (since,)):
+        g = seen_f.setdefault(b, {"names": set(), "ips": set(), "l": 0})
+        if a:
+            g["names"].add(a)
+        g["ips"].add(ip)
+        g["l"] = max(g["l"], ts)
+    meta = {r["sha"]: r for r in con.execute("SELECT * FROM files")}
+    for sha, f in meta.items():
+        if sha not in seen_f and (f["mtime"] or 0) >= since and not con.execute("SELECT 1 FROM events WHERE kind='file' AND b=? LIMIT 1", (sha,)).fetchone():
+            seen_f[sha] = {"names": set(), "ips": set(), "l": f["mtime"] or 0, "only_meta": True}
+    found = []
+    for sha, g in seen_f.items():
+        f = meta.get(sha)
+        try:
+            iocs = [str(x) for x in json.loads(f["iocs"])] if f and f["iocs"] else []
+        except ValueError:
+            iocs = []
+        hit = next((x for x in sorted(g["names"]) + iocs if needle in x.lower()), None)
+        if hit is not None or sha.startswith(needle):
+            found.append((g["l"], sha, g, f, hit))
+    found.sort(key=lambda x: (-x[0], x[1]))
+    frows = []
+    for last, sha, g, f, hit in found[:SEARCH_ROWS]:
+        fam, how = file_family(f, ",".join(sorted(g["names"])))
+        link = "<a class=mono href=\"/campaign/file/%s\">%s…</a>" % (esc(sha), esc(sha[:16])) if not g.get("only_meta") else "<span class=mono>%s…</span>" % esc(sha[:16])
+        frows.append("<td>%s</td><td>%s</td><td class='mono wrap'>%s</td>%s%s" % (
+            link, family_tag(fam, how) if fam else (esc(f["type"]) if f else "–"), snippet(hit if hit is not None else sha, q), n(len(g["ips"])), when(last)))
+    files_ = section("Files", len(found), "<th>SHA-256</th><th>Type</th><th>Match</th><th class=num>IPs</th><th>Last</th>", frows)
+
+    urls = con.execute("SELECT a,ip,session,MAX(ts) l,COUNT(*) c,COUNT(DISTINCT ip) nip FROM events WHERE kind='file_fail' AND ts>=? AND a LIKE ? ESCAPE '\\' GROUP BY a ORDER BY l DESC", (since, like)).fetchall()
+    fails = section("Failed downloads", len(urls), "<th>URL</th><th class=num>Tries</th><th class=num>IPs</th><th>Last</th><th>IP</th>",
+                    ["<td class='mono wrap'>%s</td>%s%s%s%s" % (snippet(r["a"], q), n(r["c"]), n(r["nip"]), when(r["l"]), who(r["ip"], r["session"])) for r in urls[:SEARCH_ROWS]])
+
+    where = "kind='canary' AND ts>=? AND (b LIKE ? ESCAPE '\\' OR a LIKE ? ESCAPE '\\')"
+    can_n = con.execute("SELECT COUNT(*) FROM events WHERE " + where, (since, like, like)).fetchone()[0]
+    can = con.execute("SELECT ts,ip,a,b FROM events WHERE " + where + " ORDER BY ts DESC LIMIT ?", (since, like, like, SEARCH_ROWS)).fetchall()
+    decoys = section("Decoy services", can_n, "<th>Service</th><th>Data</th><th>Last</th><th>IP</th>",
+                     ["<td>%s</td><td class='mono wrap'>%s</td>%s%s" % (esc(r["a"]), snippet(r["b"], q), when(r["ts"]), who(r["ip"], None)) for r in can])
+
+    ses_n = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND session LIKE ? ESCAPE '\\'", (since, pre)).fetchone()[0]
+    ses = con.execute("SELECT session,ip,start,cmds FROM sessions WHERE start>=? AND session LIKE ? ESCAPE '\\' ORDER BY start DESC LIMIT ?", (since, pre, SEARCH_ROWS)).fetchall()
+    sessions_ = section("Sessions", ses_n, "<th>Session</th><th class=num>Commands</th><th>Started</th><th>IP</th>",
+                        ["<td class=mono>%s</td>%s%s%s" % (snippet(r["session"], q), n(r["cmds"]), when(r["start"]), who(r["ip"], r["session"])) for r in ses])
+
+    ip_n = con.execute("SELECT COUNT(*) FROM ips WHERE last>=? AND ip LIKE ? ESCAPE '\\'", (since, pre)).fetchone()[0]
+    ips_ = con.execute("SELECT i.ip,i.last,i.score,e.cc,e.org FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=? AND i.ip LIKE ? ESCAPE '\\' ORDER BY i.last DESC LIMIT ?", (since, pre, SEARCH_ROWS)).fetchall()
+    attackers = section("Attackers", ip_n, "<th>IP</th><th>CC</th><th>Network</th><th>Last</th><th class=num>Score</th>",
+                        ["<td>%s</td><td>%s</td><td class=trunc>%s</td>%s%s" % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["org"] or ""), when(r["last"]), n(r["score"])) for r in ips_])
+
+    quoted = esc(urllib.parse.quote(q))
+    also = '<p class="muted small">Also look in <a href="/ips?q=%s">attacker networks</a> or <a href="/creds?q=%s">credentials</a>.</p>' % (quoted, quoted)
+    found_any = cmds + files_ + fails + decoys + sessions_ + attackers
+    return page("Search", form + '<div class="stack-w">%s</div>%s' % (found_any or '<div class="card muted">Nothing found.</div>', also), "/search")
+
+
 def v_files():
     con = db()
     ev = {r["sha"]: r for r in con.execute("SELECT b sha, MIN(ts) f, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip, GROUP_CONCAT(DISTINCT a) names "
@@ -3231,7 +3338,7 @@ document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.m
 if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
 var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
 if(k==='g'){g=true;gt=setTimeout(function(){g=false},1500);return}
-if(k==='/'){var i=document.querySelector('input[name=q],input.qf');if(i){i.focus();e.preventDefault()}return}
+if(k==='/'){var i=document.querySelector('input[name=q],input.qf');if(i){i.focus();e.preventDefault()}else if(document.querySelector('nav a[href="/search"]')){location.href='/search';e.preventDefault()}return}
 if(k==='t'){var f=document.querySelector('form[action="/settings/theme"]');if(f)f.submit();return}
 if(k===' '){var p=document.getElementById('pPlay');if(p){p.click();e.preventDefault()}return}
 if(k==='?'){show();e.preventDefault();return}
@@ -3337,7 +3444,8 @@ CSS += (".story{font-size:15px;margin:8px 0}.ip-w{display:grid;grid-template-col
         ".rel-r{flex:1;min-width:0}.rel-more summary{cursor:pointer;color:var(--accent);font-size:13px;margin-top:4px}.rel-more .rel-ips{margin-top:4px;max-height:none}"
         ".bcol{position:relative}.bcol.gapd::after{content:'';position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);width:100%;max-width:44px;height:3px;background:var(--orange)}"
         ".gap-note{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-top:6px}.gap-note i{display:block;width:14px;height:3px;background:var(--orange)}")
-CSS += ".note{margin:10px 0 0}"
+CSS += (".note{margin:10px 0 0}mark{background:var(--accent2);color:var(--accent);border-radius:2px;padding:0 1px}"
+        ".stack-w{display:flex;flex-direction:column;gap:14px;margin-bottom:10px}.stack-w>*{min-width:0}")
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -3551,6 +3659,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_new(qs))
         if path == "/personas":
             return self.send(200, v_personas())
+        if path == "/search":
+            return self.send(200, v_search(qs))
         if path == "/creds":
             return self.send(200, v_creds(qs))
         m = re.fullmatch(r"/creds/export\.(txt|csv)", path)
