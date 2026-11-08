@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.17.0"
+HUGINN_VERSION = "0.18.0"
 CHANGELOG = [
+    ("0.18.0", "2026-11-08", "New page: everything Huginn has never seen before since you last reviewed (files, scripts, commands, password patterns, SSH clients), with Mark all reviewed and Undo. Overview: a low banner so more fits on the first screen, today's unfinished bar is striped, rare events stand out, a change against the prior 7 days. Files: steady columns and two IOCs with the rest behind Show more. Attacker page: what the score is made of. Phone: three key numbers first, sync status back, larger touch targets. Replay: short sessions no longer leave an empty terminal."),
     ("0.17.0", "2026-11-07", "Automatic database backups: once a day Huginn saves a checked, compressed copy of its database in data/backups and keeps the last 3 (HUGINN_DB_BACKUPS, HUGINN_DB_BACKUP_HOURS). A damaged database never pushes out the good copies, you get a warning on the Account page and through ntfy. Bring one back with: app.py restore-db."),
     ("0.16.2", "2026-11-06", "More security and reliability fixes from a deep review. Honeypot: root no longer changes or writes files the honeypot users control (update it, this one matters), Cowrie and OpenCanary run in a filesystem sandbox, the real sshd leaves port 22 on new installs. Huginn: addresses with an IPv6 scope are refused and can no longer add lines to a feed. The C2 list only has addresses seen from at least 2 attackers, never from failed downloads (HUGINN_C2_EXCLUDE removes more): treat it as advice. A bad file, port or recording can no longer stop the sync or a thread. update-huginn.sh rolls back when the restart itself fails. Optional HUGINN_ALLOWED_HOSTS."),
     ("0.16.1", "2026-11-06", "Security fixes: text sent to a decoy service could add fake lines to the honeypot export and break pages. The export is now split on real line ends only, impossible times and durations are refused, and pages tolerate bad values. The web server has a time limit and a cap on connections, the login limit holds under parallel requests, and an unread request body closes the connection. Update the honeypot too (hp-traps)."),
@@ -211,6 +212,9 @@ CREATE TABLE IF NOT EXISTS logins(token_hash TEXT PRIMARY KEY, expires REAL);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS files(sha TEXT PRIMARY KEY, src TEXT, size INTEGER, type TEXT, arch TEXT, packed INTEGER,
   iocs TEXT, mtime REAL, updated REAL);
+CREATE TABLE IF NOT EXISTS seen(kind TEXT, key TEXT, observed REAL, ip TEXT, session TEXT, ex TEXT, n INTEGER DEFAULT 1,
+  PRIMARY KEY(kind, key));
+CREATE INDEX IF NOT EXISTS seen_obs ON seen(observed);
 """
 
 
@@ -868,27 +872,17 @@ def sshole_password(proto, password):
     return proto == "ssh" and SSHOLE_MIN <= len((password or "").encode("utf-8", "surrogatepass")) <= SSHOLE_MAX
 
 
+def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False):
+    # The one place that defines the score: (label, points), zero points left out.
+    parts = [("seen", 1), ("SSHole probe", 10 if sshole else 0), ("took bait", 20 if took else 0), ("read bait", 5 if read else 0),
+             ("login attempts", 2 if lo + lf else 0), ("brute force", 2 if lo + lf >= 10 else 0), ("commands", min(10, cmds // 2)),
+             ("files", 15 if files else 0), ("proxy", 10 if tcpip else 0), ("exploit", 10 if expl else 0),
+             ("decoy services", 3 * len(csvcs)), ("repeat visits", min(5, sess // 20))]
+    return [(k, v) for k, v in parts if v]
+
+
 def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False):
-    s = 1
-    if sshole:
-        s += 10
-    if took:
-        s += 20
-    if read:
-        s += 5
-    if lo + lf:
-        s += 2
-    if lo + lf >= 10:
-        s += 2
-    s += min(10, cmds // 2)
-    if files:
-        s += 15
-    if tcpip:
-        s += 10
-    if expl:
-        s += 10
-    s += 3 * len(csvcs)
-    s += min(5, sess // 20)
+    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole))
     tags = []
     if took:
         tags.append("took-bait")
@@ -943,6 +937,7 @@ def store(con, rows):
     if not rows:
         return 0
     before = con.total_changes
+    top = con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]      # everything added below is above this
     sess = {r[5] for r in rows if r[5]}
     ips = {r[2] for r in rows}
     # One transaction: events and their totals are saved together. One bad session or IP must not stop the whole sync.
@@ -955,6 +950,12 @@ def store(con, rows):
                     fn(con, k)
                 except (ValueError, TypeError, OverflowError, sqlite3.Error) as e:
                     sys.stderr.write("recompute %s: %r\n" % (k, e))
+    try:
+        note_seen(con, top)
+    except Exception as e:                 # never let the "New" page get in the way of collecting data
+        if con.in_transaction:
+            con.rollback()
+        set_meta(con, "last_seen_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
     return inserted
 
 
@@ -976,6 +977,119 @@ def retention(con):
         for ip in old_ips:
             recompute_ip(con, ip)
     con.execute("PRAGMA optimize")
+
+
+# ---------------------------------------------------------------- first sightings ("New" page)
+
+def _blob(m):
+    s = m.group(0)
+    return "<blob>" if re.search(r"[0-9]", s) and re.search(r"[a-z]", s) and re.search(r"[A-Z]", s) else s
+
+
+def _v6(m):
+    try:
+        ipaddress.IPv6Address(m.group(0))
+    except ValueError:                  # a clock time, a MAC, an odd word
+        return m.group(0)
+    return "<ip>"
+
+
+def cmd_shape(s):
+    # Same command with other addresses, numbers or payloads = same shape. Order matters: numbers go last.
+    s = re.sub(r"(\\x[0-9a-fA-F]{2})+", "<bytes>", (s or "").strip()[:2000])
+    s = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "<ip>", s)
+    s = re.sub(r"(?<![\w:.])[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*(?![\w:.])", _v6, s)
+    s = re.sub(r"(?<![0-9a-zA-Z])[0-9a-fA-F]{8,}(?![0-9a-zA-Z])", "<hex>", s.replace("_", "_ ")).replace("_ ", "_")    # also inside check_1f3a...
+    s = re.sub(r"(?<![\w+/])[A-Za-z0-9+/]{24,}={0,2}(?![\w+/])", _blob, s)      # needs digits and both cases, so paths survive
+    s = re.sub(r"\d+", "<n>", s)
+    return re.sub(r"\s+", " ", s)[:300]
+
+
+def pw_shape(p):
+    # A = capitals, a = lower case, 0 = digits, # = anything else; runs collapsed. "Summer2026!" is Aa0#.
+    out = []
+    for c in (p or "")[:64]:
+        k = "A" if "A" <= c <= "Z" else "a" if "a" <= c <= "z" else "0" if "0" <= c <= "9" else "#"
+        if not out or out[-1] != k:
+            out.append(k)
+    return "".join(out)
+
+
+def note_seen(con, after):
+    # Remembers when Huginn first saw each thing. Time of arrival, not of the log line, so late or imported lines are
+    # never missed, and the list survives retention. `after` is the highest rowid before this store: SQLite can reuse
+    # rowids once rows are deleted, so a saved position would not be safe. The very first run reads the whole history
+    # and dates it by its log times.
+    first, now = get_meta(con, "seen_done") is None, time.time()
+    after = 0 if first else after
+    got = {}
+    for rid, ts, ip, sess, kind, a, b in con.execute("SELECT rowid,ts,ip,session,kind,a,b FROM events WHERE rowid>? AND "
+                                                     "kind IN ('cmd','file','login_ok','login_fail','closed') ORDER BY rowid", (after,)):
+        if kind == "closed":                # a finished session: its whole command list, in shapes, is one script
+            cmds = [x[0] or "" for x in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sess,))]
+            if not any(cmds):
+                continue
+            k, key, ex = "script", hashlib.sha1("\n".join(cmd_shape(c) for c in cmds).encode("utf-8", "replace")).hexdigest()[:16], cmds[0]
+        else:
+            k, key, ex = ("cmd", cmd_shape(a), a) if kind == "cmd" else ("file", b, a) if kind == "file" else ("pw", pw_shape(b), b)
+        if not key:
+            continue
+        g = got.get((k, key))
+        if g:
+            g[4] += 1
+            if first and ts < g[0]:         # imports are not in time order: keep the earliest sighting
+                g[:4] = [ts, ip, sess, clean(ex or "", 300)]
+        else:
+            got[(k, key)] = [ts if first else now, ip, sess, clean(ex or "", 300), 1]
+    with con:
+        con.executemany("INSERT INTO seen(kind,key,observed,ip,session,ex,n) VALUES(?,?,?,?,?,?,?) "
+                        "ON CONFLICT(kind,key) DO UPDATE SET n=n+excluded.n", [(k[0], k[1], *v) for k, v in got.items()])
+        con.execute("INSERT OR IGNORE INTO seen(kind,key,observed,ip,session,ex,n) SELECT 'hassh',hassh,CASE WHEN ? THEN MIN(start) ELSE ? END,"
+                    "ip,session,version,1 FROM sessions WHERE hassh IS NOT NULL GROUP BY hassh", (first, now))
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_done','1')")
+
+
+def review_at(con):
+    try:
+        v = float(get_meta(con, "review_at") or 0)
+    except ValueError:
+        return 0
+    return v if 0 < v < float("inf") else 0
+
+
+def review_since(con):
+    return review_at(con) or time.time() - 7 * 86400
+
+
+def mark_reviewed(con, at):
+    # Only ever forwards, and never past what was on the page: an old tab or a double click changes nothing.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        cur = review_at(con)
+        top = con.execute("SELECT MAX(observed) FROM seen").fetchone()[0]
+        if top is not None and cur < at <= top:
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('review_prev',?)", (repr(cur) if cur else "",))
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('review_at',?)", (repr(at),))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+
+def undo_review(con):
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        prev = get_meta(con, "review_prev")
+        if prev is not None:
+            if prev:
+                con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('review_at',?)", (prev,))
+            else:
+                con.execute("DELETE FROM meta WHERE k='review_at'")
+            con.execute("DELETE FROM meta WHERE k='review_prev'")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
 
 
 # ---------------------------------------------------------------- background threads
@@ -1470,18 +1584,19 @@ def short_num(v):
     return str(v)
 
 
-def bars(values, labels, h=90, cls="bar"):
+def bars(values, labels, h=90, cls="bar", partial_last=False):
     # Bars in plain HTML/CSS (not a stretched SVG), so the number above each bar stays sharp at any width.
     if not values:
         return ""
     mx = max(values) or 1
     # No style="" attributes: the Content-Security-Policy (style-src 'self') blocks them. Heights are CSS classes.
     out = ['<div class="bars bars-%d" role="img">' % (90 if h >= 90 else 60)]
-    for v, lab in zip(values, labels):
+    for i, (v, lab) in enumerate(zip(values, labels)):
         pct = (v / mx * 100) if v else 0
         step = max(2, round(pct / 2) * 2) if v else 0          # 2 % steps: 51 classes cover every bar
-        out.append('<div class="bcol" title="%s: %s"><span class="bval">%s</span><i class="%s h%d"></i></div>'
-                   % (esc(lab), num(v), short_num(v) if v else "", cls, step))
+        part = partial_last and i == len(values) - 1
+        out.append('<div class="bcol" title="%s: %s%s"><span class="bval">%s</span><i class="%s h%d%s"></i></div>'
+                   % (esc(lab), num(v), " so far" if part else "", short_num(v) if v else "", cls, step, " partial" if part else ""))
     out.append("</div>")
     return "".join(out)
 
@@ -1556,7 +1671,7 @@ def html_attrs(st):
     return a
 
 
-NAV = [("/", "Overview"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/files", "Files"),
+NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/files", "Files"),
        ("/creds", "Credentials"), ("/blocklist", "Blocklist")]
 
 
@@ -1570,7 +1685,9 @@ def page(title, body, active="/"):
     err = get_meta(con, "last_error", "")
     stale = (time.time() - li) > POLL * 3
     status = '<span class="sync %s" title="%s">synced %s</span>' % ("bad" if (err or stale) else "ok", esc(err or ""), esc(ago(li)))
-    nav = "".join('<a href="%s"%s>%s</a>' % (h, ' class="on"' if h == active else "", esc(t)) for h, t in NAV)
+    fresh = con.execute("SELECT COUNT(*) FROM seen WHERE observed>?", (review_since(con),)).fetchone()[0]
+    badge = '<span class="nav-n">%s</span>' % ("99+" if fresh > 99 else fresh) if fresh else ""
+    nav = "".join('<a href="%s"%s>%s%s</a>' % (h, ' class="on"' if h == active else "", esc(t), badge if h == "/new" else "") for h, t in NAV)
     return ("<!doctype html><html lang=en%s><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<title>%s · %s</title><link rel=icon type=image/png sizes=32x32 href='/static/icon-32.png'><link rel=apple-touch-icon href='/static/icon-180.png'><link rel=stylesheet href='/static/app.css?v=%s'>"
@@ -1600,12 +1717,20 @@ def v_overview():
     st = settings(con)
     tw = time_wasted(con, now - 7 * 86400)
     bait7 = con.execute("SELECT SUM(','||tags||',' LIKE '%,took-bait,%'), SUM(','||tags||',' LIKE '%,read-bait,%') FROM ips WHERE last>=?", (d7,)).fetchone()
-    kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"])), ("Attackers 7d", num(k["b"]), "%s total" % num(k["c"])),
-            ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24)), ("Files captured", num(files), "unique SHA-256"),
-            ("Took the bait 7d", num(bait7[0]), ("%s read bait files" % num(bait7[1])) if BAIT else "no bait values known yet"),
-            ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else "")),
-            ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]))]
-    kp = "".join('<div class="kpi"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (esc(a), b, esc(c)) for a, b, c in kpis)
+    w = week_summary(con, d7, now)
+    files_new = sum(w["families"].values())
+    files_prior = con.execute("SELECT COUNT(*) FROM (SELECT b FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b "
+                              "HAVING MIN(ts)>=? AND MIN(ts)<?)", (now - 14 * 86400, d7)).fetchone()[0]
+    delta = "%+d%% vs prior 7d" % round((w["active"] - w["before"]) * 100.0 / w["before"]) if w["before"] else ""
+    # The three without "kpi-x" are what a phone shows first. "hot": something rare happened, make it stand out.
+    kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"]), ""),
+            ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24), ""),
+            ("Took the bait 7d", num(bait7[0] or 0), ("%s read bait files" % num(bait7[1] or 0)) if BAIT else "no bait values known yet", " hot" if bait7[0] else ""),
+            ("Attackers 7d", num(w["active"]), " · ".join(x for x in ("%s total" % num(k["c"]), delta) if x), " kpi-x"),
+            ("Files captured", num(files), "%s new 7d · %s prior" % (num(files_new), num(files_prior)), " kpi-x hot" if files_new else " kpi-x"),
+            ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else ""), " kpi-x"),
+            ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]), " kpi-x")]
+    kp = "".join('<div class="kpi%s"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (d, esc(a), b, esc(c)) for a, b, c, d in kpis)
 
     days = []
     for i in range(13, -1, -1):
@@ -1614,7 +1739,7 @@ def v_overview():
         "SELECT date(start,'unixepoch','localtime') d, COUNT(*), COUNT(DISTINCT ip) FROM sessions WHERE start>=? GROUP BY d",
         (now - 15 * 86400,))}
     chart = ('<div class="card chart-card"><h3>Unique attacker IPs per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
-             % (bars([q.get(d, (0, 0))[1] for d in days], days), esc(days[0])))
+             % (bars([q.get(d, (0, 0))[1] for d in days], days, partial_last=True), esc(days[0])))
 
     hs, ha = hidden_sql(st)
     top = con.execute("SELECT i.*, e.cc, e.org, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
@@ -1656,11 +1781,13 @@ def v_overview():
                '<th class=num>Fake shell</th><th class=num>Total</th><th class=num>Longest</th></tr></thead><tbody>%s</tbody></table></div>'
                % (esc(dur(tw["total"])), " · %d stuck in the tarpit right now" % tw["stuck"] if tw["stuck"] else "", twrows or "<tr><td colspan=6 class=muted>Nothing yet</td></tr>"))
     parts = {"chart": chart, "countries": cc_html_, "top": top_html, "shells": shells_html, "creds": creds_html, "timewasted": tw_html,
-             "week": week_card(con) if "week" in st["cards"] else "",
+             "week": week_card(con, w) if "week" in st["cards"] else "",
              "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
                          % heat_html(heatmap(con))) if "heatmap" in st["cards"] else ""}
     body = ((hero_card(con, st) if "hero" in st["cards"] else "")
-            + '<div class="kpis">%s</div><div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero")))
+            + '<input class="kpi-sw" type="checkbox" id="kpiMore" aria-label="More metrics"><div class="kpis">%s</div>'
+              '<label class="kpi-more" for="kpiMore"><span class="a">More metrics</span><span class="b">Fewer metrics</span></label>'
+              '<div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero")))
     return page("Overview", body, "/")
 
 
@@ -1775,9 +1902,10 @@ def hero_card(con, st):
             % (esc(st["title"] or "Huginn"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
 
 
-def week_card(con):
-    end = time.time()
-    w = week_summary(con, end - 7 * 86400, end)
+def week_card(con, w=None):
+    if w is None:
+        end = time.time()
+        w = week_summary(con, end - 7 * 86400, end)
     rows = [("Attackers", "%s <span class=muted>%s</span>" % (num(w["active"]), esc(trend(w["active"], w["before"])))),
             ("New attackers", num(w["new_ips"])),
             ("New countries", " ".join(cc_html(c) for c in w["new_cc"][:12]) or "–"),
@@ -1919,6 +2047,19 @@ def v_ips(qs):
     body = ('<h1>Attackers <span class=muted>%s</span></h1>%s%s<div class="card"><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
             % (num(total), form, hidden_note, hdr, trs or "<tr><td colspan=%d class=muted>No matches</td></tr>" % (len(cols) + 1), pager))
     return page("Attackers", body, "/ips")
+
+
+def score_html(r):
+    # What the score is made of. Same hue for every part: the text below names them, in the same order.
+    have = set((r["tags"] or "").split(","))
+    parts = sorted(score_parts(r["sessions"] or 0, r["logins_ok"] or 0, r["logins_fail"] or 0, r["cmds"] or 0, r["files"] or 0, r["tcpip"] or 0,
+                               r["exploits"] or 0, [c for c in (r["canary_svcs"] or "").split(",") if c],
+                               "took-bait" in have, "read-bait" in have, "sshole-probe" in have), key=lambda p: -p[1])
+    if sum(v for _k, v in parts) != r["score"]:         # scored by an older version: do not show numbers that do not add up
+        return '<div class="sleg muted">Breakdown unavailable</div>'
+    segs = "".join('<i class="g%d" title="%s: %d"></i>' % (min(v, 60), esc(k), v) for k, v in parts)
+    return '<div class="sbar" role="img" aria-label="Score breakdown">%s</div><div class="sleg muted">%s</div>' % (
+        segs, esc(" · ".join("%s %d" % p for p in parts)))
 
 
 def v_ip(ip):
@@ -2069,11 +2210,11 @@ def v_ip(ip):
         can_html = ('<div class="card span2"><h3>Other services (decoys)</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
                     % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
 
-    body = ('<div class="iphead"><h1 class=mono>%s</h1><div>%s</div><div class="score">Score <b>%s</b></div></div>'
+    body = ('<div class="iphead"><h1 class=mono>%s</h1><div>%s</div><div class="score">Score <b>%s</b></div></div>%s'
             '<div class="links">%s</div>'
             '<div class="grid"><div class="card"><h3>Activity</h3>%s</div><div class="card"><h3>Network</h3>%s</div>'
             '<div class="card span2">%s</div>%s%s%s%s%s%s</div>'
-            % (esc(ip), tag_html(tags.strip(",")), r["score"], links, left, right, flag_form, act, creds_html, rel_html, files_html, sess_html, can_html))
+            % (esc(ip), tag_html(tags.strip(",")), r["score"], score_html(r), links, left, right, flag_form, act, creds_html, rel_html, files_html, sess_html, can_html))
     return page(ip, body, "/ips")
 
 
@@ -2116,6 +2257,69 @@ def export_csv(data):
     return out.getvalue()
 
 
+def ioc_cell(iocs):
+    line = lambda xs: "<br>".join(esc(clean(x, 120)) for x in xs)
+    rest = iocs[2:]
+    return line(iocs[:2]) + ('<details class="ioc-more"><summary>Show %d more</summary>%s</details>' % (len(rest), line(rest)) if rest else "")
+
+
+NEW_ROWS = 20
+
+
+def new_card(con, kind, title, since, limit, head, row, order="observed DESC", cls="card"):
+    total = con.execute("SELECT COUNT(*) FROM seen WHERE kind=? AND observed>?", (kind, since)).fetchone()[0]
+    if not total:
+        return ""
+    rows = con.execute("SELECT * FROM seen WHERE kind=? AND observed>? ORDER BY %s LIMIT ?" % order, (kind, since, limit)).fetchall()
+    more = '<a class=more href="/new?all=1">Show all %s</a>' % num(total) if total > len(rows) else ""      # never hide what Mark all covers
+    return ('<div class="%s"><h3>%s <span class=muted>%s</span>%s</h3><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+            % (cls, esc(title), num(total), more, head, "".join("<tr>%s</tr>" % row(r) for r in rows)))
+
+
+def v_new(qs):
+    con = db()
+    saved = review_at(con)
+    since = saved or time.time() - 7 * 86400
+    limit = -1 if qs.get("all") == "1" else NEW_ROWS          # -1: no limit in SQLite
+    top, total = con.execute("SELECT MAX(observed), COUNT(*) FROM seen WHERE observed>?", (since,)).fetchone()
+    # A link only where the target page can exist: the values come from log data.
+    camp = lambda kind, key: ('<a class=mono href="/campaign/%s/%s">%s</a>' % (kind, esc(key), esc(key[:16]))
+                              if re.fullmatch(r"[0-9a-f]{8,64}", key) else '<span class=mono>%s</span>' % esc(key[:16]))
+    who = lambda r: ip_link(r["ip"], "#s-" + r["session"] if r["session"] else "") if r["ip"] else "–"
+    when = lambda r: "<td class=nw>%s</td>" % esc(ago(r["observed"]))
+
+    def r_file(r):
+        f = con.execute("SELECT * FROM files WHERE sha=?", (r["key"],)).fetchone()
+        fam, how = file_family(f, r["ex"] or "")
+        return "<td>%s</td><td>%s</td><td class='mono trunc'>%s</td>%s<td>%s</td>" % (
+            camp("file", r["key"]), family_tag(fam, how) if fam else (esc(f["type"]) if f else "–"), esc(r["ex"] or ""), when(r), who(r))
+
+    def r_script(r):
+        c = con.execute("SELECT cmdhash FROM sessions WHERE session=?", (r["session"],)).fetchone()          # gone after retention
+        return "<td>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (
+            camp("script", c[0]) if c and c[0] else "–", esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
+
+    r_cmd = lambda r: "<td class='mono wrap'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
+    r_pw = lambda r: "<td class=mono>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["key"]), esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
+    r_hassh = lambda r: "<td>%s</td><td class='mono trunc'>%s</td>%s<td>%s</td>" % (camp("hassh", r["key"]), esc(r["ex"] or ""), when(r), who(r))
+    cards = (new_card(con, "file", "Files", since, limit, "<th>SHA-256</th><th>Type</th><th>Name</th><th>First</th><th>IP</th>", r_file)
+             + new_card(con, "script", "Scripts", since, limit, "<th>Script</th><th>First command</th><th class=num>Runs</th><th>First</th><th>IP</th>", r_script)
+             + new_card(con, "cmd", "Commands", since, limit, "<th>Example</th><th class=num>Runs</th><th>First</th><th>IP</th>", r_cmd, "n DESC, observed DESC", "card span2")
+             + new_card(con, "pw", "Password patterns", since, limit, "<th>Pattern</th><th>Example</th><th class=num>Tries</th><th>First</th><th>IP</th>", r_pw)
+             + new_card(con, "hassh", "SSH clients", since, limit, "<th>HASSH</th><th>Client</th><th>First</th><th>IP</th>", r_hassh))
+    what = "since %s" % fmt_tss(saved) if saved else "last 7 days, not reviewed yet"
+    acts = ""
+    if not DEMO:
+        if top is not None:
+            acts += ('<form method=post action="/new/reviewed"><input type=hidden name=at value="%s"><button>Mark all %s reviewed</button></form>'
+                     % (esc(repr(top)), num(total)))
+        if get_meta(con, "review_prev") is not None:
+            acts += '<form method=post action="/new/undo"><button class="btn-s">Undo</button></form>'
+    body = ('<div class="newhead"><div><h1>New</h1><p class=muted>Never seen before, %s</p></div><div class="newact">%s</div></div>%s'
+            % (esc(what), acts, '<div class="grid">%s</div>' % cards if total else '<div class="card muted">Nothing new.</div>'))
+    return page("New", body, "/new")
+
+
 def v_files():
     con = db()
     ev = {r["sha"]: r for r in con.execute("SELECT b sha, MIN(ts) f, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip, GROUP_CONCAT(DISTINCT a) names "
@@ -2127,12 +2331,12 @@ def v_files():
         e, f = ev.get(sha), fi.get(sha)
         iocs = json.loads(f["iocs"]) if f and f["iocs"] else []
         fam, how = file_family(f, e["names"] if e else "")
-        kind = (family_tag(fam, how) + " " if fam else "") + ((esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
+        kind = (family_tag(fam, how) if fam else "") + ('<div class="ft">%s</div>' % (esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
                 + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>')
-        trs += ("<tr><td class=mono>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td>%s</td><td class=num>%s</td><td>%s · %s</td></tr>"
+        trs += ("<tr><td class=mono>%s</td><td>%s</td><td class='num nw'>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td class=nw>%s</td><td class=num>%s</td><td class=nw>%s · %s</td></tr>"
                 % (("<a href='/campaign/file/%s'>%s…</a>" % (esc(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
                    esc("%.1f KB" % (f["size"] / 1024.0)) if f else "", esc(clean(e["names"], 200)) if e else "",
-                   "<br>".join(esc(clean(x, 120)) for x in iocs[:8]) + (" <span class=muted>+%d</span>" % (len(iocs) - 8) if len(iocs) > 8 else ""),
+                   ioc_cell(iocs),
                    esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "",
                    ext("https://bazaar.abuse.ch/sample/%s/" % sha, "MalwareBazaar"), ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")))
     urls = con.execute("SELECT a, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='file_fail' AND a IS NOT NULL GROUP BY a ORDER BY l DESC LIMIT 200").fetchall()
@@ -2686,16 +2890,15 @@ def v_login(err=""):
 
 CSS = r"""
 .hero{position:relative;border-radius:12px;overflow:hidden;margin-bottom:14px;background:#06080d;border:1px solid var(--line)}
-.hero img{display:block;width:100%;height:190px;object-fit:cover;object-position:20% 35%}
-@media (min-width:1600px){.hero img{height:230px}.hero-name{font-size:48px}}
-.hero-txt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 32px 0 46%;color:#e8ecf2}
-.hero-name{font-size:42px;font-weight:800;letter-spacing:.5px;line-height:1.05}
-.hero-tag{font-size:17px;color:#c8cfd9;margin-top:6px}.hero-facts{font-size:13px;color:#7aa2f7;margin-top:12px}
-@media (max-width:800px){.hero img{height:130px;object-position:15% 50%}.hero-txt{padding:0 14px 0 44%}.hero-name{font-size:28px}
-.hero-tag{font-size:13px}.hero-facts{display:none}}
+.hero img{display:block;width:100%;height:96px;object-fit:cover;object-position:20% 30%}
+.hero-txt{position:absolute;inset:0;display:flex;align-items:center;gap:22px;padding:0 32px 0 34%;color:#e8ecf2}
+.hero-name{font-size:30px;font-weight:800;letter-spacing:.5px;line-height:1.05}
+.hero-tag{display:none}.hero-facts{font-size:13px;color:#7aa2f7}
+@media (max-width:800px){.hero img{height:64px;object-position:15% 30%}.hero-txt{padding:0 14px 0 34%}.hero-name{font-size:22px}.hero-facts{display:none}}
 .heat{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
 .hm-row{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;align-items:center}
 .hm-row i{display:block;aspect-ratio:1;border-radius:3px;background:var(--panel2);min-height:10px}.hm-head span{text-align:left}
+@media (min-width:1001px){.hm-row i{aspect-ratio:auto;height:16px}}
 .hm1{background:color-mix(in srgb,var(--accent) 14%,var(--panel2))!important}.hm2{background:color-mix(in srgb,var(--accent) 26%,var(--panel2))!important}
 .hm3{background:color-mix(in srgb,var(--accent) 38%,var(--panel2))!important}.hm4{background:color-mix(in srgb,var(--accent) 50%,var(--panel2))!important}
 .hm5{background:color-mix(in srgb,var(--accent) 62%,var(--panel2))!important}.hm6{background:color-mix(in srgb,var(--accent) 74%,var(--panel2))!important}
@@ -2824,7 +3027,7 @@ copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copi
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
 (function(){
-var keys=[['g o','Overview'],['g a','Attackers'],['g c','Campaigns'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
+var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
 ['/','Search / filter'],['t','Switch theme'],['Space','Play / pause a replay'],['?','This help'],['Esc','Close']];
 var box=null;function hide(){if(box){box.remove();box=null}}
 function show(){if(box){hide();return}box=document.createElement('div');box.className='kbd-help';var c=document.createElement('div');c.className='card';
@@ -2832,7 +3035,7 @@ var h=document.createElement('h3');h.textContent='Keyboard shortcuts';c.appendCh
 var a=document.createElement('kbd');a.textContent=k[0];var b=document.createElement('span');b.textContent=k[1];r.appendChild(a);r.appendChild(b);c.appendChild(r)});
 box.appendChild(c);box.addEventListener('click',function(e){if(e.target===box)hide()});document.body.appendChild(box)}
 var hb=document.getElementById('kbdHelp');if(hb)hb.addEventListener('click',function(e){e.preventDefault();show()});
-var g=false,gt=null,map={o:'/',a:'/ips',c:'/campaigns',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
+var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
 document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.metaKey||e.altKey)return;
 if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
 var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
@@ -2891,7 +3094,7 @@ CSS += (".site-foot{max-width:2200px;margin:0 auto;padding:18px 24px 28px;color:
 CSS += (".upd{font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 9px}")
 CSS += (".vtabs{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;text-transform:none;letter-spacing:0}"
         ".vtabs button{background:none;color:var(--muted);border:0;border-radius:0;padding:3px 12px;font-size:12px}.vtabs button.on{background:var(--accent2);color:var(--accent)}"
-        ".wm-svg{width:100%;height:auto;max-height:420px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:108px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"
+        ".wm-svg{width:100%;height:auto;max-height:300px;display:block;margin:0 auto}.chart-card{display:flex;flex-direction:column}.chart-card .bars{flex:1;height:auto;min-height:108px}.wm-land{fill:var(--panel2);stroke:var(--line);stroke-width:.6}"
         ".wm-hit{fill:var(--accent);cursor:pointer}.wm-hit:hover,.wm-dot:hover{fill-opacity:1}.wm-dot{fill:var(--accent);stroke:var(--panel);stroke-width:1.5;cursor:pointer}"
         ".wm-legend{display:flex;align-items:center;gap:8px;justify-content:flex-end;font-size:11px;color:var(--muted);margin-top:6px}"
         ".wm-legend i{display:inline-block;width:90px;height:8px;border-radius:4px;background:linear-gradient(90deg,var(--accent2),var(--accent))}")
@@ -2906,10 +3109,10 @@ CSS += (".theme-btn{display:flex;align-items:center;gap:6px}.ti{display:inline-b
         ".settings .row:last-of-type{border:0}.settings .rl{color:var(--muted);padding-top:2px}.opt{display:inline-flex;align-items:center;gap:6px;margin:0 16px 6px 0;cursor:pointer}"
         ".col .opt{display:flex}.sub{margin:6px 0 0 24px}.sws{display:flex;flex-wrap:wrap}.dot{width:14px;height:14px;border-radius:50%;display:inline-block}"
         ".actions{margin-top:14px;display:flex;gap:10px}@media (max-width:1000px){.settings .row{grid-template-columns:1fr}}"
-        "@media (max-width:1000px){header{flex-wrap:wrap;height:auto;padding:8px 16px;row-gap:6px}header nav{order:3;width:100%}"
-        ".hdr-right{gap:10px}.theme-btn{font-size:0}.theme-btn .ti{font-size:14px}.sync{display:none}}")
+        "@media (max-width:1000px){header{position:static;flex-wrap:wrap;height:auto;padding:4px 16px;gap:2px 10px}header nav{order:3;width:100%}"
+        ".hdr-right{display:contents}.brand{margin-right:auto}.theme-btn{font-size:0}.theme-btn .ti{font-size:14px}.sync{order:2;width:100%;text-align:right}}")
 CSS += (".pctl{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.pctl label{display:flex;gap:6px;align-items:center;color:var(--muted)}"
-        ".player{min-height:420px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0;border-radius:8px}"
+        ".player{min-height:min(220px,70vh);max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0;border-radius:8px}"
         ".iocs{line-height:1.5;max-width:420px;overflow-wrap:anywhere}.replay{font-weight:600}"
         ".replay-btn{display:inline-block;padding:2px 10px;border:1px solid var(--accent);border-radius:999px;color:var(--accent);font-size:12px;"
         "font-weight:600;white-space:nowrap;text-decoration:none}.replay-btn:hover{background:var(--accent);color:var(--bg)}"
@@ -2919,6 +3122,22 @@ CSS += (".hdr-link{color:var(--muted)}.hdr-link:hover,.hdr-link.on{color:var(--t
         ".stack button{align-self:flex-start}.okmsg{color:var(--green);margin:0 0 14px}.err{margin:0 0 14px}"
         ".cl{display:grid;grid-template-columns:60px 90px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)}.cl:last-child{border:0}"
         "button[disabled]{opacity:.5;cursor:default}")
+CSS += "".join(".sbar .g%d{flex-grow:%d}" % (n, n) for n in range(1, 61))
+CSS += (".sbar{display:flex;gap:2px;height:8px;margin:12px 0 4px}.sbar i{display:block;flex-basis:0;min-width:3px;background:var(--accent)}"
+        ".sbar i:nth-child(even){opacity:.55}.sbar i:first-child{border-radius:4px 0 0 4px}.sbar i:last-child{border-radius:0 4px 4px 0}.sleg{font-size:12px;margin-bottom:8px}"
+        ".bcol i.partial{background:repeating-linear-gradient(135deg,var(--accent) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px var(--accent)}"
+        ".kpi.hot{border-color:var(--accent)}.kpi.hot .kpi-v{color:var(--accent)}.kpi-sw{position:absolute;opacity:0;pointer-events:none}.kpi-more{display:none}"
+        ".nw{white-space:nowrap}.ft{margin-top:3px}.ioc-more summary{cursor:pointer;color:var(--accent);font-family:system-ui,sans-serif}"
+        ".nav-n{margin-left:6px;padding:0 6px;border-radius:9px;font-size:11px;background:var(--accent2);color:var(--accent);font-variant-numeric:tabular-nums}"
+        "nav a.on .nav-n{background:var(--panel)}.wrap{overflow-wrap:anywhere}"
+        ".newhead{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}.newhead h1{margin-bottom:2px}.newhead p{margin:0 0 14px}"
+        ".newact{display:flex;gap:8px;align-items:center}.newact form{margin:0}"
+        "@media (max-width:1000px){.kpis{grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}.kpi{grid-column:span 2;padding:10px;min-width:0}"
+        ".kpi.kpi-x{display:none;grid-column:span 3}.kpi-sw:checked~.kpis .kpi-x{display:block}.kpi-v{font-size:22px}.kpi:not(.kpi-x) .kpi-s{display:none}"
+        ".kpi-more{display:flex;align-items:center;justify-content:center;min-height:44px;margin:-6px 0 8px;color:var(--accent);cursor:pointer}"
+        ".kpi-sw:checked~.kpi-more .a,.kpi-sw:not(:checked)~.kpi-more .b{display:none}.kpi-sw:focus-visible~.kpi-more{outline:2px solid var(--accent);border-radius:6px}"
+        "nav a,button.link,.hdr-link,.vtabs button{min-height:44px;display:inline-flex;align-items:center}.btn-s{min-height:44px;padding:8px 12px}"
+        "button.kbd-btn{position:relative;min-height:22px}.kbd-btn::after{content:'';position:absolute;inset:-11px}.replay-btn{padding:10px 14px}}")
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -3128,6 +3347,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1><p class=muted>No data for that IP.</p>"))
         if path == "/files":
             return self.send(200, v_files())
+        if path == "/new":
+            return self.send(200, v_new(qs))
         if path == "/creds":
             return self.send(200, v_creds(qs))
         m = re.fullmatch(r"/creds/export\.(txt|csv)", path)
@@ -3243,6 +3464,15 @@ class Handler(BaseHTTPRequestHandler):
             except cookies.CookieError:
                 pass
             return self.redirect("/login", {"Set-Cookie": "huginn_s=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"})
+        if path == "/new/reviewed":
+            try:
+                mark_reviewed(con, float(self.form().get("at", "")))
+            except ValueError:
+                return self.send(400, "Bad value", "text/plain")
+            return self.redirect("/new")
+        if path == "/new/undo":
+            undo_review(con)
+            return self.redirect("/new")
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/flag", path)
         if m:
             try:

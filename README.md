@@ -101,6 +101,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
 ## What you get
 
 - **Overview:** attackers per day, top attackers, latest shell sessions, top passwords, countries as a world map or a list (click a country to see its attackers), how many took the bait, and **time wasted** (hours attackers spent stuck in the tarpit and in the fake shells, and who is stuck right now).
+- **New:** everything Huginn has never seen before since you last looked: files, scripts, commands, password patterns and SSH clients. Commands and scripts that differ only in addresses, numbers or random markers count as one. Click **Mark all reviewed** when you are done (Undo is one click away).
 - **A page per attacker IP:**
   - country, network, reverse DNS, open ports and known CVEs (from Shodan InternetDB)
   - every password they tried
