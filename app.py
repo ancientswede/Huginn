@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.21.0"
+HUGINN_VERSION = "0.21.1"
 CHANGELOG = [
+    ("0.21.1", "2026-11-08", "Session logs are easier to read: download and permission commands stand out, addresses link to Search (never to the attacker's server) and captured files link to their file page."),
     ("0.21.0", "2026-11-08", "New page, Search: commands, file hashes and names, addresses inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history. Press / on any page without a filter to get there."),
     ("0.20.0", "2026-11-08", "New page, Personas: how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof."),
     ("0.19.1", "2026-11-08", "Overview: the banner is back to its full size on computers. It stays low on phones."),
@@ -2116,6 +2117,63 @@ def v_ips(qs):
     return page("Attackers", body, "/ips")
 
 
+CMD_TOKEN = (r"(?:https?|ftp|tftp)://[^\s'\"<>;|&)`]+|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|"
+             r"(?<![\w:.])[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*(?![\w:.])|"
+             r"\b(?:wget|curl|tftp|ftpget|chmod|nohup|crontab|base64)\b|authorized_keys")
+CMD_RE = re.compile(CMD_TOKEN, re.I)
+
+
+def session_files(events):
+    # Name or URL -> hash for the files captured in one session. Very short names would match everywhere, and a name
+    # that held different content during the session cannot be linked to either one.
+    out, unclear = {}, set()
+    for x in events:
+        if x["kind"] == "file" and x["a"] and len(x["a"]) >= 3 and re.fullmatch(r"[0-9a-f]{64}", x["b"] or "") and len(out) < 20:
+            name = clean(x["a"])
+            if out.get(name, x["b"]) != x["b"]:
+                unclear.add(name)
+            out[name] = x["b"]
+    return {k: v for k, v in out.items() if k not in unclear}
+
+
+def cmd_html(text, files=None):
+    # One log line with its interesting parts marked. Links stay inside Huginn: nothing here may lead to the attacker's server.
+    s = clean(text)
+    files = files or {}
+    rx = CMD_RE
+    if files:
+        names = "|".join(re.escape(x) for x in sorted(files, key=len, reverse=True))
+        rx = re.compile(r"(?<![\w./-])(?:%s)(?=$|[\s'\";|&)<>`])|%s" % (names, CMD_TOKEN), re.I)      # the whole word, not the start of a longer path
+
+    def find(label, q):
+        return '<a class="c-l" href="/search?q=%s" title="Search">%s</a>' % (esc(urllib.parse.quote(q, safe="")), esc(label))
+
+    out, pos = [], 0
+    for m in rx.finditer(s):
+        out.append(esc(s[pos:m.start()]))
+        pos, tok = m.end(), m.group(0)
+        if tok in files:
+            out.append('<a class="c-f" href="/campaign/file/%s" title="Captured file">%s</a>' % (esc(files[tok]), esc(tok)))
+        elif "://" in tok:
+            try:
+                host = urllib.parse.urlsplit(tok).hostname
+            except ValueError:
+                host = None
+            out.append(find(tok, host) if host and len(host) >= 3 else esc(tok))
+        elif re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?", tok):
+            out.append(find(tok, tok.split(":")[0]))
+        elif ":" in tok:
+            try:
+                ipaddress.IPv6Address(tok)
+                out.append(find(tok, tok))
+            except ValueError:                  # a clock time, a MAC
+                out.append(esc(tok))
+        else:
+            out.append('<span class="c-k">%s</span>' % esc(tok))
+    out.append(esc(s[pos:]))
+    return "".join(out)
+
+
 def score_html(r):
     # What the score is made of. Same hue for every part: the text below names them, in the same order.
     have = set((r["tags"] or "").split(","))
@@ -2271,19 +2329,20 @@ def v_ip(ip):
             if gaps[len(gaps) // 2] > 2.0:
                 human = '<span class="tag t-orange">human-like</span>'
         lines = []
+        fmap = session_files(ev)
         for x in ev:
             rel_t = "+%.1fs" % (x["ts"] - s["start"])
             k = x["kind"]
             if k == "cmd":
-                lines.append('<div class="ln"><span class=t>%s</span><span class="pr">$</span><code>%s</code></div>' % (rel_t, esc(clean(x["a"]))))
+                lines.append('<div class="ln"><span class=t>%s</span><span class="pr">$</span><code>%s</code></div>' % (rel_t, cmd_html(x["a"], fmap)))
             elif k in ("login_ok", "login_fail") and sshole_password(s["proto"], x["b"]):
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">sshole</span><code>%s / %s (%d bytes, %s)</code></div>' % (rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100)), len(x["b"].encode("utf-8", "surrogatepass")), "accepted" if k == "login_ok" else "refused"))
             elif k in ("login_ok", "login_fail"):
                 lines.append('<div class="ln %s"><span class=t>%s</span><span class="pr">login</span><code>%s / %s</code></div>' % ("ok" if k == "login_ok" else "fail", rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100))))
             elif k == "file":
-                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">file</span><code>%s · %s</code></div>' % (rel_t, esc(clean(x["a"], 300)), esc(x["b"] or "")))
+                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">file</span><code>%s · %s</code></div>' % (rel_t, cmd_html(clean(x["a"], 300), fmap), ('<a class="c-f" href="/campaign/file/%s">%s</a>' % (esc(x["b"]), esc(x["b"]))) if re.fullmatch(r"[0-9a-f]{64}", x["b"] or "") else esc(x["b"] or "")))
             elif k == "file_fail":
-                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, esc(clean(x["a"], 300))))
+                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, cmd_html(clean(x["a"], 300))))
             elif k == "tcpip":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">proxy</span><code>→ %s</code></div>' % (rel_t, esc(x["a"])))
             elif k == "exploit":
@@ -2821,7 +2880,7 @@ def v_campaign(kind, val):
         ips = con.execute("SELECT ip, COUNT(*) n, MAX(start) l FROM sessions WHERE cmdhash=? GROUP BY ip ORDER BY l DESC", (val,)).fetchall()
         sid = con.execute("SELECT session FROM sessions WHERE cmdhash=? LIMIT 1", (val,)).fetchone()
         cmds = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid[0],)).fetchall() if sid else []
-        detail = '<div class="card"><h3>Script <span class=muted>one example</span></h3><div class="term">%s</div></div>' % "".join('<div class="ln"><span class="pr">$</span><code>%s</code></div>' % esc(clean(c[0])) for c in cmds)
+        detail = '<div class="card"><h3>Script <span class=muted>one example</span></h3><div class="term">%s</div></div>' % "".join('<div class="ln"><span class="pr">$</span><code>%s</code></div>' % cmd_html(c[0]) for c in cmds)
         title = "Script " + val
     elif kind == "hassh":
         ips = con.execute("SELECT ip, COUNT(*) n, MAX(start) l FROM sessions WHERE hassh=? GROUP BY ip ORDER BY l DESC", (val,)).fetchall()
@@ -3444,6 +3503,7 @@ CSS += (".story{font-size:15px;margin:8px 0}.ip-w{display:grid;grid-template-col
         ".rel-r{flex:1;min-width:0}.rel-more summary{cursor:pointer;color:var(--accent);font-size:13px;margin-top:4px}.rel-more .rel-ips{margin-top:4px;max-height:none}"
         ".bcol{position:relative}.bcol.gapd::after{content:'';position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);width:100%;max-width:44px;height:3px;background:var(--orange)}"
         ".gap-note{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-top:6px}.gap-note i{display:block;width:14px;height:3px;background:var(--orange)}")
+CSS += ".c-k{color:#f0a050}.c-l{color:#7aa2f7;text-decoration:underline}.c-f{color:#5fc28a;text-decoration:underline}"
 CSS += (".note{margin:10px 0 0}mark{background:var(--accent2);color:var(--accent);border-radius:2px;padding:0 1px}"
         ".stack-w{display:flex;flex-direction:column;gap:14px;margin-bottom:10px}.stack-w>*{min-width:0}")
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
