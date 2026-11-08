@@ -372,6 +372,27 @@ cd Huginn && git pull
 - Huginn checks GitHub's public list of version tags once a day and shows **update x.y.z** in the header when there is a newer one. Nothing about you is sent. Turn it off with `HUGINN_UPDATE_CHECK=0`.
 - Running the install scripts again also works. They keep everything that is already set up, but they make no backup and do not roll back on failure.
 
+## Database backups
+
+Once a day Huginn saves a compressed copy of its database in `/opt/huginn/data/backups/` and keeps the last 3. Change that with `HUGINN_DB_BACKUPS` (`0` turns it off) and `HUGINN_DB_BACKUP_HOURS`. The first one is made a few minutes after the start.
+
+- Every copy is checked first. If the database is damaged, no copy is saved and the good ones stay. You get a warning on the Account page and through ntfy.
+- The copies hold your login hash and feed token, so only Huginn's user can read them.
+- They sit on the same disk as the database. They save you from a broken update or a damaged database, not from a dead disk: copy them somewhere else too.
+
+To bring one back:
+
+```bash
+systemctl stop huginn
+runuser -u huginn -- python3 /opt/huginn/app.py backups
+runuser -u huginn -- python3 /opt/huginn/app.py restore-db huginn-20261107-120000.db.gz
+systemctl start huginn
+```
+
+Add your `HUGINN_BASE` if you changed it. In Docker: `docker compose stop huginn`, then `docker compose run --rm huginn restore-db <name>`, then `docker compose start huginn`.
+
+The restore checks the copy before it touches anything, and keeps the database you had next to it as `huginn.db.before-restore-...`. Events after the copy are lost, except those still in the honeypot's export: they come back at the next sync.
+
 ## Using the blocklists
 
 The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
@@ -434,6 +455,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_TZ` | `UTC` | Time zone for the UI and per-day charts |
 | `HUGINN_POLL` | `120` | Seconds between syncs |
 | `HUGINN_RETENTION_DAYS` | `180` | Days of history kept; `0` keeps everything forever |
+| `HUGINN_DB_BACKUPS` | `3` | Automatic copies of the database to keep; `0` turns them off |
+| `HUGINN_DB_BACKUP_HOURS` | `24` | Hours between those copies |
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
 | `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
 | `HUGINN_MALWAREBAZAAR_KEY` | – | Look captured files up on MalwareBazaar by SHA-256 (only the hash is sent). Free key at [auth.abuse.ch](https://auth.abuse.ch) |

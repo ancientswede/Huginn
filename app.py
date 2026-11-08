@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.16.2"
+HUGINN_VERSION = "0.17.0"
 CHANGELOG = [
+    ("0.17.0", "2026-11-07", "Automatic database backups: once a day Huginn saves a checked, compressed copy of its database in data/backups and keeps the last 3 (HUGINN_DB_BACKUPS, HUGINN_DB_BACKUP_HOURS). A damaged database never pushes out the good copies, you get a warning on the Account page and through ntfy. Bring one back with: app.py restore-db."),
     ("0.16.2", "2026-11-06", "More security and reliability fixes from a deep review. Honeypot: root no longer changes or writes files the honeypot users control (update it, this one matters), Cowrie and OpenCanary run in a filesystem sandbox, the real sshd leaves port 22 on new installs. Huginn: addresses with an IPv6 scope are refused and can no longer add lines to a feed. The C2 list only has addresses seen from at least 2 attackers, never from failed downloads (HUGINN_C2_EXCLUDE removes more): treat it as advice. A bad file, port or recording can no longer stop the sync or a thread. update-huginn.sh rolls back when the restart itself fails. Optional HUGINN_ALLOWED_HOSTS."),
     ("0.16.1", "2026-11-06", "Security fixes: text sent to a decoy service could add fake lines to the honeypot export and break pages. The export is now split on real line ends only, impossible times and durations are refused, and pages tolerate bad values. The web server has a time limit and a cap on connections, the login limit holds under parallel requests, and an unread request body closes the connection. Update the honeypot too (hp-traps)."),
     ("0.16.0", "2026-11-06", "SSHole detection (CVE-2026-123158): an SSH login with a password of 257-1024 bytes tags the attacker sshole-probe (+10 score), stands out in the session log and counts as an exploit attempt in ntfy. Attackers already in the database are tagged at the first start."),
@@ -48,6 +49,7 @@ CHANGELOG = [
 ]
 
 import base64
+import fcntl
 import getpass
 import gzip
 import hashlib
@@ -59,6 +61,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -131,7 +134,13 @@ def ntfy_post(body, title, prio=3):
     urllib.request.urlopen(req, timeout=10).read()
 PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
+# Automatic copies of the database: how many to keep (0 = off) and how often. See "Database backups" in README.md.
+BACKUP_KEEP = max(0, min(30, int(os.environ.get("HUGINN_DB_BACKUPS", "3"))))
+BACKUP_HOURS = max(1, int(os.environ.get("HUGINN_DB_BACKUP_HOURS", "24")))
+BACKUP_RETRY = 6 * 3600                  # after a failure, try again this much later
 TTY_DIR = os.path.join(DATA, "tty")
+BACKUP_DIR = os.path.join(DATA, "backups")
+BACKUP_RE = re.compile(r"huginn-\d{8}-\d{6}\.db\.gz")
 STATIC_DIR = os.environ.get("HUGINN_STATIC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
 # Persona per internal Cowrie port, e.g. HUGINN_PERSONAS="2225=server,2323=camera" (several Cowrie instances).
 # Without the setting, Huginn uses what the honeypot announces in its export (##PERSONAS, written by install-honeypot.sh).
@@ -1155,6 +1164,133 @@ def enrich_ip(ip):
     hay = " ".join(str(v) for v in (d["rdns"], d["org"], d["isp"], d["hostnames"]) if v)
     research = 1 if RESEARCH_RE.search(hay) else 0
     return d, ok, research
+
+
+# ---------------------------------------------------------------- database backups
+# A checked copy is made first. Old copies go only after that succeeded, so a damaged database never pushes out good ones.
+
+class DatabaseDamaged(Exception):
+    pass
+
+
+def backup_files():
+    # Newest first: (name, full path, size).
+    try:
+        names = sorted((n for n in os.listdir(BACKUP_DIR) if BACKUP_RE.fullmatch(n)), reverse=True)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(BACKUP_DIR, n)
+        try:
+            out.append((n, p, os.path.getsize(p)))
+        except OSError:
+            pass
+    return out
+
+
+def check_copy(path):
+    con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(path), uri=True, timeout=30)
+    try:
+        return con.execute("PRAGMA quick_check").fetchone()[0]
+    finally:
+        con.close()
+
+
+def remove_quietly(*paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def backup_db():
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    size = os.path.getsize(DB_PATH)
+    st = os.statvfs(BACKUP_DIR)
+    if st.f_bavail * st.f_frsize < size * 2:
+        raise RuntimeError("not enough free disk for a copy of the database (%.0f MB)" % (size / 1048576))
+    for n in os.listdir(BACKUP_DIR):        # left behind by a crash
+        if n.startswith(".tmp-"):
+            remove_quietly(os.path.join(BACKUP_DIR, n))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tmp_db, tmp_gz = os.path.join(BACKUP_DIR, ".tmp-%s.db" % stamp), os.path.join(BACKUP_DIR, ".tmp-%s.gz" % stamp)
+    final = os.path.join(BACKUP_DIR, "huginn-%s.db.gz" % stamp)
+    try:
+        src = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(DB_PATH), uri=True, timeout=30)
+        dst = sqlite3.connect(tmp_db)
+        try:
+            os.chmod(tmp_db, 0o600)
+            src.backup(dst, pages=2000, sleep=0.01)   # in small steps, so the sync and the web pages keep working
+            dst.execute("PRAGMA journal_mode=DELETE")  # one self-contained file, no -wal or -shm next to it
+        finally:
+            dst.close()
+            src.close()
+        result = check_copy(tmp_db)
+        if result != "ok":
+            raise DatabaseDamaged("the database is damaged: %s" % str(result)[:150])
+        fd = os.open(tmp_gz, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)    # holds the login hash and the feed token
+        with os.fdopen(fd, "wb") as raw, gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=raw) as gz, open(tmp_db, "rb") as fh:
+            shutil.copyfileobj(fh, gz, 1 << 20)
+        os.replace(tmp_gz, final)
+    finally:
+        remove_quietly(tmp_db, tmp_db + "-journal", tmp_db + "-wal", tmp_db + "-shm", tmp_gz)
+    for _name, path, _size in backup_files()[max(1, BACKUP_KEEP):]:
+        remove_quietly(path)
+    return final
+
+
+def backup_due(con, now):
+    if not BACKUP_KEEP:
+        return False
+    last = float(get_meta(con, "backup_last", "0") or 0)
+    tried = float(get_meta(con, "backup_tried", "0") or 0)
+    return now - last >= BACKUP_HOURS * 3600 and now - tried >= BACKUP_RETRY
+
+
+def backup_once(con):
+    # One scheduled backup. Failures are kept for the Account page and sent once per try through ntfy.
+    now = time.time()
+    set_meta(con, "backup_tried", now)
+    try:
+        backup_db()
+        set_meta(con, "backup_last", now)
+        set_meta(con, "backup_error", "")
+        return True
+    except Exception as e:
+        msg = "%s %s" % (fmt_ts(now), str(e)[:200])
+        set_meta(con, "backup_error", msg)
+        sys.stderr.write("database backup: %s\n" % msg)
+        try:
+            if NTFY_URL and settings(con)["notify"]:
+                ntfy_post("Database backup failed: %s" % str(e)[:200], "Huginn: backup failed", 4)
+        except Exception as e2:
+            sys.stderr.write("ntfy: %r\n" % e2)
+        return False
+
+
+def backup_loop():
+    time.sleep(300)
+    con = connect()
+    while True:
+        try:
+            if backup_due(con, time.time()):
+                backup_once(con)
+        except Exception as e:
+            sys.stderr.write("backup loop: %r\n" % e)
+        time.sleep(600)
+
+
+def backup_note(con):
+    if not BACKUP_KEEP:
+        return "turned off (HUGINN_DB_BACKUPS=0)"
+    files = backup_files()
+    last = float(get_meta(con, "backup_last", "0") or 0)
+    txt = "%s kept of %d" % (num(len(files)), BACKUP_KEEP)
+    if files:
+        txt += ", newest %s, %.1f MB" % (ago(last) if last else files[0][0][7:22], files[0][2] / 1048576)
+    return txt
 
 
 def enrich_loop():
@@ -2416,6 +2552,8 @@ def v_account(cur, ok="", err=""):
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
+                 ("Database backups", esc(backup_note(con))),
+                 ("Backup error", '<span class="err">%s</span>' % esc(get_meta(con, "backup_error", "")) if get_meta(con, "backup_error", "") else "none"),
                  ("Honeypot", '<span class=mono>%s:%s</span> every %ss' % (esc(HP_HOST), esc(HP_PORT), POLL)),
                  ("Updates", esc(("newest release %s" % get_meta(con, "update_latest")) if get_meta(con, "update_latest") else
                                  ("not checked yet" if UPDATE_CHECK else "check turned off (HUGINN_UPDATE_CHECK=0)"))
@@ -3172,11 +3310,85 @@ class HuginnServer(ThreadingHTTPServer):
             self._release(client_address[0])
 
 
+_run_lock = None
+
+
+def hold_run_lock():
+    # Held while Huginn serves, so restore-db can see that it runs (whatever port it uses).
+    global _run_lock
+    _run_lock = open(os.path.join(DATA, ".running"), "w")
+    try:
+        fcntl.flock(_run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pass
+
+
+def is_serving():
+    try:
+        fh = open(os.path.join(DATA, ".running"), "w")
+    except OSError:
+        return False
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except OSError:
+            return True
+
+
+def need_service_user():
+    # A file made by root would be unreadable for the service.
+    if os.getuid() == 0:
+        sys.exit("Run this as Huginn's own user: runuser -u huginn -- python3 %s ..." % os.path.abspath(__file__))
+
+
+def list_backups():
+    files = backup_files()
+    if not files:
+        print("No backups in %s" % BACKUP_DIR)
+    for name, _path, size in files:
+        print("%s  %.1f MB" % (name, size / 1048576))
+
+
+def restore_db(name):
+    need_service_user()
+    if is_serving():
+        sys.exit("Huginn is running. Stop it first: systemctl stop huginn")
+    path = name if os.sep in name else os.path.join(BACKUP_DIR, name)
+    if not os.path.isfile(path):
+        sys.exit("No such backup: %s (see: app.py backups)" % name)
+    os.makedirs(DATA, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tmp = os.path.join(DATA, ".restore-%s.db" % stamp)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        with os.fdopen(fd, "wb") as out, gzip.open(path, "rb") as gz:
+            shutil.copyfileobj(gz, out, 1 << 20)
+        result = check_copy(tmp)
+    except (OSError, EOFError, zlib.error, sqlite3.Error) as e:
+        remove_quietly(tmp, tmp + "-wal", tmp + "-shm")
+        sys.exit("That backup cannot be read, nothing was changed: %s" % e)
+    remove_quietly(tmp + "-wal", tmp + "-shm")
+    if result != "ok":
+        remove_quietly(tmp)
+        sys.exit("That backup is damaged, nothing was changed: %s" % str(result)[:200])
+    kept = DB_PATH + ".before-restore-" + stamp
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(DB_PATH + suffix):
+            os.replace(DB_PATH + suffix, kept + suffix)
+    os.replace(tmp, DB_PATH)
+    print("Restored %s." % os.path.basename(path))
+    print("The database you had is kept as %s. Delete it when you are happy." % kept)
+    print("Start Huginn again. Newer events still in the honeypot's export come back at the next sync.")
+
+
 def serve():
     init_db()
     threading.Thread(target=collector_loop, daemon=True, name="collector").start()
     if ENRICH:
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
+    hold_run_lock()
+    threading.Thread(target=backup_loop, daemon=True, name="backup").start()
     srv = HuginnServer((BIND, PORT), Handler)
     print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
     srv.serve_forever()
@@ -3248,5 +3460,13 @@ if __name__ == "__main__":
         ingest_once()
     elif cmd == "import" and len(sys.argv) > 2:
         import_files(sys.argv[2:])
+    elif cmd == "backups":
+        list_backups()
+    elif cmd == "backup":
+        need_service_user()
+        init_db()
+        print("Saved %s" % backup_db())
+    elif cmd == "restore-db" and len(sys.argv) == 3:
+        restore_db(sys.argv[2])
     else:
-        sys.exit("usage: app.py [serve|set-password|ingest-once|import FILE...]")
+        sys.exit("usage: app.py [serve|set-password|ingest-once|import FILE...|backup|backups|restore-db FILE]")

@@ -3,7 +3,7 @@
 #   serve          (default) create the SSH key and learn the honeypot's host key on first start, then run Huginn
 #   key            print the line to run on the honeypot:  hp-add-huginn-key '<key>'
 #   set-password   set or reset the login password (run with: docker compose exec -it huginn huginn set-password)
-#   import FILE... / ingest-once   same as app.py
+#   import FILE... / ingest-once / backup / backups / restore-db FILE   same as app.py
 set -euo pipefail
 D="${HUGINN_BASE:-/data}"
 KEY="$D/.ssh/honeypot_ro"
@@ -39,6 +39,6 @@ case "${1:-serve}" in
     echo "huginn: if you have not yet, run this once on the honeypot (as root):  $(keyline)"
     exec python3 /app/app.py serve ;;
   key) keyline ;;
-  set-password|ingest-once|import) exec python3 /app/app.py "$@" ;;
+  set-password|ingest-once|import|backup|backups|restore-db) exec python3 /app/app.py "$@" ;;
   *) exec "$@" ;;
 esac
