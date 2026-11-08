@@ -192,7 +192,7 @@ The script asks before each optional part: OpenCanary, the endlessh tarpit and h
 
 From now on, log in with `ssh -p <your admin port> root@honeypot`.
 
-**2. On the Huginn machine** (or use [Docker](#run-huginn-in-docker))
+**2. On the Huginn machine** (or use the [Debian package](#install-with-the-debian-package) or [Docker](#run-huginn-in-docker), neither needs a clone)
 
 ```bash
 apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
@@ -211,13 +211,30 @@ The script:
 
 **Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
 
+## Install with the Debian package
+
+Every [release](https://github.com/ancientswede/Huginn/releases) has a package for the Huginn side, on Debian 12/13 and derivatives. The honeypot is still set up with `install-honeypot.sh`, because each install has to get its own random identity.
+
+```bash
+wget https://github.com/ancientswede/Huginn/releases/latest/download/huginn_all.deb
+apt install ./huginn_all.deb
+huginn-setup                  # asks for the honeypot address, then the same steps as install-huginn.sh
+```
+
+- **Update:** download the new package and run `apt install ./huginn_all.deb` again. It backs up first and goes back to the old version by itself if the new one does not start.
+- **Go back:** `huginn-rollback`.
+- **Remove:** `apt remove huginn` stops Huginn and keeps your settings and data in `/opt/huginn`. `apt purge huginn` deletes them too.
+- A machine installed with the scripts can switch by installing the package. Settings and data are kept.
+
 ## Run Huginn in Docker
 
 The Huginn side also runs as a container. **The honeypot does not:** it needs its own isolated VM or LXC with port redirects, set up with `install-honeypot.sh` as above. Never run the honeypot next to your other containers.
 
 ```bash
-git clone https://github.com/ancientswede/Huginn.git && cd Huginn
-cp docker/.env.example .env          # set HUGINN_HP_HOST (and HUGINN_HP_PORT if not 22022)
+mkdir huginn && cd huginn
+wget https://github.com/ancientswede/Huginn/releases/latest/download/docker-compose.yml
+wget -O .env https://github.com/ancientswede/Huginn/releases/latest/download/huginn.env.example
+nano .env                            # set HUGINN_HP_HOST (and HUGINN_HP_PORT if not 22022)
 docker compose up -d
 docker compose logs huginn           # shows the honeypot's key fingerprint and the line to run on the honeypot
 ```
@@ -229,7 +246,7 @@ docker compose logs huginn           # shows the honeypot's key fingerprint and 
 
 Everything Huginn keeps lives in the `huginn-data` volume: the database, session recordings, its SSH key and the honeypot's host key. The container runs as an unprivileged user with a read-only file system and no capabilities.
 
-- **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. `docker compose up -d --build` builds it yourself instead. Pin a version with `HUGINN_TAG=0.13.0` in `.env`.
+- **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. To build it yourself, clone the repository, use its `docker-compose.yml` and run `docker compose up -d --build`. Pin a version with `HUGINN_TAG=0.13.0` in `.env`.
 - **Update:** `docker compose pull && docker compose up -d`. The volume is kept.
 - **Extra bait values:** `docker compose cp bait.json huginn:/data/bait.json`, then `docker compose restart huginn`.
 - **Honeypot reinstalled** (new host key): `docker compose exec huginn rm /data/.ssh/known_hosts`, then `docker compose restart huginn` and compare the new fingerprint.

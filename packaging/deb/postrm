@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+case "$1" in
+  remove)
+    echo "Huginn is stopped. Settings and data stay in /opt/huginn; 'apt purge huginn' deletes them."
+    ;;
+  purge)
+    rm -f /etc/systemd/system/huginn.service
+    rm -rf /etc/systemd/system/huginn.service.d
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -rf /opt/huginn
+    userdel huginn >/dev/null 2>&1 || true
+    echo "Huginn and its data are deleted. Remember its key in /root/.ssh/authorized_keys on the honeypot."
+    ;;
+esac

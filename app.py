@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.21.1"
+HUGINN_VERSION = "0.21.2"
 CHANGELOG = [
+    ("0.21.2", "2026-11-08", "Releases now include a Debian package, plus Docker files that work without cloning the repository."),
     ("0.21.1", "2026-11-08", "Session logs are easier to read: download and permission commands stand out, addresses link to Search (never to the attacker's server) and captured files link to their file page."),
     ("0.21.0", "2026-11-08", "New page, Search: commands, file hashes and names, addresses inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history. Press / on any page without a filter to get there."),
     ("0.20.0", "2026-11-08", "New page, Personas: how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof."),

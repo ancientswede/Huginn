@@ -1,0 +1,15 @@
+Package: huginn
+Version: @VERSION@
+Architecture: all
+Maintainer: ancientswede <ancientswede@users.noreply.github.com>
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.10), openssh-client, ca-certificates, systemd, tzdata
+Section: net
+Priority: optional
+Homepage: https://github.com/ancientswede/Huginn
+Description: attacker intelligence and blocklists from your own honeypot
+ Huginn pulls the logs from a Cowrie honeypot on an isolated machine and shows
+ who attacks it, what they try and which files they drop, with a page per
+ attacker, campaigns and firewall blocklists.
+ .
+ After installing, run huginn-setup to connect it to your honeypot.

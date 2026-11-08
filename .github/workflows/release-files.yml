@@ -1,0 +1,44 @@
+name: Release files
+
+# Attaches the Debian package and the download-only Docker files to a published release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, e.g. v0.21.2
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  files:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build
+        run: tools/build-release.sh dist
+      - name: The tag and the code agree
+        run: |
+          ver=$(sed -nE 's/^HUGINN_VERSION = "([^"]+)".*/\1/p' app.py | head -1)
+          [ "v$ver" = "$TAG" ]
+          [ "$(dpkg-deb -f dist/huginn_all.deb Version)" = "$ver" ]
+      - name: Compose file is valid
+        run: |
+          cp dist/huginn.env.example dist/.env
+          docker compose -f dist/docker-compose.yml config -q
+          rm dist/.env
+      - name: Package installs
+        run: |
+          sudo apt-get install -y ./dist/huginn_all.deb
+          test -x /usr/sbin/huginn-setup
+          sudo huginn-setup --help
+      - name: Upload
+        run: gh release upload "$TAG" dist/huginn_all.deb dist/docker-compose.yml dist/huginn.env.example dist/SHA256SUMS --clobber

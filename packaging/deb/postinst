@@ -1,0 +1,24 @@
+#!/bin/sh
+# The code runs from /opt/huginn, which only the setup and update scripts write to. That way an
+# upgrade gets the same backup and automatic rollback as update-huginn.sh, and a machine installed
+# with the scripts can move to the package as it is.
+set -e
+[ "$1" = configure ] || exit 0
+
+SRC=/usr/share/huginn
+if [ -f /opt/huginn/app.py ] && systemctl is-enabled --quiet huginn 2>/dev/null; then
+  cmp -s "$SRC/app.py" /opt/huginn/app.py && exit 0
+  # A failed update has already put the old version back. Failing here too would only leave the package half-configured.
+  "$SRC/update-huginn.sh" || {
+    echo "WARNING: Huginn was not updated, see the message above. Try again with: apt install --reinstall ./huginn_all.deb" >&2
+  }
+  exit 0
+fi
+
+cat <<'MSG'
+
+  Huginn is unpacked. Connect it to your honeypot with:
+
+    huginn-setup
+
+MSG

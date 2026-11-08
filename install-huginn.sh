@@ -116,9 +116,13 @@ PY
 fi
 
 say "Installing packages"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq python3 openssh-client ca-certificates >/dev/null
+if command -v python3 >/dev/null && command -v ssh-keyscan >/dev/null && [ -d /etc/ssl/certs ]; then
+  ok "already installed"
+else
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq python3 openssh-client ca-certificates >/dev/null
+fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || die "Python 3.10 or newer is required."
 ok "python $(python3 -V | cut -d' ' -f2)"
 

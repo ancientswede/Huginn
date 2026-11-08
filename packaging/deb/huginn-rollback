@@ -1,0 +1,3 @@
+#!/bin/sh
+# Go back to the Huginn version from before the last update (part of Huginn, AGPL-3.0-or-later).
+exec /usr/share/huginn/update-huginn.sh --rollback "$@"

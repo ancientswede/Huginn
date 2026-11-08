@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck -S warning *.sh tools/*.sh honeypot/*.sh honeypot/hp-export honeypot/hp-logclean
+        run: shellcheck -S warning *.sh tools/*.sh honeypot/*.sh honeypot/hp-export honeypot/hp-logclean packaging/deb/huginn-* packaging/deb/post* packaging/deb/prerm
 
   docker:
     name: Docker image builds and starts

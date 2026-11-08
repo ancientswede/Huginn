@@ -1,0 +1,3 @@
+#!/bin/sh
+# Connect the packaged Huginn to a honeypot. Safe to run again (part of Huginn, AGPL-3.0-or-later).
+exec /usr/share/huginn/install-huginn.sh "$@"
