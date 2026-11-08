@@ -110,6 +110,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - files they dropped, decoy services they touched and time spent in the tarpit
   - **related attackers** (same SSH client fingerprint, same command script, same file, same /24)
   - an "always block" / "never block" switch
+- **Personas:** how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof.
 - **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH), so one botnet shows up as one group.
 - **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up on [MalwareBazaar](https://bazaar.abuse.ch) by its hash.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.

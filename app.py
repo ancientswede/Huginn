@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.19.1"
+HUGINN_VERSION = "0.20.0"
 CHANGELOG = [
+    ("0.20.0", "2026-11-08", "New page, Personas: how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof."),
     ("0.19.1", "2026-11-08", "Overview: the banner is back to its full size on computers. It stays low on phones."),
     ("0.19.0", "2026-11-08", "Campaigns: scripts that differ only in addresses, numbers or random markers are now one campaign (old links to a script campaign stop working). Attacker page: a one-line summary, sessions first with the facts in a side column on wide screens, related attackers as a count and the five latest. Sync gaps: the day charts and the Account page show when Huginn did not collect."),
     ("0.18.0", "2026-11-08", "New page: everything Huginn has never seen before since you last reviewed (files, scripts, commands, password patterns, SSH clients), with Mark all reviewed and Undo. Overview: a low banner so more fits on the first screen, today's unfinished bar is striped, rare events stand out, a change against the prior 7 days. Files: steady columns and two IOCs with the rest behind Show more. Attacker page: what the score is made of. Phone: three key numbers first, sync status back, larger touch targets. Replay: short sessions no longer leave an empty terminal."),
@@ -1735,7 +1736,7 @@ def html_attrs(st):
     return a
 
 
-NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/files", "Files"),
+NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/personas", "Personas"), ("/files", "Files"),
        ("/creds", "Credentials"), ("/blocklist", "Blocklist")]
 
 
@@ -2420,6 +2421,84 @@ def v_new(qs):
     body = ('<div class="newhead"><div><h1>New</h1><p class=muted>Never seen before, %s</p></div><div class="newact">%s</div></div>%s'
             % (esc(what), acts, '<div class="grid">%s</div>' % cards if total else '<div class="card muted">Nothing new.</div>'))
     return page("New", body, "/new")
+
+
+# A guess at "going for a payload": a download tool with a target in the same command, or a step that only makes sense
+# after one. "which wget", "curl --version" or reading authorized_keys are still looking around.
+PAYLOAD_RE = re.compile(r"\b(?:wget|curl|tftp|ftpget)\b[^;|&\n]*\s(?!-)[^\s;|&]*\.[^\s;|&]|/dev/tcp/|>>?\s*\S*authorized_keys|chmod\s+(?:[ugoa]*\+x|7[0-7]{2})\s|base64\s+-d", re.I)
+_persona_cache = {}
+
+
+def persona_stats(con):
+    # Finished sessions the honeypot let in, sorted by how far they got. Cached until the data changes (sync, import, retention).
+    key = (get_meta(con, "last_ingest", ""), con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0],
+           con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+    if _persona_cache.get("key") == key:
+        return _persona_cache["data"]
+    ev = {}
+    for sid, kind, a in con.execute("SELECT session,kind,a FROM events WHERE kind IN ('cmd','file','file_fail') AND session IS NOT NULL ORDER BY ts,rowid"):
+        x = ev.setdefault(sid, [[], False])
+        if kind == "cmd":
+            if (a or "").strip():
+                x[0].append(a)
+        else:
+            x[1] = True
+    rows, stop, ran, probe = {}, {}, {}, {}
+    for s in con.execute("SELECT session,port,proto,logins_ok FROM sessions WHERE duration IS NOT NULL"):
+        name = PERSONA.get(s["port"] or 0) or "%s:%s" % ((s["proto"] or "?").lower(), s["port"] or "?")
+        r = rows.setdefault(name, {"persona": name, "sessions": 0, "in": 0, "none": 0, "one": 0, "short": 0, "payload": 0})
+        r["sessions"] += 1
+        if not s["logins_ok"]:
+            continue
+        r["in"] += 1
+        cmds, got_file = ev.get(s["session"], ([], False))
+        if got_file or any(PAYLOAD_RE.search(c) for c in cmds):
+            r["payload"] += 1
+            many = True
+        elif not cmds:
+            r["none"] += 1
+            continue
+        elif len(cmds) == 1:
+            r["one"] += 1
+            g = probe.setdefault(cmd_shape(cmds[0]), [0, cmds[0]])
+            g[0] += 1
+            continue
+        else:
+            r["short"] += 1
+            g = stop.setdefault(cmd_shape(cmds[-1]), {"n": 0, "ex": cmds[-1], "by": {}})
+            g["n"] += 1
+            g["by"][name] = g["by"].get(name, 0) + 1
+            many = True
+        if many:
+            for shape in {cmd_shape(c) for c in cmds}:      # the denominator: only sessions that did more than one thing
+                ran[shape] = ran.get(shape, 0) + 1
+    stops = [dict(v, shape=k, ran=ran.get(k, v["n"])) for k, v in stop.items() if v["n"] >= 2]
+    data = {"rows": sorted(rows.values(), key=lambda r: -r["sessions"]),
+            "stops": sorted(stops, key=lambda v: (-v["n"], v["shape"]))[:30],
+            "probes": sorted(probe.items(), key=lambda kv: (-kv[1][0], kv[0]))[:10]}
+    _persona_cache.update(key=key, data=data)
+    return data
+
+
+def v_personas():
+    d = persona_stats(db())
+    n = lambda v: "<td class='num nw'>%s</td>" % num(v)
+    pct = lambda a, b: "<td class='num nw'>%d%%</td>" % round(a * 100.0 / b) if b else "<td class='num nw muted'>–</td>"
+    rows = "".join("<tr><td>%s</td>%s%s%s%s%s%s%s</tr>" % (tag_html(r["persona"]), n(r["sessions"]), n(r["in"]), n(r["none"]), n(r["one"]), n(r["short"]), n(r["payload"]), pct(r["payload"], r["short"] + r["payload"]))
+                   for r in d["rows"])
+    stops = "".join("<tr><td class='mono wrap'>%s</td>%s%s%s<td>%s</td></tr>" % (esc(clean(s["ex"], 300)), n(s["n"]), n(s["ran"]), pct(s["n"], s["ran"]),
+                    " ".join("%s <span class=muted>%s</span>" % (tag_html(k), num(v)) for k, v in sorted(s["by"].items(), key=lambda x: -x[1]))) for s in d["stops"])
+    probes = "".join("<tr><td class='mono wrap'>%s</td>%s</tr>" % (esc(clean(v[1], 300)), n(v[0])) for _k, v in d["probes"])
+    empty = lambda cols: '<tr><td colspan=%d class=muted>Nothing yet</td></tr>' % cols
+    body = ('<h1>Personas</h1><p class=muted>How far attackers get on each fake machine. Finished sessions, by port, under the current persona names.</p>'
+            '<div class="card"><table class="wide"><thead><tr><th>Persona</th><th class=num>Sessions</th><th class=num>Got in</th><th class=num>No command</th><th class=num>One line</th>'
+            '<th class=num>Stopped short</th><th class=num>Went for payload</th><th class=num>Payload share</th></tr></thead><tbody>%s</tbody></table>'
+            '<p class="muted small note">One line: a single input line, then gone. Stopped short: several lines, no download seen. Went for payload is a best guess from files and commands. Payload share is of the last two columns.</p></div>'
+            '<h2>Where they stopped</h2><p class=muted>The last line before a session with several lines ended with no download seen. A hint, not proof: they may have spotted the fake or simply been done.</p>'
+            '<div class="card"><table class="wide"><thead><tr><th>Last command, example</th><th class=num>Stopped here</th><th class=num>Ran it</th><th class=num>Stop rate</th><th>Persona</th></tr></thead><tbody>%s</tbody></table></div>'
+            '<h2>One-line sessions</h2><div class="card"><table class="wide"><thead><tr><th>Command, example</th><th class=num>Sessions</th></tr></thead><tbody>%s</tbody></table></div>'
+            % (rows or empty(8), stops or empty(5), probes or empty(2)))
+    return page("Personas", body, "/personas")
 
 
 def v_files():
@@ -3139,7 +3218,7 @@ copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copi
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
 (function(){
-var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
+var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g p','Personas'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
 ['/','Search / filter'],['t','Switch theme'],['Space','Play / pause a replay'],['?','This help'],['Esc','Close']];
 var box=null;function hide(){if(box){box.remove();box=null}}
 function show(){if(box){hide();return}box=document.createElement('div');box.className='kbd-help';var c=document.createElement('div');c.className='card';
@@ -3147,7 +3226,7 @@ var h=document.createElement('h3');h.textContent='Keyboard shortcuts';c.appendCh
 var a=document.createElement('kbd');a.textContent=k[0];var b=document.createElement('span');b.textContent=k[1];r.appendChild(a);r.appendChild(b);c.appendChild(r)});
 box.appendChild(c);box.addEventListener('click',function(e){if(e.target===box)hide()});document.body.appendChild(box)}
 var hb=document.getElementById('kbdHelp');if(hb)hb.addEventListener('click',function(e){e.preventDefault();show()});
-var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
+var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',p:'/personas',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
 document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.metaKey||e.altKey)return;
 if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
 var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
@@ -3258,6 +3337,7 @@ CSS += (".story{font-size:15px;margin:8px 0}.ip-w{display:grid;grid-template-col
         ".rel-r{flex:1;min-width:0}.rel-more summary{cursor:pointer;color:var(--accent);font-size:13px;margin-top:4px}.rel-more .rel-ips{margin-top:4px;max-height:none}"
         ".bcol{position:relative}.bcol.gapd::after{content:'';position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);width:100%;max-width:44px;height:3px;background:var(--orange)}"
         ".gap-note{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-top:6px}.gap-note i{display:block;width:14px;height:3px;background:var(--orange)}")
+CSS += ".note{margin:10px 0 0}"
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -3469,6 +3549,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_files())
         if path == "/new":
             return self.send(200, v_new(qs))
+        if path == "/personas":
+            return self.send(200, v_personas())
         if path == "/creds":
             return self.send(200, v_creds(qs))
         m = re.fullmatch(r"/creds/export\.(txt|csv)", path)
