@@ -232,7 +232,24 @@ for i in range(2):
     if i == 0:
         ev(rnd_ts(2), ip, "canary", "canary", None, "redis", json.dumps({"CMD": "AUTH", "ARGS": BAIT["redis"]}))
 
+# 12. The web trap's identities: a few NAS and router brands over the last two weeks, each drawing its own traffic
+WEB_IDENTITIES = [(13.5, "synology", "nas", "Synology DS923+", 11), (9.0, "mikrotik", "router", "MikroTik hAP ax3", 24), (6.0, "qnap", "nas", "QNAP TS-464", 15),
+                  (3.5, "tp-link", "router", "TP-Link AX55", 31), (1.5, "wd-mycloud", "nas", "WD EX2 Ultra", 9)]
+WEB_PATHS = ["/", "/login", "/admin", "/.env", "/cgi-bin/luci", "/boot.ini", "/webfig/", "/cgi-bin/qnap.cgi", "/api/auth.cgi", "/wp-login.php"]
+web_lines, web_ips = [], [ip for ip, d in ips.items() if d["kind"] != "research"]
+for i, (ago_days, ident, kind, label, per_day) in enumerate(WEB_IDENTITIES):
+    start = NOW - ago_days * 86400
+    end = NOW - WEB_IDENTITIES[i + 1][0] * 86400 if i + 1 < len(WEB_IDENTITIES) else NOW
+    web_lines.append("%d %s %s %s" % (start, ident, kind, label))
+    for _ in range(int((end - start) / 86400 * per_day)):
+        ts, ip = R.uniform(start, end), R.choice(web_ips)
+        if R.random() < 0.18:
+            ev(ts, ip, "canary", "canary", None, R.choice(["http", "https"]), "%s / %s" % (R.choice(USERS), R.choice(PASSWORDS)))
+        else:
+            ev(ts, ip, "canary", "canary", None, R.choice(["http", "https"]), "GET %s (404)  · Mozilla/5.0" % R.choice(WEB_PATHS))
+
 app.store(con, rows)
+app.apply_honeypot_meta(con, {"identities": app.parse_identities(web_lines)})
 app.store_files(con, [{"sha": f["sha"], "src": "redir" if "script" in f["type"] else "download", "size": f["size"], "type": f["type"],
                        "arch": f["arch"], "packed": f["packed"], "iocs": f["iocs"], "mtime": NOW - R.uniform(0, 5) * 86400, "family": f.get("family", "")} for f in FILES])
 with con:
