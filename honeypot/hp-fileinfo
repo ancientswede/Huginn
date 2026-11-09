@@ -3,10 +3,12 @@
 # NEVER executes anything: reads bytes only, in pure Python (no libmagic/strings on attacker-controlled data).
 # Caches per file in /var/lib/hp-export/fileinfo.json, prints one JSON line per file (sha, size, type, arch, packed, iocs,
 # family = a best guess from known strings).
-import base64, binascii, hashlib, ipaddress, json, os, re, struct, sys
+import base64, binascii, hashlib, ipaddress, json, os, re, struct, sys, time
 DIRS = os.environ.get("HP_DOWNLOAD_DIRS", "/home/cowrie/cowrie/var/lib/cowrie/downloads").split()
 CACHE = os.environ.get("HP_FILEINFO_CACHE", "/var/lib/hp-export/fileinfo.json")
 MAXREAD = 8 * 1024 * 1024
+MAX_IOCS = 60
+TIME_BUDGET = 80          # seconds of analysis per run; the export gives this tool 120. The rest waits for the next run.
 EM = {3: "x86", 8: "mips", 20: "powerpc", 40: "arm", 62: "x86-64", 183: "arm64", 2: "sparc", 43: "sparc64", 42: "superh", 243: "riscv", 21: "powerpc64", 4: "m68k", 22: "s390"}
 URL_RE = re.compile(rb"(?:https?|ftp|tftp)://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{4,200}")
 IP_RE = re.compile(rb"(?<![\d.])(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?(?![\d.])")
@@ -89,11 +91,14 @@ def family(b):
 
 
 def iocs(b):
-    out = []
+    out, seen = [], set()
     for m in URL_RE.finditer(b):
         u = m.group(0).decode("ascii", "replace").rstrip(".,;'\")")
-        if u not in out:
+        if u not in seen:
+            seen.add(u)
             out.append(u)
+            if len(out) >= MAX_IOCS:       # attacker data: stop at the limit, a file can hold millions of these
+                return out
     for m in IP_RE.finditer(b):
         ip = m.group(1).decode()
         try:
@@ -105,16 +110,16 @@ def iocs(b):
         v = ip + (":" + m.group(2).decode() if m.group(2) else "")
         if v not in out and not any(v in u for u in out):
             out.append(v)
-        if len(out) >= 60:
+        if len(out) >= MAX_IOCS:
             break
-    return out[:60]
+    return out[:MAX_IOCS]
 
 def main():
     try:
         cache = json.load(open(CACHE))
     except Exception:
         cache = {}
-    changed = False
+    changed, started = False, time.monotonic()
     for d in DIRS:
         try:
             names = os.listdir(d)
@@ -133,14 +138,20 @@ def main():
             c = cache.get(n)
             if c and c.get("size") == st.st_size and c.get("v") == 4:
                 continue
-            with open(p, "rb") as fh:
-                b = fh.read(MAXREAD)
-            typ, arch = classify(b)
-            u = unpack(b)
+            if time.monotonic() - started > TIME_BUDGET:     # keep what is done; the next export carries on
+                continue
+            try:
+                with open(p, "rb") as fh:
+                    b = fh.read(MAXREAD)
+                typ, arch = classify(b)
+                u = unpack(b)
+                found_iocs, found_family = iocs(u), family(u)
+            except Exception:                 # one odd file must not cost the results of all the others
+                continue
             sha = n if re.fullmatch(r"[0-9a-f]{64}", n) else hashlib.sha256(b).hexdigest()
             cache[n] = {"sha": sha, "src": "redir" if n.startswith("redir") else "download", "size": st.st_size, "mtime": int(st.st_mtime), "type": typ, "arch": arch,
-                        "packed": b"UPX!" in b[:4096] or b"UPX!" in b[-4096:], "iocs": iocs(u),
-                        "family": family(u), "v": 4}
+                        "packed": b"UPX!" in b[:4096] or b"UPX!" in b[-4096:], "iocs": found_iocs,
+                        "family": found_family, "v": 4}
             changed = True
     if changed:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)

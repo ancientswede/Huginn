@@ -1,5 +1,5 @@
 # The rotating web identity: the catalogue on the honeypot and what Huginn does with its history.
-import importlib.machinery, importlib.util, os, re, tempfile, time, unittest
+import importlib.machinery, importlib.util, json, os, re, tempfile, time, unittest
 from unittest import mock
 
 from tests.helpers import app, ROOT
@@ -151,12 +151,74 @@ class Change(unittest.TestCase):
     def test_interrupted_change_is_undone_by_the_next_run(self):
         before = dict(self.conf)
         os.makedirs(tool.STATE)
-        tool.save_pending(before)
+        tool.save_pending(before, 1800000000, "qnap")
         self.conf["http.banner"] = "half done"
-        with mock.patch.object(tool, "restart") as r:
+        with mock.patch.object(tool, "restart") as r, mock.patch.object(tool, "serving", return_value=True):
             tool.recover()
         self.assertEqual(self.conf, before)
         r.assert_called_once()
+        self.assertFalse(os.path.exists(tool.PENDING))
+
+    def test_a_note_from_the_previous_version(self):
+        os.makedirs(tool.STATE)
+        with open(tool.PENDING, "w") as fh:
+            json.dump({"http.banner": "old"}, fh)
+        self.conf["http.banner"] = "half done"
+        with mock.patch.object(tool, "restart"), mock.patch.object(tool, "serving", return_value=True):
+            tool.recover()
+        self.assertEqual(self.conf["http.banner"], "old")
+
+    def test_history_line_is_removed_when_the_change_is_undone(self):
+        real = tool.add_history
+        def half(stamp, ident, label):
+            real(stamp, ident, label)
+            raise OSError("fsync failed")
+        with mock.patch.object(tool, "restart"), mock.patch.object(tool, "serving", return_value=True), mock.patch.object(tool, "add_history", half):
+            with self.assertRaises(SystemExit):
+                tool.apply_identity(tool.IDENTITIES["qnap"])
+        self.assertEqual(tool.history(), [])
+
+    def test_recovery_checks_the_service_even_without_a_banner(self):
+        os.makedirs(tool.STATE)
+        tool.save_pending({"http.skin": "nasLogin"}, 1800000000, "asus")
+        with mock.patch.object(tool, "restart"), mock.patch.object(tool, "serving", return_value=False) as chk:
+            with self.assertRaises(SystemExit):
+                tool.recover()
+        chk.assert_called_once()
+        self.assertTrue(os.path.exists(tool.PENDING))
+
+    def test_a_note_of_the_wrong_shape_is_set_aside(self):
+        os.makedirs(tool.STATE)
+        with open(tool.PENDING, "w") as fh:
+            fh.write("[1, 2]")
+        tool.recover()
+        self.assertTrue(os.path.exists(tool.PENDING + ".bad"))
+
+    def test_a_finished_change_is_not_undone(self):
+        os.makedirs(tool.STATE)
+        tool.save_pending({"http.banner": "old"}, 1800000000, "asus")
+        tool.add_history(1800000000, tool.IDENTITIES["asus"], "ASUS RT-AC68U")
+        self.conf["http.banner"] = "httpd/2.0"
+        with mock.patch.object(tool, "restart") as r:
+            tool.recover()
+        self.assertEqual(self.conf["http.banner"], "httpd/2.0")
+        r.assert_not_called()
+        self.assertFalse(os.path.exists(tool.PENDING))
+
+    def test_recovery_keeps_its_note_until_the_service_answers(self):
+        os.makedirs(tool.STATE)
+        tool.save_pending({"http.banner": "old"}, 1800000000, "asus")
+        with mock.patch.object(tool, "restart"), mock.patch.object(tool, "serving", return_value=False):
+            with self.assertRaises(SystemExit):
+                tool.recover()
+        self.assertTrue(os.path.exists(tool.PENDING))
+
+    def test_unreadable_note_is_kept_for_a_human(self):
+        os.makedirs(tool.STATE)
+        with open(tool.PENDING, "w") as fh:
+            fh.write("{broken")
+        tool.recover()
+        self.assertTrue(os.path.exists(tool.PENDING + ".bad"))
         self.assertFalse(os.path.exists(tool.PENDING))
 
     def test_only_one_change_at_a_time(self):
@@ -237,10 +299,24 @@ class Huginn(unittest.TestCase):
     def test_pruned_time_is_not_counted_as_quiet(self):
         t0 = int(NOW) - 30 * 86400
         self.announce("%d qnap nas QNAP TS-264" % t0, "%d asus router ASUS RT-AX58U" % (t0 + 20 * 86400), "%d tp-link router TP-Link AX55" % (t0 + 25 * 86400))
-        self.hit("a", t0 + 22 * 86400, "GET /a (404)")          # everything older has been pruned
+        self.hit("a", t0 + 22 * 86400, "GET /a (404)")          # everything older has been pruned, or was never collected
         rows = {r["id"]: r for r in app.identity_stats(self.con)}
         self.assertNotIn("qnap", rows)
         self.assertAlmostEqual(rows["asus"]["secs"] / 86400, 3, delta=0.01)
+
+    def test_quiet_time_while_collecting_counts_as_zero(self):
+        t0 = int(NOW) - 21 * 86400
+        app.store(self.con, [("ssh", t0, "198.51.100.77", "cowrie", "connect", "sess00000001", "ssh", "2225")])
+        self.announce("%d qnap nas QNAP TS-264" % t0)
+        self.hit("late", int(NOW) - 86400, "GET /late (404)")   # the first web hit, on day 20 of 21
+        self.assertAlmostEqual(app.identity_stats(self.con)[0]["per_day"], 1 / 21.0, places=3)
+
+    def test_a_compromised_honeypot_cannot_fill_the_table(self):
+        future = int(NOW) + 10 * 86400
+        self.announce("%d qnap nas QNAP TS-264" % future)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM web_identities").fetchone()[0], 0)
+        self.announce(*["%d qnap nas QNAP TS-264" % (int(NOW) - 3000 - i) for i in range(500)])
+        self.assertLessEqual(self.con.execute("SELECT COUNT(*) FROM web_identities").fetchone()[0], 2000)
 
     def test_login_with_a_method_as_user_name(self):
         t0 = int(NOW) - 86400

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.23.0"
+HUGINN_VERSION = "0.23.1"
 CHANGELOG = [
+    ("0.23.1", "2026-11-09", "Security and bug hunt. Fixed: a specially crafted command line could freeze Huginn for minutes, web requests were counted as logins on the password lists, a failed update of New left permanent holes, backup and restore could collide, restore accepted a database that was not Huginn's, one huge captured file could stop all file analysis, firewall feeds did not clear IPv6 when the list became empty, a reverse DNS name containing a word like research could keep an attacker off the blocklist, and the database file was readable by other users on the machine."),
     ("0.23.0", "2026-11-09", "The web trap can pretend to be many NAS and router brands and changes by itself every few weeks (hp-identity on the honeypot, ROTATE_DAYS sets how often, 0 turns it off). Personas shows which device drew the most attention, per day, because each one runs for a different time."),
     ("0.22.0", "2026-11-09", "A visual pass: the attacker page is headed by its address, phones get shorter lists with paging at the top and readable rows, campaigns and New lead with the commands instead of a hash, rare finds (bait, files, exploits) have their own warm colour, Replay looks like a terminal and has a timeline, Personas shows how far attackers got as bars, and empty sections no longer draw empty tables. Two small extras: the raven in the header reacts once to a new file or used bait, and Time wasted has a receipt."),
     ("0.21.2", "2026-11-08", "Releases now include a Debian package, plus Docker files that work without cloning the repository."),
@@ -196,6 +197,22 @@ RESEARCH_RE = re.compile(
     r"netsystemsresearch|recyber|alphastrike|bitsight|paloaltonetworks|expanse|driftnet|rapid7|"
     r"internettl|quadmetrics|intrinsec|zoomeye|natlas|ipip\.net|academic|research|"
     r"probe-?net|projectdiscovery|modat|hadrian|cyber\.casa|securitytrails|fofa", re.I)
+# Whoever controls an address chooses its reverse DNS, so a name only counts when it ends in a known scanner's domain.
+RESEARCH_DOMAINS = ("shodan.io", "censys-scanner.com", "censys.io", "binaryedge.ninja", "binaryedge.io", "shadowserver.org", "shadowserver.io", "academyforinternetresearch.org", "gatech.edu", "mpg.de", "tu-dresden.de", "internet-measurement.com",
+                    "stretchoid.com", "onyphe.net", "onyphe.io", "criminalip.io", "criminalip.com", "leakix.net", "netsystemsresearch.com", "recyber.net",
+                    "alphastrike.io", "bitsight.com", "bitsighttech.com", "paloaltonetworks.com", "expanseinc.com", "driftnet.io", "rapid7.com", "internettl.org",
+                    "quadmetrics.com", "intrinsec.com", "zoomeye.org", "ipip.net", "projectdiscovery.io", "modat.io", "hadrian.io", "cyber.casa",
+                    "securitytrails.com", "fofa.info", "probe-net.net")
+
+
+def research_flag(rdns, org, isp, hostnames, rdns_ok=None):
+    # rdns_ok: 1 the name points back to this address, anything else it has not been shown to. This is an exception from
+    # blocking, so unknown does not count. `hostnames` is not checked at all, so it cannot grant anything.
+    if rdns_ok == 1:
+        n = str(rdns or "").strip().lower().rstrip(".")
+        if any(n == d or n.endswith("." + d) for d in RESEARCH_DOMAINS):
+            return 1
+    return 1 if RESEARCH_RE.search(" ".join(str(v) for v in (org, isp) if v)) else 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(h TEXT PRIMARY KEY, ts REAL, ip TEXT, src TEXT, kind TEXT, session TEXT, a TEXT, b TEXT);
@@ -238,14 +255,27 @@ def connect():
     return con
 
 
+def tighten_data():
+    # Password hash, feed token and everything collected: not for other users on the machine. Older installs were world-readable.
+    for path, mode in [(DATA, 0o750), (TTY_DIR, 0o750)] + [(DB_PATH + x, 0o640) for x in ("", "-wal", "-shm")]:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
 def init_db():
     os.makedirs(DATA, exist_ok=True)
+    tighten_data()
     con = connect()
     con.executescript(SCHEMA)
+    tighten_data()
+    if "rdns_ok" not in [r[1] for r in con.execute("PRAGMA table_info(enrich)")]:
+        con.execute("ALTER TABLE enrich ADD COLUMN rdns_ok INTEGER")
+        con.execute("UPDATE enrich SET fetched=0 WHERE research=1")       # look these up again soon, now with the forward check
     # Re-evaluate the research flag with the current rules (cheap, runs at start).
-    for ip, rd, org, isp, hn in con.execute("SELECT ip, rdns, org, isp, hostnames FROM enrich").fetchall():
-        hay = " ".join(str(v) for v in (rd, org, isp, hn) if v)
-        con.execute("UPDATE enrich SET research=? WHERE ip=?", (1 if RESEARCH_RE.search(hay) else 0, ip))
+    for ip, rd, org, isp, hn, ok in con.execute("SELECT ip, rdns, org, isp, hostnames, rdns_ok FROM enrich").fetchall():
+        con.execute("UPDATE enrich SET research=? WHERE ip=?", (research_flag(rd, org, isp, hn, ok), ip))
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
     if "tty" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
@@ -413,8 +443,8 @@ def p_canary(line):
         ld.pop(k, None)
     user, pw = ld.get("USERNAME") or ld.get("USER"), ld.get("PASSWORD")
     if user or pw:
-        b = "%s / %s" % (user or "", pw or "")
-    elif svc in ("http", "https") and ld.get("PATH"):
+        return (datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp(), ip, "canary", "canary", None, svc, trunc("%s / %s" % (user or "", pw or ""), 600))
+    if svc in ("http", "https") and ld.get("PATH"):
         b = "%s %s%s" % (ld.get("METHOD") or "GET", ld.get("PATH"), " (%s)" % ld["STATUS"] if ld.get("STATUS") else "")
         if ld.get("BODY"):
             b += "  body: " + str(ld["BODY"])[:300]
@@ -424,7 +454,7 @@ def p_canary(line):
         ld2 = {k: v for k, v in ld.items() if "Challenge" not in k and "Response" not in k}
         b = json.dumps(ld2, ensure_ascii=False) if ld2 else ""
     ts = datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp()
-    return (ts, ip, "canary", "canary", None, svc, trunc(b, 600))
+    return (ts, ip, "canary", "canary", None, svc, trunc(not_a_login(b), 600))
 
 
 RE_ENDLESSH = re.compile(r"^(\S+) CLOSE host=(\S+) port=(\d{1,5}) fd=\d+ time=(\d{1,8}(?:\.\d{1,6})?)(?:\s|$)")
@@ -444,6 +474,11 @@ def p_endlessh(line):
     return None
 
 
+def not_a_login(text):
+    # " / " between user and password is what marks a stored login. Anything else an attacker wrote must not look like one.
+    return re.sub(r"(?<= )/(?= )", "\u2044", text)       # lookarounds: " / / " shares its middle space
+
+
 def p_traps(line):
     # hp-traps (our own service on the honeypot): stored as "canary" events, a = service, b = summary.
     if not line.startswith("{"):
@@ -458,9 +493,9 @@ def p_traps(line):
         if ev.get("database"):
             b += "  (db %s)" % ev["database"]
     elif e == "mail":
-        b = "relay: %s -> %s recipient(s): %s" % (ev.get("mail_from") or "?", ev.get("rcpt_count") or 0, ev.get("subject") or "")
+        b = not_a_login("relay: %s -> %s recipient(s): %s" % (ev.get("mail_from") or "?", ev.get("rcpt_count") or 0, ev.get("subject") or ""))
     elif e == "proxy":
-        b = "proxy -> %s" % (ev.get("target") or "?")
+        b = not_a_login("proxy -> %s" % (ev.get("target") or "?"))
     elif e == "connect":
         b = ""
     else:
@@ -532,8 +567,11 @@ def parse_identities(lines):
 def apply_honeypot_meta(con, meta):
     # Personas and bait announced by the honeypot. Stored so they survive a restart; a change of bait re-checks every attacker.
     if meta.get("identities"):
+        # The honeypot's word only: nothing from the future, and a limit on how much it can ask us to keep.
+        latest = time.time() + 86400
         with con:
-            con.executemany("INSERT OR IGNORE INTO web_identities(ts,id,kind,label) VALUES(?,?,?,?)", meta["identities"])
+            con.executemany("INSERT OR IGNORE INTO web_identities(ts,id,kind,label) VALUES(?,?,?,?)", [x for x in meta["identities"] if x[0] <= latest])
+            con.execute("DELETE FROM web_identities WHERE ts NOT IN (SELECT ts FROM web_identities ORDER BY ts DESC LIMIT 2000)")
     if meta.get("has_personas"):
         set_meta(con, "hp_personas", json.dumps({str(k): v for k, v in meta["personas"].items()}))
     if meta.get("has_bait"):
@@ -963,15 +1001,38 @@ def recompute_ip(con, ip):
                  c["n"], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
 
 
+def retry_seen(con):
+    # Nothing new in this export. A failed update of New is finished here, or it would wait for the next new log line.
+    done = get_meta(con, "seen_rowid")
+    if not done or not done.isdigit() or int(done) >= con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]:
+        return
+    try:
+        note_seen(con, None)
+    except Exception as e:
+        if con.in_transaction:
+            con.rollback()
+        set_meta(con, "last_seen_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
+
+
 def store(con, rows):
     if not rows:
+        retry_seen(con)
         return 0
     before = con.total_changes
-    top = con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]      # everything added below is above this
+    # New works from a saved position, so lines from a failed update are picked up by the next one. No position yet (first
+    # run after an upgrade), or one above the highest rowid (rows deleted, rowids may be reused): start from here. Saved in
+    # the same transaction as the events, so a crash in between cannot lose them, and decided under the write lock, so
+    # another writer cannot have moved it in the meantime.
     sess = {r[5] for r in rows if r[5]}
     ips = {r[2] for r in rows}
     # One transaction: events and their totals are saved together. One bad session or IP must not stop the whole sync.
     with con:
+        con.execute("BEGIN IMMEDIATE")
+        top = con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]
+        done = get_meta(con, "seen_rowid")
+        if not done or not done.isdigit() or int(done) > top:
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_rowid',?)", (str(top),))
+        before = con.total_changes
         con.executemany("INSERT OR IGNORE INTO events(h,ts,ip,src,kind,session,a,b) VALUES(?,?,?,?,?,?,?,?)", rows)
         inserted = con.total_changes - before
         for fn, keys in ((recompute_session, sess), (recompute_ip, ips)):
@@ -981,7 +1042,7 @@ def store(con, rows):
                 except (ValueError, TypeError, OverflowError, sqlite3.Error) as e:
                     sys.stderr.write("recompute %s: %r\n" % (k, e))
     try:
-        note_seen(con, top)
+        note_seen(con, None)
     except Exception as e:                 # never let the "New" page get in the way of collecting data
         if con.in_transaction:
             con.rollback()
@@ -1016,6 +1077,11 @@ def _blob(m):
     return "<blob>" if re.search(r"[0-9]", s) and re.search(r"[a-z]", s) and re.search(r"[A-Z]", s) else s
 
 
+# An IPv6 candidate: a run of hex digits and colons with at least two colons. The lookahead cannot overlap the run it
+# guards (no colon in its hex classes), so this stays linear. Three "*" over the same characters took minutes on one line.
+V6_TOKEN = r"(?<![\w:.])(?=[0-9a-fA-F]*:[0-9a-fA-F]*:)[0-9a-fA-F:]+(?![\w:.])"
+
+
 def _v6(m):
     try:
         ipaddress.IPv6Address(m.group(0))
@@ -1028,7 +1094,7 @@ def cmd_shape(s):
     # Same command with other addresses, numbers or payloads = same shape. Order matters: numbers go last.
     s = re.sub(r"(\\x[0-9a-fA-F]{2})+", "<bytes>", (s or "").strip()[:2000])
     s = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "<ip>", s)
-    s = re.sub(r"(?<![\w:.])[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*(?![\w:.])", _v6, s)
+    s = re.sub(V6_TOKEN, _v6, s)
     s = re.sub(r"(?<![0-9a-zA-Z])[0-9a-fA-F]{8,}(?![0-9a-zA-Z])", "<hex>", s.replace("_", "_ ")).replace("_ ", "_")    # also inside check_1f3a...
     s = re.sub(r"(?<![\w+/])[A-Za-z0-9+/]{24,}={0,2}(?![\w+/])", _blob, s)      # needs digits and both cases, so paths survive
     s = re.sub(r"\d+", "<n>", s)
@@ -1056,16 +1122,30 @@ def session_commands(con, sid):
     return [x[0] or "" for x in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts,rowid", (sid,))]
 
 
-def note_seen(con, after):
+def note_seen(con, after=None):
     # Remembers when Huginn first saw each thing. Time of arrival, not of the log line, so late or imported lines are
-    # never missed, and the list survives retention. `after` is the highest rowid before this store: SQLite can reuse
-    # rowids once rows are deleted, so a saved position would not be safe. The very first run reads the whole history
-    # and dates it by its log times.
+    # never missed, and the list survives retention. Position and results are read and written in one transaction, so two
+    # writers (the sync and an import) cannot count the same lines. The very first run reads the whole history and dates it
+    # by its log times.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        _note_seen(con, after)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+
+def _note_seen(con, after):
     first, now = get_meta(con, "seen_done") is None, time.time()
+    if after is None:
+        v = get_meta(con, "seen_rowid")
+        after = int(v) if v and v.isdigit() else 0
     after = 0 if first else after
+    upto = con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]
     got = {}
-    for rid, ts, ip, sess, kind, a, b in con.execute("SELECT rowid,ts,ip,session,kind,a,b FROM events WHERE rowid>? AND "
-                                                     "kind IN ('cmd','file','login_ok','login_fail','closed') ORDER BY rowid", (after,)):
+    for rid, ts, ip, sess, kind, a, b in con.execute("SELECT rowid,ts,ip,session,kind,a,b FROM events WHERE rowid>? AND rowid<=? AND "
+                                                     "kind IN ('cmd','file','login_ok','login_fail','closed') ORDER BY rowid", (after, upto)):
         if kind == "closed":                # a finished session: its whole command list, in shapes, is one script
             cmds = session_commands(con, sess)
             k, key, ex = "script", script_hash(cmds), next((c for c in cmds if c), "")
@@ -1080,12 +1160,13 @@ def note_seen(con, after):
                 g[:4] = [ts, ip, sess, clean(ex or "", 300)]
         else:
             got[(k, key)] = [ts if first else now, ip, sess, clean(ex or "", 300), 1]
-    with con:
-        con.executemany("INSERT INTO seen(kind,key,observed,ip,session,ex,n) VALUES(?,?,?,?,?,?,?) "
-                        "ON CONFLICT(kind,key) DO UPDATE SET n=n+excluded.n", [(k[0], k[1], *v) for k, v in got.items()])
-        con.execute("INSERT OR IGNORE INTO seen(kind,key,observed,ip,session,ex,n) SELECT 'hassh',hassh,CASE WHEN ? THEN MIN(start) ELSE ? END,"
-                    "ip,session,version,1 FROM sessions WHERE hassh IS NOT NULL GROUP BY hassh", (first, now))
-        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_done','1')")
+    con.executemany("INSERT INTO seen(kind,key,observed,ip,session,ex,n) VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(kind,key) DO UPDATE SET n=n+excluded.n", [(k[0], k[1], *v) for k, v in got.items()])
+    con.execute("INSERT OR IGNORE INTO seen(kind,key,observed,ip,session,ex,n) SELECT 'hassh',hassh,CASE WHEN ? THEN MIN(start) ELSE ? END,"
+                "ip,session,version,1 FROM sessions WHERE hassh IS NOT NULL GROUP BY hassh", (first, now))
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_done','1')")
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_rowid',?)", (str(upto),))
+    con.execute("DELETE FROM meta WHERE k='last_seen_error'")
 
 
 def review_at(con):
@@ -1328,9 +1409,27 @@ def ext_text(v, n=200):
     return v or None
 
 
+def rdns_confirmed(name, ip):
+    # Reverse DNS is whatever the owner of the address writes. Only its forward lookup can be trusted to belong to that domain.
+    try:
+        infos = _rdns_pool.submit(lambda: socket.getaddrinfo(name, None)).result(timeout=4)
+    except socket.gaierror:
+        return 0
+    except Exception:                   # a timeout says nothing either way
+        return None
+    want = ipaddress.ip_address(ip)
+    for info in infos:
+        try:
+            if ipaddress.ip_address(str(info[4][0]).split("%")[0]) == want:
+                return 1
+        except ValueError:
+            pass
+    return 0
+
+
 def enrich_ip(ip):
     d = {"cc": None, "country": None, "city": None, "asn": None, "org": None, "isp": None, "rdns": None,
-         "ports": None, "tags": None, "vulns": None, "hostnames": None}
+         "ports": None, "tags": None, "vulns": None, "hostnames": None, "rdns_ok": None}
     ok = 0
     try:
         j = http_json("https://ipwho.is/%s?fields=success,country,country_code,city,connection" % urllib.parse.quote(ip))
@@ -1358,8 +1457,8 @@ def enrich_ip(ip):
     except Exception:
         pass
     # Only names count: Shodan's "scanner" tag just means "seen scanning", which every attacker is.
-    hay = " ".join(str(v) for v in (d["rdns"], d["org"], d["isp"], d["hostnames"]) if v)
-    research = 1 if RESEARCH_RE.search(hay) else 0
+    d["rdns_ok"] = rdns_confirmed(d["rdns"], ip) if d["rdns"] else None
+    research = research_flag(d["rdns"], d["org"], d["isp"], d["hostnames"], d["rdns_ok"])
     return d, ok, research
 
 
@@ -1394,6 +1493,24 @@ def check_copy(path):
         con.close()
 
 
+def check_is_huginn(path):
+    # quick_check says the file is a sound SQLite database, not that it is ours: an empty one passes too.
+    con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(path), uri=True, timeout=30)
+    try:
+        # What every version has had. Newer columns are added at start, so an older backup is fine without them.
+        need = {"events": {"h", "ts", "ip", "src", "kind", "session", "a", "b"}, "sessions": {"session", "ip", "start"},
+                "ips": {"ip", "first", "last", "score", "tags"}, "meta": {"k", "v"}}
+        for table, cols in sorted(need.items()):
+            have = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
+            if not have:
+                return "not a Huginn database (no table %s)" % table
+            if not cols <= have:
+                return "not a Huginn database (table %s lacks %s)" % (table, ", ".join(sorted(cols - have)))
+        return "ok"
+    finally:
+        con.close()
+
+
 def remove_quietly(*paths):
     for p in paths:
         try:
@@ -1404,6 +1521,16 @@ def remove_quietly(*paths):
 
 def backup_db():
     os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    # One at a time: the scheduled one and "app.py backup" would otherwise delete each other's work files.
+    with open(os.path.join(BACKUP_DIR, ".lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError("another backup is running")
+        return _backup_db_locked()
+
+
+def _backup_db_locked():
     size = os.path.getsize(DB_PATH)
     st = os.statvfs(BACKUP_DIR)
     if st.f_bavail * st.f_frsize < size * 2:
@@ -1412,7 +1539,7 @@ def backup_db():
         if n.startswith(".tmp-"):
             remove_quietly(os.path.join(BACKUP_DIR, n))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    tmp_db, tmp_gz = os.path.join(BACKUP_DIR, ".tmp-%s.db" % stamp), os.path.join(BACKUP_DIR, ".tmp-%s.gz" % stamp)
+    tmp_db, tmp_gz = os.path.join(BACKUP_DIR, ".tmp-%s-%d.db" % (stamp, os.getpid())), os.path.join(BACKUP_DIR, ".tmp-%s-%d.gz" % (stamp, os.getpid()))
     final = os.path.join(BACKUP_DIR, "huginn-%s.db.gz" % stamp)
     try:
         src = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(DB_PATH), uri=True, timeout=30)
@@ -1507,9 +1634,9 @@ def enrich_loop():
                 d, ok, research = enrich_ip(ip)
                 fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:
-                    con.execute("INSERT OR REPLACE INTO enrich VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    con.execute("INSERT OR REPLACE INTO enrich VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (ip, fetched, ok, d["cc"], d["country"], d["city"], d["asn"], d["org"], d["isp"],
-                                 d["rdns"], d["ports"], d["tags"], d["vulns"], d["hostnames"], research))
+                                 d["rdns"], d["ports"], d["tags"], d["vulns"], d["hostnames"], research, d.get("rdns_ok")))
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
@@ -2189,7 +2316,7 @@ def v_ips(qs, mobile=False):
 
 
 CMD_TOKEN = (r"(?:https?|ftp|tftp)://[^\s'\"<>;|&)`]+|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|"
-             r"(?<![\w:.])[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*(?![\w:.])|"
+             + V6_TOKEN + r"|"
              r"\b(?:wget|curl|tftp|ftpget|chmod|nohup|crontab|base64)\b|authorized_keys")
 CMD_RE = re.compile(CMD_TOKEN, re.I)
 
@@ -2556,10 +2683,10 @@ def v_new(qs):
 
 # A guess at "going for a payload": a download tool with a target in the same command, or a step that only makes sense
 # after one. "which wget", "curl --version" or reading authorized_keys are still looking around.
-PAYLOAD_RE = re.compile(r"\b(?:wget|curl|tftp|ftpget)\b[^;|&\n]*\s(?!-)[^\s;|&]*\.[^\s;|&]|/dev/tcp/|>>?\s*\S*authorized_keys|chmod\s+(?:[ugoa]*\+x|7[0-7]{2})\s|base64\s+-d", re.I)
+PAYLOAD_RE = re.compile(r"\b(?:wget|curl|tftp|ftpget)\b[^;|&\n]{0,400}\s(?!-)[^\s;|&]{0,400}\.[^\s;|&]|/dev/tcp/|>>?\s{0,20}\S{0,400}authorized_keys|chmod\s+(?:[ugoa]*\+x|7[0-7]{2})\s|base64\s+-d", re.I)
 _persona_cache = {}
 _identity_cache = {}
-WEB_REQUEST_RE = re.compile(r"(?:GET|POST|PUT|HEAD|DELETE|PATCH|OPTIONS|CONNECT|TRACE) \S+(?: \(\d+\))?(?:  body: |  · |$)")
+WEB_REQUEST_RE = re.compile(r"[A-Z]{3,12} \S+(?: \(\d+\))?(?:  body: |  · |$)")
 
 
 def persona_stats(con):
@@ -2620,10 +2747,11 @@ def identity_stats(con):
            con.execute("SELECT COUNT(*) FROM web_identities").fetchone()[0])
     if _identity_cache.get("key") == key:
         return _identity_cache["data"]
-    hist = con.execute("SELECT ts,id,kind,label FROM web_identities ORDER BY ts").fetchall()
+    hist = con.execute("SELECT ts,id,kind,label FROM (SELECT * FROM web_identities ORDER BY ts DESC LIMIT 1000) ORDER BY ts").fetchall()
     now, out = time.time(), {}
-    # Time only counts where the web events are still kept. Pruned periods are unknown, not quiet.
-    kept = con.execute("SELECT MIN(ts) FROM events WHERE kind='canary' AND a IN ('http','https')").fetchone()[0] or now
+    # Time only counts where Huginn was collecting and still keeps the data. Pruned periods are unknown, not quiet, but a
+    # quiet day while collecting is a real zero: so this is when anything at all was first kept, not the first web hit.
+    kept = max(con.execute("SELECT COALESCE(MIN(ts), ?) FROM events", (now,)).fetchone()[0], now - RETENTION_DAYS * 86400 if RETENTION_DAYS else 0)
     for i, h in enumerate(hist):
         end = hist[i + 1]["ts"] if i + 1 < len(hist) else now
         current = i + 1 == len(hist)
@@ -2634,9 +2762,7 @@ def identity_stats(con):
         for ip, b in con.execute("SELECT ip,b FROM events WHERE kind='canary' AND a IN ('http','https') AND ts>=? AND ts<?", (h["ts"], end)):
             r["hits"] += 1
             r["ips"].add(ip)
-            # A login line is "user / password". A request line is "METHOD /path", then its status, body or client.
-            # The user name is the attacker's: "GET / admin" is a login, "GET / (404)" is not.
-            if " / " in (b or "") and not WEB_REQUEST_RE.match(b):
+            if canary_is_login("http", b):
                 r["logins"] += 1
     rows = [dict(r, ips=len(r["ips"]), per_day=r["hits"] * 86400.0 / max(r["secs"], 3600.0)) for r in out.values()]
     rows.sort(key=lambda r: (-r["now"], -r["per_day"]))
@@ -2843,7 +2969,8 @@ def v_creds(qs):
     users = con.execute("SELECT a, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a ORDER BY n DESC LIMIT 300", (since,)).fetchall()
     pws = con.execute("SELECT b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY b ORDER BY n DESC LIMIT 300", (since,)).fetchall()
     pairs = con.execute("SELECT a,b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 500", (since,)).fetchall()
-    canary = con.execute("SELECT a svc, b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='canary' AND b LIKE '% / %' AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 300", (since,)).fetchall()
+    canary = con.execute("SELECT a svc, b, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='canary' AND b LIKE '% / %' AND ts>=? GROUP BY a,b ORDER BY n DESC", (since,)).fetchall()
+    canary = [r for r in canary if canary_is_login(r["svc"], r["b"])][:300]
     t = lambda rows, cols: "".join("<tr>%s</tr>" % "".join(c(r) for c in cols) for r in rows)
     td = lambda k, n=80: (lambda r: "<td class=mono>%s</td>" % esc(clean(r[k], n)))
     tn = lambda k: (lambda r: "<td class=num>%s</td>" % num(r[k]))
@@ -2897,6 +3024,17 @@ _cred_lock = threading.Lock()
 _cred_cache = {"key": None}
 
 
+def canary_is_login(svc, b):
+    # A decoy line holds a login as "user / password". Since 0.23.1 the parsers keep " / " out of everything else (see
+    # not_a_login), so this only has to recognise lines stored before that: requests, service data as JSON, mail and proxy
+    # summaries. Those guesses can be wrong for an odd old line. A login whose user name looks like one is not counted.
+    if not b or " / " not in b:
+        return False
+    if svc in ("http", "https") and WEB_REQUEST_RE.match(b):
+        return False
+    return not b.startswith(("{", "relay: ", "proxy -> "))
+
+
 def cred_rows(con, since=0):
     # Every login attempt on every service: (ts, ip, service, user, password, accepted).
     out = []
@@ -2904,6 +3042,8 @@ def cred_rows(con, since=0):
          "WHERE e.ts >= ? AND (e.kind IN ('login_ok','login_fail') OR (e.kind = 'canary' AND e.b LIKE '% / %')) ORDER BY e.ts")
     for ts, ip, src, kind, a, b, proto in con.execute(q, (since,)):
         if kind == "canary":
+            if not canary_is_login(a, b):
+                continue
             user, _, pw = (b or "").partition(" / ")
             if src == "traps":
                 pw = re.sub(r"  \(db .*\)$", "", pw)
@@ -2920,9 +3060,10 @@ def pw_hash(pw):
 
 
 def cred_index(con):
+    global _cred_cache
     key = "%s|%s" % (get_meta(con, "last_ingest", ""), con.execute("SELECT COUNT(*) FROM events WHERE kind IN ('login_ok','login_fail','canary')").fetchone()[0])
     with _cred_lock:
-        if _cred_cache["key"] == key:
+        if _cred_cache.get("key") == key:
             return _cred_cache
         agg, oldest = {}, None
         for ts, ip, svc, user, pw, ok in cred_rows(con):
@@ -2942,8 +3083,8 @@ def cred_index(con):
         for pw, d in agg.items():
             h = pw_hash(pw)
             buckets.setdefault(h[:CRED_PREFIX], []).append((h[CRED_PREFIX:], d))
-        _cred_cache.clear()
-        _cred_cache.update(key=key, buckets=buckets, distinct=len(agg), oldest=oldest)
+        # A new object each time: a page still reading the old one must not see it emptied.
+        _cred_cache = {"key": key, "buckets": buckets, "distinct": len(agg), "oldest": oldest}
         return _cred_cache
 
 
@@ -2973,7 +3114,7 @@ def cred_export(con, what, days):
     w = csv.writer(out)
     w.writerow(["time", "ip", "service", "username", "password", "accepted"])
     for ts, ip, svc, user, pw, ok in rows:
-        w.writerow([datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), ip, svc, csv_safe(user), csv_safe(pw), "yes" if ok else "no"])
+        w.writerow([datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), ip, csv_safe(svc), csv_safe(user), csv_safe(pw), "yes" if ok else "no"])
     return out.getvalue(), "text/csv"
 
 
@@ -3048,12 +3189,15 @@ def v_campaign(kind, val):
 def blocklist_ips(con, min_score, days, research, v6):
     since = time.time() - days * 86400
     rows = con.execute(
-        "SELECT i.ip FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
-        "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=? AND (?=1 OR COALESCE(e.research,0)=0 "
-        "OR (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) > 0)))",
-        (since, min_score, 1 if research else 0)).fetchall()
+        "SELECT i.ip, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 maybe "
+        "FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
+        "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=?))",
+        (since, min_score)).fetchall()
     out = []
-    for (ip,) in rows:
+    for ip, maybe in rows:
+        # A scanner by name, and nothing but looking around: left out, unless it tried to log in to a decoy service.
+        if maybe and not research and not any(canary_is_login(s, b) for s, b in con.execute("SELECT a,b FROM events WHERE ip=? AND kind='canary' AND b LIKE '% / %'", (ip,))):
+            continue
         a = ipaddress.ip_address(ip)
         if not is_public(a) or getattr(a, "scope_id", None) or (a.version == 6 and not v6):
             continue
@@ -3105,7 +3249,8 @@ def bl_params(qs):
     return gi("min", int(st["bl_min"]), 1, 1000), gi("days", int(st["bl_days"]), 1, 3650), qs.get("research") == "1", qs.get("v6", "1") != "0"
 
 
-def render_feed(fmt, ips):
+def render_feed(fmt, ips, with_v6=True):
+    # with_v6: this feed manages IPv6 too, so an empty list must still clear what an earlier one added.
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     v4 = [i for i in ips if ":" not in i]
     v6 = [i for i in ips if ":" in i]
@@ -3124,14 +3269,14 @@ def render_feed(fmt, ips):
         s = ["# Huginn honeypot blocklist, %s — load with: ipset restore -exist < huginn.ipset" % now,
              "create huginn4 hash:ip family inet maxelem 262144 -exist", "flush huginn4"]
         s += ["add huginn4 %s -exist" % i for i in v4]
-        if v6:
+        if v6 or with_v6:
             s += ["create huginn6 hash:ip family inet6 maxelem 262144 -exist", "flush huginn6"] + ["add huginn6 %s -exist" % i for i in v6]
         return "\n".join(s) + "\n", "text/plain"
     if fmt == "mikrotik":
         s = ["# Huginn honeypot blocklist, %s" % now, "/ip firewall address-list remove [find list=huginn]"]
         s += ["/ip firewall address-list add list=huginn address=%s" % i for i in v4]
-        if v6:
-            s += ["/ipv6 firewall address-list remove [find list=huginn]"] + ["/ipv6 firewall address-list add list=huginn address=%s" % i for i in v6]
+        if v6 or with_v6:
+            s += ["/ipv6 firewall address-list remove [find list=huginn]" if v6 else ":do { /ipv6 firewall address-list remove [find list=huginn] } on-error={}"] + ["/ipv6 firewall address-list add list=huginn address=%s" % i for i in v6]
         return "\n".join(s) + "\n", "text/plain"
     if fmt == "c2":
         c2 = c2_list(db())
@@ -3245,6 +3390,7 @@ def v_account(cur, ok="", err=""):
                          "(SELECT COUNT(*) FROM enrich WHERE ok=1), (SELECT MIN(ts) FROM events)").fetchone()
     status = kv([("Version", esc(HUGINN_VERSION)), ("Last sync", "%s <span class=muted>(%s new rows, %ss)</span>" % (esc(ago(li)), esc(get_meta(con, "last_ingest_new", "0")), esc(get_meta(con, "last_ingest_secs", "–")))),
                  ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Export warning", esc(get_meta(con, "last_export_warn", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
+                 ("New page error", esc(get_meta(con, "last_seen_error", "") or "none")),
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
@@ -3584,8 +3730,8 @@ if(k==='?'){show();e.preventDefault();return}
 if(k==='Escape')hide()})})();
 (function(){var pl=document.getElementById('player');if(!pl)return;var fr=[],i=0,t=0,timer=null,buf='',playing=false;
 var bt=document.getElementById('pPlay'),sp=document.getElementById('pSpeed'),idle=document.getElementById('pIdle'),tm=document.getElementById('pTime');
-function feed(s){s=s.replace(/\x1b\][^\x07]*\x07/g,'').replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'').replace(/\x1b[()][A-Z0-9]/g,'').replace(/\r\n/g,'\n');
-for(var k=0;k<s.length;k++){var c=s[k];if(c==='\b'){buf=buf.slice(0,-1)}else if(c==='\r'){var p=buf.lastIndexOf('\n');buf=buf.slice(0,p+1)}else if(c==='\x07'){}else{buf+=c}}}
+function feed(s){s=s.replace(/\x1b\][^\x07\x1b]{0,4096}\x07/g,'').replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'').replace(/\x1b[()][A-Z0-9]/g,'').replace(/\r\n/g,'\n');
+for(var k=0;k<s.length;k++){var c=s[k];if(c==='\b'){buf=buf.slice(0,-1)}else if(c==='\r'){var p=buf.lastIndexOf('\n');buf=buf.slice(0,p+1)}else if(c==='\x07'){}else{buf+=c}}if(buf.length>2000000)buf=buf.slice(-1000000)}
 var PR=/^((?:[^\s@]{1,64}@[\w.-]+:[^#$]{0,200}|[\w.\/~-]{0,200} ?)[#$](?: |$))(.*)$/,sk=document.getElementById('pSeek');
 function span(c,x){var e=document.createElement('span');e.className=c;e.textContent=x;return e}
 // Attacker text: built with textContent only, never as HTML. Very long recordings show their tail.
@@ -3593,7 +3739,7 @@ function show(){var ls=buf.split('\n'),f=document.createDocumentFragment();if(ls
 ls.forEach(function(l,n){var m=l.length<2000?PR.exec(l):null;if(m){f.appendChild(span('tp',m[1]));f.appendChild(span('tc',m[2]))}else f.appendChild(document.createTextNode(l));if(n<ls.length-1)f.appendChild(document.createTextNode('\n'))});
 pl.textContent='';pl.appendChild(f);pl.scrollTop=pl.scrollHeight;tm.textContent=(fr.length?Math.round(t)+'s / '+Math.round(fr[fr.length-1][0])+'s':'');if(sk){sk.max=fr.length;sk.value=i}}
 function seek(n){clearTimeout(timer);playing=false;bt.textContent='Play';buf='';for(var k=0;k<n;k++)feed(fr[k][1]);i=n;t=n?fr[n-1][0]:0;show()}
-if(sk)sk.addEventListener('input',function(){seek(Math.max(0,Math.min(fr.length,+sk.value||0)))});
+var sq=null,want=0;if(sk)sk.addEventListener('input',function(){want=+sk.value||0;clearTimeout(timer);playing=false;bt.textContent='Play';if(sq!==null)return;sq=requestAnimationFrame(function(){sq=null;seek(Math.max(0,Math.min(fr.length,want)))})});
 function step(){if(!playing)return;if(i>=fr.length){playing=false;bt.textContent='Play';return}
 feed(fr[i][1]);t=fr[i][0];i++;show();if(i>=fr.length){playing=false;bt.textContent='Play';return}
 var d=(fr[i][0]-t);if(idle.checked)d=Math.min(d,1);timer=setTimeout(step,Math.max(0,d*1000/(+sp.value||1)))}
@@ -3904,7 +4050,7 @@ class Handler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(m.group(1), tok):
                 return self.send(404, "Not found", "text/plain")
             mn, days, research, v6 = bl_params(qs)
-            body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6))
+            body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6), v6)
             return self.send(200, body, ctype + "; charset=utf-8")
         if path == "/login":
             if not get_meta(db(), "pw"):
@@ -4135,30 +4281,18 @@ class HuginnServer(ThreadingHTTPServer):
             self._release(client_address[0])
 
 
-_run_lock = None
+_db_lock = None
 
 
-def hold_run_lock():
-    # Held while Huginn serves, so restore-db can see that it runs (whatever port it uses).
-    global _run_lock
-    _run_lock = open(os.path.join(DATA, ".running"), "w")
+def hold_db_lock():
+    # Everything that uses the database holds this, shared. restore-db takes it alone, for as long as it works.
+    global _db_lock
+    os.makedirs(DATA, exist_ok=True)
+    _db_lock = open(os.path.join(DATA, ".running"), "a")
     try:
-        fcntl.flock(_run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(_db_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
-        pass
-
-
-def is_serving():
-    try:
-        fh = open(os.path.join(DATA, ".running"), "w")
-    except OSError:
-        return False
-    with fh:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return False
-        except OSError:
-            return True
+        sys.exit("A database restore is running. Try again when it is done.")
 
 
 def need_service_user():
@@ -4175,44 +4309,78 @@ def list_backups():
         print("%s  %.1f MB" % (name, size / 1048576))
 
 
+def settle_wal():
+    # "ok": the log is folded in. "busy": someone is reading, leave everything alone. "damaged": it cannot be opened properly.
+    if not os.path.exists(DB_PATH):
+        return "damaged"
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            return "busy" if con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] else "ok"
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        return "busy" if "locked" in str(e) or "busy" in str(e) else "damaged"
+    except sqlite3.Error:
+        return "damaged"
+
+
 def restore_db(name):
     need_service_user()
-    if is_serving():
+    os.makedirs(DATA, exist_ok=True)
+    lock = open(os.path.join(DATA, ".running"), "a")           # stays locked until this function returns
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
         sys.exit("Huginn is running. Stop it first: systemctl stop huginn")
     path = name if os.sep in name else os.path.join(BACKUP_DIR, name)
     if not os.path.isfile(path):
         sys.exit("No such backup: %s (see: app.py backups)" % name)
     os.makedirs(DATA, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    for n in os.listdir(DATA):          # left by an interrupted restore; nothing else can be running now
+        if n.startswith(".restore-"):
+            remove_quietly(os.path.join(DATA, n))
     tmp = os.path.join(DATA, ".restore-%s.db" % stamp)
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
         with os.fdopen(fd, "wb") as out, gzip.open(path, "rb") as gz:
             shutil.copyfileobj(gz, out, 1 << 20)
         result = check_copy(tmp)
+        if result == "ok":
+            result = check_is_huginn(tmp)
     except (OSError, EOFError, zlib.error, sqlite3.Error) as e:
         remove_quietly(tmp, tmp + "-wal", tmp + "-shm")
         sys.exit("That backup cannot be read, nothing was changed: %s" % e)
     remove_quietly(tmp + "-wal", tmp + "-shm")
     if result != "ok":
         remove_quietly(tmp)
-        sys.exit("That backup is damaged, nothing was changed: %s" % str(result)[:200])
+        sys.exit("That backup is damaged or not Huginn's, nothing was changed: %s" % str(result)[:200])
     kept = DB_PATH + ".before-restore-" + stamp
+    # Fold the write-ahead log into the old database first: then there is nothing left to lose when the files change. A real
+    # copy goes aside (a hard link would let a later start change it). Only after that is the database swapped, in one step.
+    settled = settle_wal()
+    if settled == "busy":
+        remove_quietly(tmp)
+        sys.exit("Something else is reading the database. Close it and try again, nothing was changed.")
     for suffix in ("", "-wal", "-shm"):
         if os.path.exists(DB_PATH + suffix):
-            os.replace(DB_PATH + suffix, kept + suffix)
+            shutil.copy2(DB_PATH + suffix, kept + suffix)
+    if settled != "ok":                 # a damaged database: its log must never be applied to the restored file
+        remove_quietly(DB_PATH + "-wal", DB_PATH + "-shm")
     os.replace(tmp, DB_PATH)
+    remove_quietly(DB_PATH + "-wal", DB_PATH + "-shm")
     print("Restored %s." % os.path.basename(path))
     print("The database you had is kept as %s. Delete it when you are happy." % kept)
     print("Start Huginn again. Newer events still in the honeypot's export come back at the next sync.")
 
 
 def serve():
+    hold_db_lock()
     init_db()
     threading.Thread(target=collector_loop, daemon=True, name="collector").start()
     if ENRICH:
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
-    hold_run_lock()
     threading.Thread(target=backup_loop, daemon=True, name="backup").start()
     srv = HuginnServer((BIND, PORT), Handler)
     print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
@@ -4220,6 +4388,7 @@ def serve():
 
 
 def set_password():
+    hold_db_lock()
     init_db()
     p1 = getpass.getpass("New Huginn password: ")
     if len(p1) < 10:
@@ -4234,6 +4403,7 @@ def set_password():
 
 
 def ingest_once():
+    hold_db_lock()
     init_db()
     con = connect()
     t0 = time.time()
@@ -4250,6 +4420,7 @@ def ingest_once():
 def import_files(paths):
     # One-off import of whole log files (cowrie.json*, opencanary.log*). Same parsing and dedupe as the sync,
     # so overlap with stored data is skipped. Reads in blocks to keep memory low.
+    hold_db_lock()
     init_db()
     con = connect()
     total_rows = total_new = 0
@@ -4290,8 +4461,12 @@ if __name__ == "__main__":
         list_backups()
     elif cmd == "backup":
         need_service_user()
+        hold_db_lock()
         init_db()
-        print("Saved %s" % backup_db())
+        try:
+            print("Saved %s" % backup_db())
+        except (RuntimeError, DatabaseDamaged) as e:
+            sys.exit("No backup made: %s" % e)
     elif cmd == "restore-db" and len(sys.argv) == 3:
         restore_db(sys.argv[2])
     else:

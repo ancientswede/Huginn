@@ -173,7 +173,7 @@ def serving(banner, port, secs=45):
             got = r.getheader("Server")
             r.read()
             c.close()
-            if r.status == 200 and got == banner:
+            if r.status == 200 and (banner is None or got == banner):      # None: any answer, for a setup without a banner of its own
                 return True
         except (OSError, http.client.HTTPException):
             pass
@@ -211,11 +211,11 @@ def lock():
     return fd
 
 
-def save_pending(before):
+def save_pending(before, stamp, ident_id):
     tmp = "%s.%d" % (PENDING, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(before, fh)
+        json.dump({"before": before, "stamp": stamp, "id": ident_id}, fh)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, PENDING)
@@ -232,14 +232,24 @@ def recover():
     # A change that never finished (killed, power cut): go back to what was there before it.
     try:
         with open(PENDING, encoding="utf-8") as fh:
-            before = json.load(fh)
+            p = json.load(fh)
+        if not isinstance(p, dict) or not isinstance(p.get("before", {}), dict):
+            raise ValueError("not an object")
     except FileNotFoundError:
         return
     except ValueError:
-        clear_pending()
+        os.replace(PENDING, PENDING + ".bad")      # unreadable: keep it for a human, and say so
+        print("A note about an interrupted change could not be read: see %s.bad" % PENDING)
         return
+    last = history()[-1:]
+    if last and last[0][0] == p.get("stamp") and last[0][1] == p.get("id"):
+        clear_pending()                            # the history line was written: that change was finished, only the tidying was not
+        return
+    before = p.get("before", p) if "stamp" in p else p      # a note from 0.23.0 is the old settings on their own
     write_conf(before)
     restart()
+    if not serving(before.get("http.banner"), int(read_conf().get("http.port", 8080))):
+        raise SystemExit("Went back after an interrupted change, but OpenCanary did not come up: check the opencanary service.")
     clear_pending()
     print("Finished an interrupted change by going back.")
 
@@ -273,7 +283,9 @@ def apply_identity(ident):
     port = int(conf.get("http.port", 8080))
     skin = None
     os.makedirs(STATE, mode=0o700, exist_ok=True)
-    save_pending(before)
+    stamp = int(time.time())       # also what ties this note to the history line, see recover()
+    size_before = os.path.getsize(HISTORY) if os.path.exists(HISTORY) else 0
+    save_pending(before, stamp, ident["id"])
     try:
         if ident["layout"] == "builtin":
             change = {"http.skin": "nasLogin", "https.skin": "nasLogin", "http.skindir": ""}
@@ -282,27 +294,26 @@ def apply_identity(ident):
             change = {"http.skin": ident["id"], "https.skin": ident["id"], "http.skindir": skin}
         change.update({"http.banner": ident["banner"], "https.certificate": pem, "https.key": key})
         write_conf(change)
-        # From the restart on, a visitor can only meet the new device: this is when the change happens.
-        stamp = int(time.time())
         restart()
         if not serving(ident["banner"], port):
             raise RuntimeError("did not come up")
         add_history(stamp, ident, label)
     except (Exception, SystemExit) as e:
-        go_back(ident, before, port, skin, e)
+        go_back(ident, before, port, skin, e, size_before)
     clear_pending()
     prune_skins(skin)
     print("Now: %s (%s)" % (label, ident["kind"]))
 
 
-def go_back(ident, before, port, skin, why):
+def go_back(ident, before, port, skin, why, size_before=0):
     # PENDING stays until the old identity really is back, so a failure here is retried by the next run.
     try:
         write_conf(before)
         restart()
-        back = before.get("http.banner")
-        if back and not serving(back, port):
+        if not serving(before.get("http.banner"), port):
             raise RuntimeError("no answer")
+        if os.path.exists(HISTORY) and os.path.getsize(HISTORY) > size_before:
+            os.truncate(HISTORY, size_before)          # the line may have been written before the error: the change did not happen
     except (Exception, SystemExit):
         raise SystemExit("%s failed (%s) and the previous identity did not come back: check the opencanary service." % (ident["id"], why))
     clear_pending()

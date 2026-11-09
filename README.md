@@ -417,6 +417,8 @@ The restore checks the copy before it touches anything, and keeps the database y
 
 ## Using the blocklists
 
+The ipset and MikroTik feeds also clear the IPv6 list, so an address that left the blocklist is removed. A firewall without IPv6 support should fetch the feed with `v6=0`. Addresses an earlier feed added to an IPv6 list then have to be removed by hand.
+
 The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
 
 | Format | Use with |
