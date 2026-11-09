@@ -1,0 +1,376 @@
+#!/usr/bin/python3 -I
+# hp-identity — change what the honeypot's web trap (ports 80 and 443) pretends to be (part of Huginn, AGPL-3.0-or-later).
+#
+#   hp-identity list              the devices it can pretend to be
+#   hp-identity status            what it is now, and when it last changed
+#   hp-identity set <id>|random   change now
+#   hp-identity rotate            change if ROTATE_DAYS have passed (run by a daily timer)
+#
+# Settings in /etc/default/hp-identity: ROTATE_DAYS=21 (0 turns the rotation off).
+# Each change updates the login page, the Server header and the certificate together and restarts OpenCanary, nothing else.
+# The login pages are written from scratch: product names as plain text, no logos or code from any vendor.
+# Huginn reads the history through hp-export and cannot change any of this: the honeypot decides by itself.
+import fcntl, glob, html, http.client, json, os, random, re, shutil, subprocess, sys, tempfile, time
+
+OC_USER = "opencanary"
+OC_HOME = "/home/opencanary"
+CONF = OC_HOME + "/.opencanary.conf"
+CERTS = OC_HOME + "/identity-certs"
+SKINS = "/usr/local/share/hp-identity/skins"
+STATE = "/var/lib/hp-identity"
+HISTORY = STATE + "/history"
+PENDING = STATE + "/pending"       # what to go back to, while a change is under way
+LOCK = STATE + "/lock"
+DEFAULTS = "/etc/default/hp-identity"
+ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9 !+._-]{1,48}$")
+KEEP_RECENT = 3         # a rotation does not go back to the last few
+
+# id, kind, vendor, product line, models, Server header, certificate name, accent, background, layout
+CATALOG = [
+    ("synology", "nas", "Synology", "DiskStation Manager", ["DS224+", "DS423+", "DS923+", "DS1621+"], "nginx", "DiskStation", "", "", "builtin"),
+    ("qnap", "nas", "QNAP", "QTS", ["TS-264", "TS-464", "TS-873A", "TVS-h674"], "http server 1.0", "NAS", "#1a73c9", "#10202f", "split"),
+    ("asustor", "nas", "ASUSTOR", "ADM", ["AS1104T", "AS5304T", "AS6604T"], "Apache", "AS-NAS", "#0a7cc1", "#eef2f6", "card"),
+    ("terramaster", "nas", "TerraMaster", "TOS", ["F2-423", "F4-423", "F5-422"], "nginx", "TNAS", "#e8622c", "#22262c", "card"),
+    ("wd-mycloud", "nas", "WD", "My Cloud OS", ["EX2 Ultra", "PR4100", "EX4100"], "Apache", "MyCloud", "#0067b1", "#f4f6f8", "topbar"),
+    ("netgear-readynas", "nas", "NETGEAR", "ReadyNAS OS", ["RN212", "RN424", "RN628X"], "Apache", "ReadyNAS", "#5a2d91", "#f1f1f3", "topbar"),
+    ("zyxel-nas", "nas", "Zyxel", "NAS Storage", ["NAS326", "NAS542"], "Apache", "NAS326", "#00a0e1", "#e9edf0", "classic"),
+    ("buffalo", "nas", "BUFFALO", "TeraStation", ["TS3410DN", "TS5410DN"], "lighttpd", "TeraStation", "#c8102e", "#f3f3f3", "classic"),
+    ("mikrotik", "router", "MikroTik", "RouterOS", ["hAP ax3", "RB4011", "CCR2004", "hEX S"], "RouterOS", "MikroTik", "#44617b", "#e8e8e8", "classic"),
+    ("tp-link", "router", "TP-Link", "Archer", ["AX55", "AX73", "C7", "BE550"], "TP-LINK HTTPD/1.0", "tplinkwifi.net", "#2bb6b1", "#f2f5f5", "card"),
+    ("asus", "router", "ASUS", "ASUSWRT", ["RT-AX58U", "RT-AX86U", "RT-AC68U"], "httpd/2.0", "router.asus.com", "#1fa6d6", "#14191f", "split"),
+    ("netgear", "router", "NETGEAR", "Nighthawk", ["R7000", "RAX50", "RAX120"], "mini_httpd/1.30", "routerlogin.net", "#5a2d91", "#ffffff", "topbar"),
+    ("d-link", "router", "D-Link", "Wireless Router", ["DIR-842", "DIR-882", "DIR-X1860"], "lighttpd/1.4.59", "dlinkrouter", "#00788a", "#e7ecef", "classic"),
+    ("ubiquiti", "router", "Ubiquiti", "EdgeOS", ["EdgeRouter X", "EdgeRouter 4", "EdgeRouter 12"], "Server", "ubnt", "#0559c9", "#20252b", "card"),
+    ("zyxel", "router", "Zyxel", "Armor", ["G5", "VMG8825", "EX5601"], "Mbedthis-Appweb/2.4.2", "zyxelrouter", "#00a0e1", "#f4f7f9", "split"),
+    ("avm", "router", "AVM", "FRITZ!Box", ["7530 AX", "7590 AX", "6660"], "FRITZ!OS", "fritz.box", "#e2001a", "#f6f6f6", "topbar"),
+    ("huawei", "router", "Huawei", "Home Gateway", ["HG8245H", "AX3 Pro", "B535"], "mini_httpd/1.19", "homerouter.cpe", "#cf0a2c", "#ffffff", "card"),
+    ("linksys", "router", "Linksys", "Smart Wi-Fi", ["E8450", "MR9600", "EA7500"], "lighttpd", "myrouter.local", "#101820", "#eef0f2", "split"),
+    ("tenda", "router", "Tenda", "Wireless Router", ["AC10", "AX12", "AC23"], "GoAhead-Webs", "tendawifi.com", "#f36f21", "#f4f4f4", "classic"),
+]
+FIELDS = ("id", "kind", "vendor", "product", "models", "banner", "cn", "accent", "bg", "layout")
+IDENTITIES = {row[0]: dict(zip(FIELDS, row)) for row in CATALOG}
+
+FORM = ('<form method="POST" action="/index.html">'
+        '<label for="u">Username</label><input id="u" type="text" name="username" autocomplete="off" autofocus>'
+        '<label for="p">Password</label><input id="p" type="password" name="password">'
+        '<!--STARTERR--><p class="err">Incorrect username or password.</p><!--ENDERR-->'
+        '<button type="submit" name="btnLogin" value="1">Sign in</button></form>')
+BASE = ("*{box-sizing:border-box}html,body{height:100%%}body{margin:0;font:14px/1.5 Arial,Helvetica,sans-serif;background:%(bg)s;color:%(fg)s}"
+        "label{display:block;margin:12px 0 4px;font-size:13px}input{width:100%%;padding:9px;border:1px solid #b9c0c7;border-radius:3px;font:inherit;color:#222;background:#fff}"
+        "button{width:100%%;margin-top:18px;padding:10px;border:0;border-radius:3px;font:inherit;color:#fff;background:%(accent)s;cursor:pointer}"
+        ".err{margin:12px 0 0;color:#c62828;font-size:13px}.b{font-size:24px;font-weight:700;color:%(accent)s}.p{color:#6c7680;font-size:13px}.foot{margin-top:18px;color:#8a939c;font-size:12px}")
+LAYOUTS = {
+    "card": ".w{min-height:100%%;display:flex;align-items:center;justify-content:center}.c{width:340px;padding:30px;background:#fff;color:#222;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.25)}",
+    "split": ".w{min-height:100%%;display:flex}.l{flex:1;display:flex;flex-direction:column;justify-content:center;padding:60px;color:#fff}.l .b{color:#fff;font-size:34px}.l .p{color:rgba(255,255,255,.75);font-size:15px}"
+             ".c{width:400px;padding:60px 44px;background:#fff;color:#222;display:flex;flex-direction:column;justify-content:center}@media(max-width:760px){.l{display:none}.c{width:100%%}}",
+    "topbar": ".t{padding:14px 28px;background:%(accent)s;color:#fff;font-size:18px;font-weight:700}.c{width:360px;margin:60px auto;padding:26px;background:#fff;color:#222;border:1px solid #dcdfe3}",
+    "classic": ".t{padding:10px 18px;background:%(accent)s;color:#fff;font-weight:700}.c{width:340px;margin:50px auto;padding:20px;background:#fff;color:#222;border:2px solid %(accent)s}button{border-radius:0}input{border-radius:0}",
+}
+
+
+def is_dark(colour):
+    r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.299 * r + 0.587 * g + 0.114 * b < 110
+
+
+def login_page(ident, model):
+    e = {k: html.escape(str(ident[k])) for k in ("vendor", "product", "accent", "bg")}
+    m, layout = html.escape(model), ident["layout"]
+    vals = {"bg": ident["bg"], "accent": ident["accent"], "fg": "#fff" if is_dark(ident["bg"]) else "#222"}
+    css = (BASE + LAYOUTS[layout]) % vals
+    head = '<div class="b">%s</div><div class="p">%s %s</div>' % (e["vendor"], e["product"], m)
+    if layout == "split":
+        body = '<div class="w"><div class="l" id="l">%s</div><div class="c"><h2>Sign in</h2>%s</div></div>' % (head, FORM)
+        css += ".l{background:%s}" % ident["accent"]
+    elif layout in ("topbar", "classic"):
+        body = '<div class="t">%s %s</div><div class="c"><div class="p">%s %s</div>%s<div class="foot">Authorized users only.</div></div>' % (e["vendor"], e["product"], e["vendor"], m, FORM)
+    else:
+        body = '<div class="w"><div class="c">%s%s<div class="foot">%s %s</div></div></div>' % (head, FORM, e["vendor"], m)
+    return ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>%s %s</title><style>%s</style></head><body>%s</body></html>\n' % (e["vendor"], e["product"], css, body))
+
+
+def plain_error(code, text):
+    return ('<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n<html><head><title>%s %s</title></head><body><h1>%s</h1>'
+            '<p>The requested URL [[URL]] %s.</p><hr><address>[[BANNER]]</address></body></html>\n' % (code, text, text, "was not found on this server" if code == "404" else "cannot be accessed"))
+
+
+def build_skin(ident, model, root=SKINS):
+    # Owned by root and outside OpenCanary's home: the web service can read its pages but not change them.
+    # A new folder every time: the one in use must survive until the new one has proved it works.
+    final = tempfile.mkdtemp(prefix=ident["id"] + "-", dir=root)
+    os.mkdir(os.path.join(final, "static"))
+    pages = {"index.html": login_page(ident, model), "404.html": plain_error("404", "Not Found"), "403.html": plain_error("403", "Forbidden"),
+             "400.html": plain_error("400", "Bad Request"),
+             "redirect.html": '<html><head><title>Redirect</title></head><body><a href="/index.html">Click here</a></body></html>\n'}
+    for name, text in pages.items():
+        with open(os.path.join(final, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(os.path.join(final, name), 0o644)       # whatever umask this shell has: OpenCanary is another user
+    os.chmod(os.path.join(final, "static"), 0o755)
+    os.chmod(final, 0o755)
+    return final
+
+
+def as_canary(*cmd, stdin=None):
+    # OpenCanary's home belongs to an internet-facing service: root must not write or follow anything in it.
+    return subprocess.run(["runuser", "-u", OC_USER, "--"] + list(cmd), input=stdin, capture_output=True, text=True, timeout=120)
+
+
+CONF_EDIT = r"""
+import json, os, sys
+path, change = sys.argv[1], json.loads(sys.stdin.read())
+c = json.load(open(path))
+for k, v in change.items():
+    if v is None:
+        c.pop(k, None)
+    else:
+        c[k] = v
+tmp = "%s.identity.%d" % (path, os.getpid())
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, os.stat(path).st_mode & 0o777)
+with os.fdopen(fd, "w") as fh:
+    json.dump(c, fh, indent=2)
+os.replace(tmp, path)
+"""
+
+
+def read_conf():
+    r = as_canary("cat", CONF)
+    if r.returncode:
+        raise SystemExit("Cannot read the OpenCanary settings: %s" % r.stderr.strip())
+    return json.loads(r.stdout)
+
+
+def write_conf(change):
+    r = as_canary("/usr/bin/python3", "-I", "-c", CONF_EDIT, CONF, stdin=json.dumps(change))
+    if r.returncode:
+        raise SystemExit("Cannot write the OpenCanary settings: %s" % r.stderr.strip())
+
+
+def ensure_cert(ident):
+    pem, key = "%s/%s.pem" % (CERTS, ident["id"]), "%s/%s.key" % (CERTS, ident["id"])
+    as_canary("mkdir", "-p", "-m", "700", CERTS)
+    if as_canary("test", "-s", key).returncode or as_canary("test", "-s", pem).returncode:
+        name = ident["cn"]
+        r = as_canary("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", "/CN=" + name,
+                      "-addext", "subjectAltName=DNS:" + name, "-keyout", key, "-out", pem)
+        if r.returncode:
+            raise SystemExit("Cannot make a certificate: %s" % r.stderr.strip()[:300])
+        as_canary("chmod", "600", key)
+    return pem, key
+
+
+def serving(banner, port, secs=45):
+    # OpenCanary needs a few seconds. It only counts when the new Server header is what actually answers.
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        time.sleep(1)
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+            c.request("GET", "/index.html", headers={"User-Agent": "hp-identity"})
+            r = c.getresponse()
+            got = r.getheader("Server")
+            r.read()
+            c.close()
+            if r.status == 200 and got == banner:
+                return True
+        except (OSError, http.client.HTTPException):
+            pass
+    return False
+
+
+def restart():
+    # reset-failed: systemd refuses a service restarted too often, which would leave the web trap down until someone notices.
+    subprocess.run(["systemctl", "reset-failed", "opencanary"], check=False, timeout=30, capture_output=True)
+    subprocess.run(["systemctl", "restart", "opencanary"], check=False, timeout=60)
+
+
+def history():
+    out = []
+    try:
+        with open(HISTORY, encoding="utf-8") as fh:
+            for line in fh:
+                p = line.rstrip("\n").split(" ", 3)
+                if len(p) == 4 and p[0].isdigit() and p[1] in IDENTITIES:
+                    out.append((int(p[0]), p[1], p[2], p[3]))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def lock():
+    # One change at a time: the timer, a manual change and the first setup all come through here.
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def save_pending(before):
+    tmp = "%s.%d" % (PENDING, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(before, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, PENDING)
+
+
+def clear_pending():
+    try:
+        os.remove(PENDING)
+    except FileNotFoundError:
+        pass
+
+
+def recover():
+    # A change that never finished (killed, power cut): go back to what was there before it.
+    try:
+        with open(PENDING, encoding="utf-8") as fh:
+            before = json.load(fh)
+    except FileNotFoundError:
+        return
+    except ValueError:
+        clear_pending()
+        return
+    write_conf(before)
+    restart()
+    clear_pending()
+    print("Finished an interrupted change by going back.")
+
+
+def prune_skins(keep):
+    # Only after a change is confirmed. The old folder was the way back until now.
+    for d in glob.glob(os.path.join(SKINS, "*")):
+        if d != keep and os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def add_history(stamp, ident, label):
+    fd = os.open(HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("%d %s %s %s\n" % (stamp, ident["id"], ident["kind"], label))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def apply_identity(ident):
+    if not os.path.isdir(OC_HOME):
+        raise SystemExit("OpenCanary is not installed here.")
+    model = random.SystemRandom().choice(ident["models"])
+    label = "%s %s" % (ident["vendor"], model)
+    if not LABEL_RE.match(label):
+        raise SystemExit("Bad label: %s" % label)
+    conf = read_conf()
+    keys = ("http.banner", "http.skin", "http.skindir", "https.skin", "https.certificate", "https.key")
+    before = {k: conf.get(k) for k in keys}
+    pem, key = ensure_cert(ident)
+    port = int(conf.get("http.port", 8080))
+    skin = None
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    save_pending(before)
+    try:
+        if ident["layout"] == "builtin":
+            change = {"http.skin": "nasLogin", "https.skin": "nasLogin", "http.skindir": ""}
+        else:
+            skin = build_skin(ident, model)
+            change = {"http.skin": ident["id"], "https.skin": ident["id"], "http.skindir": skin}
+        change.update({"http.banner": ident["banner"], "https.certificate": pem, "https.key": key})
+        write_conf(change)
+        # From the restart on, a visitor can only meet the new device: this is when the change happens.
+        stamp = int(time.time())
+        restart()
+        if not serving(ident["banner"], port):
+            raise RuntimeError("did not come up")
+        add_history(stamp, ident, label)
+    except (Exception, SystemExit) as e:
+        go_back(ident, before, port, skin, e)
+    clear_pending()
+    prune_skins(skin)
+    print("Now: %s (%s)" % (label, ident["kind"]))
+
+
+def go_back(ident, before, port, skin, why):
+    # PENDING stays until the old identity really is back, so a failure here is retried by the next run.
+    try:
+        write_conf(before)
+        restart()
+        back = before.get("http.banner")
+        if back and not serving(back, port):
+            raise RuntimeError("no answer")
+    except (Exception, SystemExit):
+        raise SystemExit("%s failed (%s) and the previous identity did not come back: check the opencanary service." % (ident["id"], why))
+    clear_pending()
+    if skin:
+        shutil.rmtree(skin, ignore_errors=True)
+    raise SystemExit("%s failed (%s), went back to the previous identity." % (ident["id"], why))
+
+
+def choose(recent):
+    # Any device that has not been used lately, NAS or router alike.
+    avoid = set(recent[-KEEP_RECENT:])
+    return random.SystemRandom().choice([k for k in IDENTITIES if k not in avoid])
+
+
+def rotate_days():
+    try:
+        with open(DEFAULTS, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r"^ROTATE_DAYS=(\d{1,4})\s*$", line)
+                if m:
+                    return int(m.group(1))
+    except FileNotFoundError:
+        pass
+    return 21
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "list":
+        for k, v in IDENTITIES.items():
+            print("%-18s %-7s %s %s (%s)" % (k, v["kind"], v["vendor"], v["product"], ", ".join(v["models"])))
+        return 0
+    if cmd == "status":
+        h = history()
+        days = rotate_days()
+        print("Rotation: every %d days" % days if days else "Rotation: off")
+        if not h:
+            print("No identity set yet.")
+            return 0
+        print("Now: %s (%s), since %s" % (h[-1][3], h[-1][1], time.strftime("%Y-%m-%d %H:%M", time.localtime(h[-1][0]))))
+        return 0
+    if os.geteuid() != 0:
+        raise SystemExit("Run as root.")
+    if cmd not in ("set", "rotate"):
+        print("Usage: hp-identity list | status | set <id>|random | rotate")
+        return 2
+    held = lock()
+    if held is None:
+        if cmd == "rotate":
+            return 0                # someone is changing it right now: tomorrow's check will do
+        raise SystemExit("Another change is running. Try again in a minute.")
+    recover()
+    h = history()                   # read under the lock, so it cannot change between here and the decision
+    if cmd == "set" and len(argv) == 3:
+        pick = choose([x[1] for x in h]) if argv[2] == "random" else argv[2]
+        if pick not in IDENTITIES:
+            raise SystemExit("Unknown identity. See: hp-identity list")
+        apply_identity(IDENTITIES[pick])
+        return 0
+    if cmd == "rotate":
+        days = rotate_days()
+        if not days or (h and time.time() - h[-1][0] < days * 86400):
+            return 0
+        apply_identity(IDENTITIES[choose([x[1] for x in h])])
+        return 0
+    print("Usage: hp-identity list | status | set <id>|random | rotate")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

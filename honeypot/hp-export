@@ -12,6 +12,7 @@ TRAPS_LOG_DIR="/var/log/hp-traps"
 FILEINFO_USER="cowrie"                         # unprivileged user that may read the Cowrie downloads
 PERSONAS_FILE="/etc/huginn-honeypot/personas"  # "internal port=persona" per line (written by install-honeypot.sh)
 BAIT_FILE="/etc/huginn-honeypot/bait.json"     # the fake credentials planted in the personas
+IDENTITY_HISTORY="/var/lib/hp-identity/history"  # what the web trap has pretended to be (written by hp-identity)
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
 FIRST_COWRIE="${COWRIE_DIRS%% *}"
 export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downloads}"
@@ -84,6 +85,7 @@ echo "##TRAPS"
 catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000 | keep
 # Personas and bait, so Huginn needs no extra settings. The bait is fake and already sits in the fake file systems.
 if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
+if [ -r "$IDENTITY_HISTORY" ]; then echo "##IDENTITY"; tail -n 500 "$IDENTITY_HISTORY" | grep -E '^[0-9]{9,11} [a-z0-9-]{1,32} (nas|router) [A-Za-z0-9 !+._-]{1,48}$' || true; fi
 if [ -r "$BAIT_FILE" ]; then echo "##BAIT"; head -c 20000 "$BAIT_FILE" | tr -d '\n'; echo; fi
 echo "##FILES"
 # The captured files are attacker data: analyse them as the Cowrie user (who already owns them), never as root.

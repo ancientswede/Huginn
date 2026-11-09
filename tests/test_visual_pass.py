@@ -19,10 +19,11 @@ class VisualPass(unittest.TestCase):
     def setUp(self):
         self.con = app.connect()
         with self.con:
-            for t in ("events", "sessions", "ips", "seen", "enrich", "flags"):
+            for t in ("events", "sessions", "ips", "seen", "enrich", "flags", "web_identities"):
                 self.con.execute("DELETE FROM %s" % t)
             self.con.execute("DELETE FROM meta WHERE k='settings'")
         app._persona_cache.clear()
+        app._identity_cache.clear()
         app._local.h12 = False
 
     def add(self, *batches):

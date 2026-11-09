@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.22.0"
+HUGINN_VERSION = "0.23.0"
 CHANGELOG = [
+    ("0.23.0", "2026-11-09", "The web trap can pretend to be many NAS and router brands and changes by itself every few weeks (hp-identity on the honeypot, ROTATE_DAYS sets how often, 0 turns it off). Personas shows which device drew the most attention, per day, because each one runs for a different time."),
     ("0.22.0", "2026-11-09", "A visual pass: the attacker page is headed by its address, phones get shorter lists with paging at the top and readable rows, campaigns and New lead with the commands instead of a hash, rare finds (bait, files, exploits) have their own warm colour, Replay looks like a terminal and has a timeline, Personas shows how far attackers got as bars, and empty sections no longer draw empty tables. Two small extras: the raven in the header reacts once to a new file or used bait, and Time wasted has a receipt."),
     ("0.21.2", "2026-11-08", "Releases now include a Debian package, plus Docker files that work without cloning the repository."),
     ("0.21.1", "2026-11-08", "Session logs are easier to read: download and permission commands stand out, addresses link to Search (never to the attacker's server) and captured files link to their file page."),
@@ -223,6 +224,7 @@ CREATE TABLE IF NOT EXISTS seen(kind TEXT, key TEXT, observed REAL, ip TEXT, ses
   PRIMARY KEY(kind, key));
 CREATE INDEX IF NOT EXISTS seen_obs ON seen(observed);
 CREATE TABLE IF NOT EXISTS gaps(start REAL PRIMARY KEY, end REAL);
+CREATE TABLE IF NOT EXISTS web_identities(ts REAL PRIMARY KEY, id TEXT, kind TEXT, label TEXT);
 """
 
 
@@ -471,7 +473,7 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
-    files, personas, bait = [], [], {}
+    files, personas, bait, identities = [], [], {}, []
     seen = set()
     # Only "\n" ends a line. str.splitlines() also breaks on characters such as U+2028, which an attacker can send.
     for line in text.split("\n"):
@@ -489,6 +491,9 @@ def parse_export(text, skip):
             continue
         if section == "PERSONAS":
             personas.append(line)
+            continue
+        if section == "IDENTITY":
+            identities.append(line)
             continue
         if section == "BAIT" and line.startswith("{"):
             try:
@@ -510,14 +515,25 @@ def parse_export(text, skip):
         if r and sane_row(r):
             rows.append((h,) + r)
     parse_export.files = files
-    parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait),
+    parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
                          "warnings": sorted(x[5:] for x in seen if x.startswith("WARN "))[:10]}
     return rows, hashes
 
 
+IDENTITY_LINE = re.compile(r"^([0-9]{9,11}) ([a-z0-9-]{1,32}) (nas|router) ([A-Za-z0-9 !+._-]{1,48})$")
+
+
+def parse_identities(lines):
+    # What the web trap pretended to be, and from when. From the honeypot, so only the exact expected shape gets through.
+    return [(float(m.group(1)), m.group(2), m.group(3), m.group(4)) for m in map(IDENTITY_LINE.match, lines) if m]
+
+
 def apply_honeypot_meta(con, meta):
     # Personas and bait announced by the honeypot. Stored so they survive a restart; a change of bait re-checks every attacker.
+    if meta.get("identities"):
+        with con:
+            con.executemany("INSERT OR IGNORE INTO web_identities(ts,id,kind,label) VALUES(?,?,?,?)", meta["identities"])
     if meta.get("has_personas"):
         set_meta(con, "hp_personas", json.dumps({str(k): v for k, v in meta["personas"].items()}))
     if meta.get("has_bait"):
@@ -1611,7 +1627,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "server": "t-blue", "camera": "t-teal"}
+             "sshole-probe": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 def tag_html(tags):
@@ -2542,6 +2558,8 @@ def v_new(qs):
 # after one. "which wget", "curl --version" or reading authorized_keys are still looking around.
 PAYLOAD_RE = re.compile(r"\b(?:wget|curl|tftp|ftpget)\b[^;|&\n]*\s(?!-)[^\s;|&]*\.[^\s;|&]|/dev/tcp/|>>?\s*\S*authorized_keys|chmod\s+(?:[ugoa]*\+x|7[0-7]{2})\s|base64\s+-d", re.I)
 _persona_cache = {}
+_identity_cache = {}
+WEB_REQUEST_RE = re.compile(r"(?:GET|POST|PUT|HEAD|DELETE|PATCH|OPTIONS|CONNECT|TRACE) \S+(?: \(\d+\))?(?:  body: |  · |$)")
 
 
 def persona_stats(con):
@@ -2595,6 +2613,57 @@ def persona_stats(con):
     return data
 
 
+def identity_stats(con):
+    # Web traffic per device the trap pretended to be. An identity can come back, so its periods are added up.
+    # Cached until the data changes: this walks every web event.
+    key = (get_meta(con, "last_ingest", ""), con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0],
+           con.execute("SELECT COUNT(*) FROM web_identities").fetchone()[0])
+    if _identity_cache.get("key") == key:
+        return _identity_cache["data"]
+    hist = con.execute("SELECT ts,id,kind,label FROM web_identities ORDER BY ts").fetchall()
+    now, out = time.time(), {}
+    # Time only counts where the web events are still kept. Pruned periods are unknown, not quiet.
+    kept = con.execute("SELECT MIN(ts) FROM events WHERE kind='canary' AND a IN ('http','https')").fetchone()[0] or now
+    for i, h in enumerate(hist):
+        end = hist[i + 1]["ts"] if i + 1 < len(hist) else now
+        current = i + 1 == len(hist)
+        if end <= kept and not current:
+            continue
+        r = out.setdefault(h["id"], {"id": h["id"], "kind": h["kind"], "label": h["label"], "secs": 0.0, "hits": 0, "logins": 0, "ips": set(), "last": 0, "now": False})
+        r.update(label=h["label"], secs=r["secs"] + max(0.0, end - max(h["ts"], kept)), last=end, now=current)
+        for ip, b in con.execute("SELECT ip,b FROM events WHERE kind='canary' AND a IN ('http','https') AND ts>=? AND ts<?", (h["ts"], end)):
+            r["hits"] += 1
+            r["ips"].add(ip)
+            # A login line is "user / password". A request line is "METHOD /path", then its status, body or client.
+            # The user name is the attacker's: "GET / admin" is a login, "GET / (404)" is not.
+            if " / " in (b or "") and not WEB_REQUEST_RE.match(b):
+                r["logins"] += 1
+    rows = [dict(r, ips=len(r["ips"]), per_day=r["hits"] * 86400.0 / max(r["secs"], 3600.0)) for r in out.values()]
+    rows.sort(key=lambda r: (-r["now"], -r["per_day"]))
+    _identity_cache.update(key=key, data=rows)
+    return rows
+
+
+def identity_section(con):
+    rows = identity_stats(con)
+    if not rows:
+        return "<h2>Web trap</h2><div class=\"card\">%s</div>" % none_yet("The honeypot has not announced a web identity yet")
+    days = lambda s: ("%.1f" % (s / 86400.0)).replace(".0", "")
+    trs = "".join("<tr><td>%s%s</td><td>%s</td><td class='num nw'>%s</td><td class='num nw'><b>%s</b></td><td class='num nw'>%s</td><td class='num nw'>%s</td></tr>"
+                  % (esc(r["label"]), ' <span class="now-tag">now</span>' if r["now"] else "", tag_html(r["kind"]), days(r["secs"]), ("%.1f" % r["per_day"]).replace(".0", ""), num(r["ips"]), num(r["logins"])) for r in rows)
+    # NAS against router, once both have run. Per day, so a device that ran longer does not win by default.
+    kinds = {}
+    for r in rows:
+        k = kinds.setdefault(r["kind"], [0.0, 0])
+        k[0] += r["secs"]
+        k[1] += r["hits"]
+    compare = ""
+    if len(kinds) > 1:
+        compare = '<p class="muted small note">%s</p>' % esc(" · ".join("%s %.1f hits a day" % (k.upper() if k == "nas" else k.capitalize(), v[1] * 86400.0 / max(v[0], 3600.0)) for k, v in sorted(kinds.items())))
+    return ('<h2>Web trap</h2><p class=muted>What ports 80 and 443 have pretended to be. Compare hits per day: each one runs for a different time.</p>'
+            '<div class="card"><table class="wide"><thead><tr><th>Device</th><th>Type</th><th class=num>Days</th><th class=num>Hits a day</th><th class=num>Attackers</th><th class=num>Login tries</th></tr></thead><tbody>%s</tbody></table>%s</div>' % (trs, compare))
+
+
 def v_personas():
     d = persona_stats(db())
     n = lambda v: "<td class='num nw'>%s</td>" % num(v)
@@ -2619,10 +2688,11 @@ def v_personas():
     probes = "".join("<tr><td class='mono wrap'>%s</td>%s</tr>" % (esc(clean(v[1], 300)), n(v[0])) for _k, v in d["probes"])
     body = ('<h1>Personas</h1><p class=muted>How far attackers get on each fake machine. Finished sessions, by port, under the current persona names.</p>'
             '<div class="card">%s<p class="muted small note">One line: a single input line, then gone. Stopped short: several lines, no download seen. Went for payload is a best guess from files and commands. Payload share is of those two.</p></div>'
-            '<h2>Where they stopped</h2><p class=muted>The last line before a session with several lines ended with no download seen. A hint, not proof: they may have spotted the fake or simply been done.</p>'
+            '%s<h2>Where they stopped</h2><p class=muted>The last line before a session with several lines ended with no download seen. A hint, not proof: they may have spotted the fake or simply been done.</p>'
             '<div class="card">%s</div>'
             '<h2>One-line sessions</h2><div class="card">%s</div>'
             % ('<table class="wide ptab"><thead><tr><th>Persona</th><th class=num>Sessions</th><th class=num>Got in</th><th>After the login</th><th class=num>Payload share</th></tr></thead><tbody>%s</tbody></table>' % rows if rows else none_yet("No finished sessions yet"),
+               identity_section(db()),
                '<table class="wide"><thead><tr><th>Last command, example</th><th class=num>Stopped here</th><th class=num>Ran it</th><th class=num>Stop rate</th><th>Persona</th></tr></thead><tbody>%s</tbody></table>' % stops if stops else none_yet("No repeated stopping points yet"),
                '<table class="wide"><thead><tr><th>Command, example</th><th class=num>Sessions</th></tr></thead><tbody>%s</tbody></table>' % probes if probes else none_yet("No one-line sessions yet")))
     return page("Personas", body, "/personas")
@@ -3643,7 +3713,7 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".o-none{background:var(--line)}.o-one{background:color-mix(in srgb,var(--muted) 60%,var(--panel))}.o-short{background:var(--accent)}.o-pay{background:var(--hot)}"
         ".dleg{display:flex;flex-wrap:wrap;gap:2px 16px;margin-top:6px;font-size:12px;color:var(--muted)}.dleg span{display:inline-flex;align-items:center;gap:5px}"
         ".dleg i{display:block;width:8px;height:8px;border-radius:2px}.dleg b{font-weight:500;color:var(--text)}"
-        ".brand{display:flex;align-items:center;gap:10px}.raven-note{font-size:12px;color:var(--hot);white-space:nowrap}"
+        ".now-tag{margin-left:6px;font-size:11px;color:var(--hot)}.brand{display:flex;align-items:center;gap:10px}.raven-note{font-size:12px;color:var(--hot);white-space:nowrap}"
         ".raven-on .brand-ic{animation:raven 1.1s ease-in-out 1;box-shadow:0 0 0 2px var(--hot),0 0 14px var(--hot)}"
         "@keyframes raven{0%,100%{transform:rotate(0)}25%{transform:rotate(-16deg)}55%{transform:rotate(12deg)}80%{transform:rotate(-4deg)}}"
         "@media (prefers-reduced-motion:reduce){.raven-on .brand-ic{animation:none}}"

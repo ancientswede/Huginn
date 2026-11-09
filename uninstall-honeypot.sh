@@ -62,6 +62,9 @@ rm -f /etc/huginn-honeypot.nft
 
 # ------------------------------------------------------------------ 2. services
 say "Services"
+# First: a web identity change under way would otherwise restart OpenCanary, or write its history, after everything is gone.
+systemctl disable --now hp-identity.timer >/dev/null 2>&1 || true
+systemctl stop hp-identity.service >/dev/null 2>&1 || true
 UNITS=$(systemctl list-unit-files --no-legend 'cowrie*.service' 2>/dev/null | awk '{print $1}' || true)   # none left: not an error
 for u in $UNITS opencanary.service hp-traps.service; do
   if [ -f "/etc/systemd/system/$u" ]; then
@@ -85,6 +88,8 @@ if [ "$PURGE" = 1 ] && grep -qs "Written by Huginn" /etc/endlessh/config; then
 fi
 rm -rf /etc/systemd/system/hp-traps.service.d
 systemctl disable --now hp-logclean.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/hp-identity.service /etc/systemd/system/hp-identity.timer /usr/local/sbin/hp-identity /etc/default/hp-identity
+rm -rf /usr/local/share/hp-identity /var/lib/hp-identity
 rm -f /etc/systemd/system/hp-logclean.service /etc/systemd/system/hp-logclean.timer /etc/systemd/journald.conf.d/huginn-honeypot.conf
 systemctl daemon-reload
 rm -f /etc/logrotate.d/opencanary

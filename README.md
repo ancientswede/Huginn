@@ -465,6 +465,20 @@ Everything lives in `/etc/huginn-honeypot/` on the honeypot (root only). **Never
 
 You can still build your own: put files in a Cowrie instance's `honeyfs`, add them with `honeypot/personas.py fs`, and list extra bait values in `bait.json` next to `app.py` (see `examples/bait.example.json`). Set `HUGINN_PERSONAS` to override the persona names the honeypot announces.
 
+## The web trap's identity
+
+Ports 80 and 443 pretend to be a NAS or a router, and change by themselves every few weeks. `hp-identity` on the honeypot picks from 19 devices (8 NAS brands, 11 routers) and changes the login page, the `Server` header and the certificate together. Only OpenCanary restarts; the SSH and telnet personas are not touched.
+
+```bash
+hp-identity list              # the devices it can pretend to be
+hp-identity status            # what it is now
+hp-identity set mikrotik      # change now (or: set random)
+```
+
+`ROTATE_DAYS=21` in `/etc/default/hp-identity` sets how often it changes, `0` turns it off. Do not make it very short: a machine that keeps changing what it is on one address looks odd by itself, and scanners keep history. The login pages are written from scratch for Huginn, with product names as plain text and no logos or code from any vendor.
+
+Huginn only reads the history (through `hp-export`) and shows it on **Personas**: hits per day for each device, since each one runs for a different time. It cannot change the identity: nothing ever connects to the honeypot to control it.
+
 ## Configuration
 
 All settings are environment variables in `/opt/huginn/.env`. See [`.env.example`](.env.example).

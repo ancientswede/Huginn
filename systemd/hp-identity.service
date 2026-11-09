@@ -1,0 +1,9 @@
+[Unit]
+Description=Huginn: change the honeypot's web identity when it is due
+After=opencanary.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hp-identity rotate
+PrivateTmp=true
+TimeoutStartSec=300

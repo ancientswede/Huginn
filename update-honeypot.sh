@@ -27,7 +27,7 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -94,6 +94,14 @@ if [ "$UP_CANARY" = 1 ]; then
   case $rc in 0|3) ok "web logging patch in place" ;; *) warn "web logging patch no longer fits the new OpenCanary (only start-page visits are logged)" ;; esac
   patch_as opencanary opencanary-ports "$O/.opencanary.conf" || true
   restart_ok opencanary
+fi
+
+say "Web identity"
+# Last, after any upgrade you asked for. A problem here must not stop those.
+if bash "$HERE/honeypot/setup-identity.sh"; then
+  [ -x /usr/local/sbin/hp-identity ] && /usr/local/sbin/hp-identity status | sed 's/^/    /' || true
+else
+  warn "web identity not set up (the rest of the update is done)"; FAILED=1
 fi
 
 say "Check"
