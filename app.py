@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.21.2"
+HUGINN_VERSION = "0.22.0"
 CHANGELOG = [
+    ("0.22.0", "2026-11-09", "A visual pass: the attacker page is headed by its address, phones get shorter lists with paging at the top and readable rows, campaigns and New lead with the commands instead of a hash, rare finds (bait, files, exploits) have their own warm colour, Replay looks like a terminal and has a timeline, Personas shows how far attackers got as bars, and empty sections no longer draw empty tables. Two small extras: the raven in the header reacts once to a new file or used bait, and Time wasted has a receipt."),
     ("0.21.2", "2026-11-08", "Releases now include a Debian package, plus Docker files that work without cloning the repository."),
     ("0.21.1", "2026-11-08", "Session logs are easier to read: download and permission commands stand out, addresses link to Search (never to the attacker's server) and captured files link to their file page."),
     ("0.21.0", "2026-11-08", "New page, Search: commands, file hashes and names, addresses inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history. Press / on any page without a filter to get there."),
@@ -1633,6 +1634,38 @@ def cc_html(cc):
     return '<span class="cc">%s</span>' % esc(cc) if cc else '<span class="cc muted">··</span>'
 
 
+HOT_TAGS = {"took-bait", "read-bait", "dropper", "exploit", "sshole-probe"}     # rare finds: these get the warm colour
+
+
+def tags_row(tags, cols):
+    # Phones only (CSS): the tags get a full-width line under their row instead of a narrow column.
+    # Always one extra row, also when empty, so "the first five attackers" stays the first ten rows.
+    return '<tr class="m-row"><td colspan=%d>%s</td></tr>' % (cols, tag_html(tags))
+
+
+def score_html_cell(r):
+    hot = HOT_TAGS & set((r["tags"] or "").split(","))
+    return '<td class=num><b%s>%s</b></td>' % (' class="s-hot"' if hot else "", r["score"])
+
+
+def none_yet(msg):
+    # An empty section: one line, no table head with nothing under it.
+    return '<p class="empty muted">%s</p>' % esc(msg)
+
+
+def first_cmds(con, session, n=2):
+    return [r[0] for r in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' AND TRIM(COALESCE(a,''))<>'' ORDER BY ts, rowid LIMIT ?", (session, n))]
+
+
+def script_cell(key, cmds, link=True):
+    # What a script does comes first. The hash is only its id, and two scripts can start with the same command.
+    label = " ; ".join(clean(c, 90) for c in cmds) or key[:16]
+    href = link and re.fullmatch(r"[0-9a-f]{8,64}", key or "")
+    head = ('<a class="scr mono" href="/campaign/script/%s" title="%s">%s</a>' % (esc(key), esc(label), esc(label)) if href
+            else '<span class="scr mono" title="%s">%s</span>' % (esc(label), esc(label)))
+    return head + ('<div class="hash mono muted">%s</div>' % esc(key[:16]) if cmds else "")
+
+
 def ip_link(ip, anchor=""):
     return '<a class="mono" href="/ip/%s%s">%s</a>' % (esc(urllib.parse.quote(ip)), esc(anchor), esc(ip))
 
@@ -1755,18 +1788,22 @@ def page(title, body, active="/"):
     status = '<span class="sync %s" title="%s">synced %s</span>' % ("bad" if (err or stale) else "ok", esc(err or ""), esc(ago(li)))
     fresh = con.execute("SELECT COUNT(*) FROM seen WHERE observed>?", (review_since(con),)).fetchone()[0]
     badge = '<span class="nav-n">%s</span>' % ("99+" if fresh > 99 else fresh) if fresh else ""
+    # The raven (app.js) compares these with what this browser saw last. Bait counts attackers, so it means "a new attacker
+    # used the bait", and pruning old attackers in the same sync can hide one. It is a flourish: ntfy and New are the record.
+    newest_file = con.execute("SELECT COALESCE(MAX(observed), 0) FROM seen WHERE kind='file'").fetchone()[0]
+    took, read = con.execute("SELECT COALESCE(SUM(','||tags||',' LIKE '%,took-bait,%'), 0), COALESCE(SUM(','||tags||',' LIKE '%,read-bait,%'), 0) FROM ips").fetchone()
     nav = "".join('<a href="%s"%s>%s%s</a>' % (h, ' class="on"' if h == active else "", esc(t), badge if h == "/new" else "") for h, t in NAV)
     return ("<!doctype html><html lang=en%s><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<title>%s · %s</title><link rel=icon type=image/png sizes=32x32 href='/static/icon-32.png'><link rel=apple-touch-icon href='/static/icon-180.png'><link rel=stylesheet href='/static/app.css?v=%s'>"
             "<script src='/static/app.js?v=%s' defer></script></head><body>"
-            "<header><div class=brand><a href='/'><img class=brand-ic src='/static/icon-32.png' alt=''>%s</a></div><nav>%s</nav>"
+            "<header><div class=brand id=brand data-file='%s' data-took='%d' data-read='%d'><a href='/'><img class=brand-ic src='/static/icon-32.png' alt=''>%s</a></div><nav>%s</nav>"
             "<div class=hdr-right>%s<span class=muted>v%s</span>%s%s"
             "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
             "<main>%s</main>%s</body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
-                                                  esc(st["title"]), nav, status, HUGINN_VERSION, update_badge(con), theme_btn,
+                                                  esc(repr(newest_file)), took, read, esc(st["title"]), nav, status, HUGINN_VERSION, update_badge(con), theme_btn,
                                                   " on" if active == "/settings" else "", " on" if active == "/account" else "", body, footer())
 
 
@@ -1813,11 +1850,11 @@ def v_overview():
     hs, ha = hidden_sql(st)
     top = con.execute("SELECT i.*, e.cc, e.org, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
                       "LEFT JOIN flags f USING(ip) WHERE i.last>=?" + hs + " ORDER BY i.score DESC, i.last DESC LIMIT 15", [d7] + ha).fetchall()
-    trows = "".join("<tr><td>%s</td><td>%s</td><td class=trunc>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td class=num><b>%s</b></td></tr>"
+    trows = "".join("<tr><td>%s</td><td>%s</td><td data-h class=trunc>%s</td><td class=num>%s</td><td class=num>%s</td><td data-h>%s</td>%s</tr>%s"
                     % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["org"] or ""), num(r["sessions"]), num(r["cmds"]),
-                       tag_html(ip_tags(r)), r["score"]) for r in top)
+                       tag_html(ip_tags(r)), score_html_cell(r), tags_row(ip_tags(r), 7)) for r in top)
     top_html = ('<div class="card span2"><h3>Top attackers, 7 days <a class=more href="/ips?days=7">all →</a></h3>'
-                '<table><thead><tr><th>IP</th><th>CC</th><th>Network</th><th class=num>Sess.</th><th class=num>Cmds</th><th>Tags</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table></div>' % trows)
+                '<table class="top5"><thead><tr><th>IP</th><th>CC</th><th data-h>Network</th><th class=num>Sess.</th><th class=num>Cmds</th><th data-h>Tags</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table></div>' % trows)
 
     shells = con.execute("SELECT s.*, e.cc FROM sessions s LEFT JOIN enrich e USING(ip) WHERE s.cmds>0" + hs + " ORDER BY s.start DESC LIMIT 10", ha).fetchall()
     srows = ""
@@ -1846,9 +1883,10 @@ def v_overview():
     twrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num><b>%s</b></td><td class=num>%s</td></tr>"
                      % (ip_link(r["ip"]), cc_html(r["cc"]), esc(dur(r["tarpit"]) if r["tarpit"] else "–"), esc(dur(r["shell"]) if r["shell"] else "–"),
                         esc(dur(r["total"])), esc(dur(r["longest"]))) for r in tw["top"])
-    tw_html = ('<div class="card"><h3>Time wasted, 7 days <span class=muted>%s total%s</span></h3><table><thead><tr><th>IP</th><th>CC</th><th class=num>Tarpit</th>'
-               '<th class=num>Fake shell</th><th class=num>Total</th><th class=num>Longest</th></tr></thead><tbody>%s</tbody></table></div>'
-               % (esc(dur(tw["total"])), " · %d stuck in the tarpit right now" % tw["stuck"] if tw["stuck"] else "", twrows or "<tr><td colspan=6 class=muted>Nothing yet</td></tr>"))
+    tw_table = ('<table><thead><tr><th>IP</th><th>CC</th><th class=num>Tarpit</th><th class=num>Fake shell</th><th class=num>Total</th><th class=num>Longest</th></tr></thead><tbody>%s</tbody></table>' % twrows
+                if twrows else none_yet("No time wasted yet"))
+    tw_html = ('<div class="card"><h3>Time wasted, 7 days <span class=muted>%s total%s</span><a class=more href="/receipt?days=7">View receipt →</a></h3>%s</div>'
+               % (esc(dur(tw["total"])), " · %d stuck in the tarpit right now" % tw["stuck"] if tw["stuck"] else "", tw_table))
     parts = {"chart": chart, "countries": cc_html_, "top": top_html, "shells": shells_html, "creds": creds_html, "timewasted": tw_html,
              "week": week_card(con, w) if "week" in st["cards"] else "",
              "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
@@ -1997,12 +2035,12 @@ def time_wasted(con, since):
         rows.append({"ip": ip, "tarpit": t or 0, "shell": s_ or 0, "total": (t or 0) + (s_ or 0), "longest": max(tl or 0, sl or 0)})
     rows.sort(key=lambda r: -r["total"])
     st = settings(con)
+    visible = rows
     if st["hide_cc"] or st["hide_asn"]:
         en = {r[0]: (r[1] or "", r[2] or "") for r in con.execute("SELECT ip, cc, asn FROM enrich")}
         hcc, has = set(st["hide_cc"]), set(st["hide_asn"])
-        top = [r for r in rows if en.get(r["ip"], ("", ""))[0] not in hcc and en.get(r["ip"], ("", ""))[1] not in has][:10]
-    else:
-        top = rows[:10]
+        visible = [r for r in rows if en.get(r["ip"], ("", ""))[0] not in hcc and en.get(r["ip"], ("", ""))[1] not in has]
+    top = visible[:10]
     if top:
         cc = {r[0]: r[1] for r in con.execute("SELECT ip, cc FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(top)), [r["ip"] for r in top])}
         for r in top:
@@ -2011,15 +2049,19 @@ def time_wasted(con, since):
     opens = con.execute("SELECT ip, a FROM events WHERE kind='tarpit_open' AND ts>=?", (time.time() - 2 * 86400,)).fetchall()
     closed = {(r[0], r[1]) for r in con.execute("SELECT ip, b FROM events WHERE kind='tarpit' AND b IS NOT NULL AND ts>=?", (time.time() - 2 * 86400,))}
     stuck = sum(1 for ip, port in opens if (ip, port) not in closed)
+    longest = max(rows, key=lambda r: r["longest"], default=None)    # over all rows, like the totals; the address may be hidden
     return {"tarpit": sum(r["tarpit"] for r in rows), "shell": sum(r["shell"] for r in rows),
-            "total": sum(r["total"] for r in rows), "top": top, "stuck": stuck}
+            "total": sum(r["total"] for r in rows), "top": top, "stuck": stuck,
+            "longest": longest, "longest_shown": bool(longest) and any(r is longest for r in visible)}
 
 
+IPS_SIZES = (25, 50, 100)
+IPS_PHONE_HIDE = {"network", "asn", "rdns", "first", "sessions", "logins", "files", "tarpit", "tags"}     # what a phone leaves out
 SORTS = {"score": "i.score DESC, i.last DESC", "last": "i.last DESC", "first": "i.first DESC",
          "sessions": "i.sessions DESC", "cmds": "i.cmds DESC", "logins": "(i.logins_ok+i.logins_fail) DESC"}
 
 
-def v_ips(qs):
+def v_ips(qs, mobile=False):
     con = db()
     q = (qs.get("q") or "").strip()[:100]
     days = qs.get("days") or str(settings()["ips_days"])
@@ -2031,6 +2073,8 @@ def v_ips(qs):
         pg = max(0, int(qs.get("p") or 0))
     except ValueError:
         pg = 0
+    size_default = 25 if mobile else 100
+    size = int(qs["n"]) if qs.get("n") in ("25", "50", "100") else size_default
     where, args = [], []
     if days != "all":
         try:
@@ -2069,17 +2113,19 @@ def v_ips(qs):
     total = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) " + w, args).fetchone()[0]
     if hs:
         nhidden = allc - total if not show_hidden else 0
+    pg = min(pg, max(0, (total - 1) // size))          # a page past the end (a stale link, or a number SQLite cannot take) shows the last one
     rows = con.execute("SELECT i.*, e.cc, e.org, e.rdns, e.asn, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
-                       "LEFT JOIN flags f USING(ip) %s ORDER BY %s LIMIT 100 OFFSET ?" % (w, SORTS[sort]), args + [pg * 100]).fetchall()
+                       "LEFT JOIN flags f USING(ip) %s ORDER BY %s LIMIT ? OFFSET ?" % (w, SORTS[sort]), args + [size, pg * size]).fetchall()
 
     def link(**kw):
-        p = {"q": q, "days": days, "tag": tag, "cc": ccf, "sort": sort, "hidden": "1" if show_hidden else ""}
+        p = {"q": q, "days": days, "tag": tag, "cc": ccf, "sort": sort, "hidden": "1" if show_hidden else "", "n": size if size != size_default else ""}
         p.update(kw)
         return "/ips?" + urllib.parse.urlencode({k: v for k, v in p.items() if v not in ("", None)})
 
     cols = [c for c in IPS_COLS if c[0] in st["ips_cols"]]
-    hdr = '<th>IP</th>' + "".join(('<th class="%s"><a href="%s">%s</a></th>' % (cls, esc(link(sort=key, p=0)), esc(lab))) if key
-                                  else '<th class="%s">%s</th>' % (cls, esc(lab)) for _k, lab, key, cls in cols)
+    dh = lambda k: " data-h" if k in IPS_PHONE_HIDE else ""
+    hdr = '<th>IP</th>' + "".join(('<th class="%s"%s><a href="%s">%s</a></th>' % (cls, dh(k), esc(link(sort=key, p=0)), esc(lab))) if key
+                                  else '<th class="%s"%s>%s</th>' % (cls, dh(k), esc(lab)) for k, lab, key, cls in cols)
     cell = {
         "cc": lambda r: "<td>%s</td>" % cc_html(r["cc"]),
         "network": lambda r: "<td class=trunc title='%s'>%s</td>" % (esc(r["rdns"] or ""), esc(r["org"] or "")),
@@ -2093,28 +2139,36 @@ def v_ips(qs):
         "files": lambda r: "<td class=num>%s</td>" % num(r["files"]),
         "tarpit": lambda r: "<td class=num>%s</td>" % (esc(dur(r["tarpit_s"])) if r["tarpit_s"] else "–"),
         "tags": lambda r: "<td>%s</td>" % tag_html(ip_tags(r)),
-        "score": lambda r: "<td class=num><b>%s</b></td>" % r["score"],
+        "score": score_html_cell,
     }
-    trs = "".join("<tr><td>%s</td>%s</tr>" % (ip_link(r["ip"]), "".join(cell[c[0]](r) for c in cols)) for r in rows)
+    show_tags = "tags" in st["ips_cols"]
+    trs = "".join("<tr><td>%s</td>%s</tr>%s" % (ip_link(r["ip"]), "".join(cell[c[0]](r).replace("<td", "<td" + dh(c[0]), 1) for c in cols),
+                                                 tags_row(ip_tags(r), len(cols) + 1) if show_tags else "") for r in rows)
     opts = lambda cur, vals: "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(l)) for v, l in vals)
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
-            '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s<button>Filter</button></form>'
+            '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["shell", "dropper", "proxy", "exploit", "sshole-probe", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
-               ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else ""))
-    pager = ""
-    if total > 100:
-        pager = '<div class="pager">%s<span>%s–%s of %s</span>%s</div>' % (
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
+               ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "",
+               '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
+    pager, pager_top = "", ""
+    if total > IPS_SIZES[0]:
+        # A size only makes sense where the server can answer it: the static demo has one fixed list.
+        sizes = "" if DEMO else ' <span class="sizes">Show %s</span>' % " ".join(
+            "<b>%d</b>" % v if v == size else '<a href="%s">%d</a>' % (esc(link(n=v if v != size_default else "", p=0)), v) for v in IPS_SIZES)
+        pager = '<div class="pager">%s<span>%s–%s of %s%s</span>%s</div>' % (
             '<a href="%s">← Prev</a>' % esc(link(p=pg - 1)) if pg > 0 else "<span></span>",
-            num(pg * 100 + 1), num(min(total, pg * 100 + 100)), num(total),
-            '<a href="%s">Next →</a>' % esc(link(p=pg + 1)) if (pg + 1) * 100 < total else "<span></span>")
+            num(pg * size + 1), num(min(total, pg * size + size)), num(total), sizes,
+            '<a href="%s">Next →</a>' % esc(link(p=pg + 1)) if (pg + 1) * size < total else "<span></span>")
+        if total > size:
+            pager_top = pager.replace('class="pager"', 'class="pager top"', 1)
     hidden_note = ""
     if nhidden:
         hidden_note = '<p class="muted small">%s hidden by your settings · <a href="%s">show them</a></p>' % (num(nhidden), esc(link(hidden="1", p=0)))
     elif show_hidden and hs:
         hidden_note = '<p class="muted small">Showing hidden networks too · <a href="%s">hide them again</a></p>' % esc(link(hidden="", p=0))
-    body = ('<h1>Attackers <span class=muted>%s</span></h1>%s%s<div class="card"><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
-            % (num(total), form, hidden_note, hdr, trs or "<tr><td colspan=%d class=muted>No matches</td></tr>" % (len(cols) + 1), pager))
+    body = ('<h1>Attackers <span class=muted>%s</span></h1>%s%s%s<div class="card"><table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
+            % (num(total), form, hidden_note, pager_top, hdr, trs or "<tr><td colspan=%d class=muted>No matches</td></tr>" % (len(cols) + 1), pager))
     return page("Attackers", body, "/ips")
 
 
@@ -2176,14 +2230,14 @@ def cmd_html(text, files=None):
 
 
 def score_html(r):
-    # What the score is made of. Same hue for every part: the text below names them, in the same order.
+    # What the score is made of. The text below names the parts, in the same order. Rare finds are warm.
     have = set((r["tags"] or "").split(","))
     parts = sorted(score_parts(r["sessions"] or 0, r["logins_ok"] or 0, r["logins_fail"] or 0, r["cmds"] or 0, r["files"] or 0, r["tcpip"] or 0,
                                r["exploits"] or 0, [c for c in (r["canary_svcs"] or "").split(",") if c],
                                "took-bait" in have, "read-bait" in have, "sshole-probe" in have), key=lambda p: -p[1])
     if sum(v for _k, v in parts) != r["score"]:         # scored by an older version: do not show numbers that do not add up
         return '<div class="sleg muted">Breakdown unavailable</div>'
-    segs = "".join('<i class="g%d" title="%s: %d"></i>' % (min(v, 60), esc(k), v) for k, v in parts)
+    segs = "".join('<i class="g%d%s" title="%s: %d"></i>' % (min(v, 60), " hot" if k in ("took bait", "read bait", "SSHole probe", "files", "exploit") else "", esc(k), v) for k, v in parts)
     return '<div class="sbar" role="img" aria-label="Score breakdown">%s</div><div class="sleg muted">%s</div>' % (
         segs, esc(" · ".join("%s %d" % p for p in parts)))
 
@@ -2277,7 +2331,7 @@ def v_ip(ip):
     crows = "".join("<tr><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td><td>%s</td></tr>" % (esc(clean(c["a"], 80)), esc(clean(c["b"], 80)), num(c["n"]), "accepted" if c["ok"] else "<span class=muted>rejected</span>") for c in creds)
     creds_html = ('<div class="card"><h3>Credentials tried <span class=muted>%s unique</span></h3><input class="qf" data-filter="t-creds" placeholder="Filter">'
                   '<div class="scroll"><table id="t-creds"><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th><th>Result</th></tr></thead><tbody>%s</tbody></table></div></div>'
-                  % (num(ccount), crows or "<tr><td colspan=4 class=muted>None</td></tr>"))
+                  % (num(ccount), crows)) if crows else '<div class="card"><h3>Credentials tried</h3>%s</div>' % none_yet("No logins tried")
 
     # Files + URLs
     files = con.execute("SELECT a,b,MAX(ts) l,COUNT(*) n,kind FROM events WHERE ip=? AND kind IN ('file','file_fail') GROUP BY kind,a,b ORDER BY l DESC LIMIT 100", (ip,)).fetchall()
@@ -2374,7 +2428,7 @@ def v_ip(ip):
                     % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
 
     # Sessions come first in the page itself, so reading and keyboard order match what a phone shows.
-    body = ('<div class="iphead"><h1 class=mono>%s</h1><div>%s</div><div class="score">Score <b>%s</b></div></div>%s<p class="story">%s</p>'
+    body = ('<div class="iphead ip-h"><h1 class="ip-title mono">%s</h1><div class="ip-tags">%s</div><div class="score">Score <b>%s</b></div></div>%s<p class="story">%s</p>'
             '<div class="links">%s</div>'
             '<div class="ip-w"><div class="ip-main">%s%s%s%s</div><div class="ip-side"><div class="card"><h3>Activity</h3>%s</div>'
             '<div class="card"><h3>Network</h3>%s</div><div class="card flagcard">%s</div>%s%s</div></div>'
@@ -2460,14 +2514,14 @@ def v_new(qs):
             camp("file", r["key"]), family_tag(fam, how) if fam else (esc(f["type"]) if f else "–"), esc(r["ex"] or ""), when(r), who(r))
 
     live = lambda key: con.execute("SELECT 1 FROM sessions WHERE cmdhash=? LIMIT 1", (key,)).fetchone()     # gone after retention: no dead link
-    r_script = lambda r: "<td>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (
-        camp("script", r["key"]) if live(r["key"]) else '<span class=mono>%s</span>' % esc(r["key"]), esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
+    r_cmds = lambda r: (first_cmds(con, r["session"]) if r["session"] else []) or ([r["ex"]] if r["ex"] else [])
+    r_script = lambda r: "<td>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (script_cell(r["key"], r_cmds(r), bool(live(r["key"]))), num(r["n"]), when(r), who(r))
 
     r_cmd = lambda r: "<td class='mono wrap'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
     r_pw = lambda r: "<td class=mono>%s</td><td class='mono trunc'>%s</td><td class='num nw'>%s</td>%s<td>%s</td>" % (esc(r["key"]), esc(r["ex"] or ""), num(r["n"]), when(r), who(r))
     r_hassh = lambda r: "<td>%s</td><td class='mono trunc'>%s</td>%s<td>%s</td>" % (camp("hassh", r["key"]), esc(r["ex"] or ""), when(r), who(r))
     cards = (new_card(con, "file", "Files", since, limit, "<th>SHA-256</th><th>Type</th><th>Name</th><th>First</th><th>IP</th>", r_file)
-             + new_card(con, "script", "Scripts", since, limit, "<th>Script</th><th>First command</th><th class=num>Runs</th><th>First</th><th>IP</th>", r_script)
+             + new_card(con, "script", "Scripts", since, limit, "<th>Script</th><th class=num>Runs</th><th>First</th><th>IP</th>", r_script)
              + new_card(con, "cmd", "Commands", since, limit, "<th>Example</th><th class=num>Runs</th><th>First</th><th>IP</th>", r_cmd, "n DESC, observed DESC", "card span2")
              + new_card(con, "pw", "Password patterns", since, limit, "<th>Pattern</th><th>Example</th><th class=num>Tries</th><th>First</th><th>IP</th>", r_pw)
              + new_card(con, "hassh", "SSH clients", since, limit, "<th>HASSH</th><th>Client</th><th>First</th><th>IP</th>", r_hassh))
@@ -2545,20 +2599,32 @@ def v_personas():
     d = persona_stats(db())
     n = lambda v: "<td class='num nw'>%s</td>" % num(v)
     pct = lambda a, b: "<td class='num nw'>%d%%</td>" % round(a * 100.0 / b) if b else "<td class='num nw muted'>–</td>"
-    rows = "".join("<tr><td>%s</td>%s%s%s%s%s%s%s</tr>" % (tag_html(r["persona"]), n(r["sessions"]), n(r["in"]), n(r["none"]), n(r["one"]), n(r["short"]), n(r["payload"]), pct(r["payload"], r["short"] + r["payload"]))
+    outcomes = (("none", "No command", "o-none"), ("one", "One line", "o-one"), ("short", "Stopped short", "o-short"), ("payload", "Went for payload", "o-pay"))
+
+    def journey(r):
+        # What happened after the login, as shares of those who got in. The exact numbers stay right below the bar.
+        if not r["in"]:
+            return "<span class=muted>Nobody got in</span>"
+        parts = [(k, lab, c, r[k]) for k, lab, c in outcomes if r[k]]
+        bar = "".join('<i class="%s p%d" title="%s: %s"></i>' % (c, max(1, round(v * 100.0 / r["in"])), esc(lab), num(v)) for _k, lab, c, v in parts)
+        leg = "".join('<span><i class="%s"></i>%s <b>%s</b></span>' % (c, esc(lab), num(r[k])) for k, lab, c in outcomes)
+        return '<div class="dist" role="img" aria-label="Outcome after login">%s</div><div class="dleg">%s</div>' % (bar, leg)
+
+    lab_n = lambda label, v: "<td class='num nw' data-l='%s'>%s</td>" % (esc(label), num(v))
+    share = lambda r: ("<td class='num nw' data-l='Payload share'>%d%%</td>" % round(r["payload"] * 100.0 / (r["short"] + r["payload"]))) if r["short"] + r["payload"] else "<td class='num nw muted' data-l='Payload share'>–</td>"
+    rows = "".join("<tr><td>%s</td>%s%s<td class=pb>%s</td>%s</tr>" % (tag_html(r["persona"]), lab_n("Sessions", r["sessions"]), lab_n("Got in", r["in"]), journey(r), share(r))
                    for r in d["rows"])
     stops = "".join("<tr><td class='mono wrap'>%s</td>%s%s%s<td>%s</td></tr>" % (esc(clean(s["ex"], 300)), n(s["n"]), n(s["ran"]), pct(s["n"], s["ran"]),
                     " ".join("%s <span class=muted>%s</span>" % (tag_html(k), num(v)) for k, v in sorted(s["by"].items(), key=lambda x: -x[1]))) for s in d["stops"])
     probes = "".join("<tr><td class='mono wrap'>%s</td>%s</tr>" % (esc(clean(v[1], 300)), n(v[0])) for _k, v in d["probes"])
-    empty = lambda cols: '<tr><td colspan=%d class=muted>Nothing yet</td></tr>' % cols
     body = ('<h1>Personas</h1><p class=muted>How far attackers get on each fake machine. Finished sessions, by port, under the current persona names.</p>'
-            '<div class="card"><table class="wide"><thead><tr><th>Persona</th><th class=num>Sessions</th><th class=num>Got in</th><th class=num>No command</th><th class=num>One line</th>'
-            '<th class=num>Stopped short</th><th class=num>Went for payload</th><th class=num>Payload share</th></tr></thead><tbody>%s</tbody></table>'
-            '<p class="muted small note">One line: a single input line, then gone. Stopped short: several lines, no download seen. Went for payload is a best guess from files and commands. Payload share is of the last two columns.</p></div>'
+            '<div class="card">%s<p class="muted small note">One line: a single input line, then gone. Stopped short: several lines, no download seen. Went for payload is a best guess from files and commands. Payload share is of those two.</p></div>'
             '<h2>Where they stopped</h2><p class=muted>The last line before a session with several lines ended with no download seen. A hint, not proof: they may have spotted the fake or simply been done.</p>'
-            '<div class="card"><table class="wide"><thead><tr><th>Last command, example</th><th class=num>Stopped here</th><th class=num>Ran it</th><th class=num>Stop rate</th><th>Persona</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<h2>One-line sessions</h2><div class="card"><table class="wide"><thead><tr><th>Command, example</th><th class=num>Sessions</th></tr></thead><tbody>%s</tbody></table></div>'
-            % (rows or empty(8), stops or empty(5), probes or empty(2)))
+            '<div class="card">%s</div>'
+            '<h2>One-line sessions</h2><div class="card">%s</div>'
+            % ('<table class="wide ptab"><thead><tr><th>Persona</th><th class=num>Sessions</th><th class=num>Got in</th><th>After the login</th><th class=num>Payload share</th></tr></thead><tbody>%s</tbody></table>' % rows if rows else none_yet("No finished sessions yet"),
+               '<table class="wide"><thead><tr><th>Last command, example</th><th class=num>Stopped here</th><th class=num>Ran it</th><th class=num>Stop rate</th><th>Persona</th></tr></thead><tbody>%s</tbody></table>' % stops if stops else none_yet("No repeated stopping points yet"),
+               '<table class="wide"><thead><tr><th>Command, example</th><th class=num>Sessions</th></tr></thead><tbody>%s</tbody></table>' % probes if probes else none_yet("No one-line sessions yet")))
     return page("Personas", body, "/personas")
 
 
@@ -2691,10 +2757,10 @@ def v_files():
     urs = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                   % (esc(clean(u["a"], 200)), esc(ago(u["l"])), num(u["n"]), num(u["nip"]), ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(u["a"]), "URLhaus")) for u in urls)
     body = ('<h1>Files</h1><p class=muted>Captured by the honeypot (uploads and downloads). Never executed here — look them up by hash only.</p>'
-            '<div class="card"><input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
-            '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<h2>Malware URLs (fetch blocked)</h2><div class="card"><table class="wide"><thead><tr><th>URL</th><th>Last</th><th class=num>Tries</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>'
-            % (trs or "<tr><td colspan=8 class=muted>None yet</td></tr>", urs or "<tr><td colspan=5 class=muted>None yet</td></tr>"))
+            '<div class="card">%s</div><h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
+            % ('<input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
+               '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % trs if trs else none_yet("No files captured yet"),
+               '<table class="wide"><thead><tr><th>URL</th><th>Last</th><th class=num>Tries</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % urs if urs else none_yet("No blocked downloads recorded")))
     return page("Files", body, "/files")
 
 
@@ -2737,9 +2803,11 @@ def v_creds(qs):
              % (CRED_PREFIX, CRED_PREFIX, esc(q), esc(days), {"1": "24h", "7": "7 days", "30": "30 days", "all": "all"}[days], exp))
     def card(title, tid, heads, rows):
         # Fixed height, scrolls inside, header row stays visible, own filter box.
+        if not rows:
+            return '<div class="card"><h3>%s</h3>%s</div>' % (title, none_yet("Nothing in this period"))
         return ('<div class="card"><h3>%s <span class=muted>top %s</span></h3><input class="qf" data-filter="%s" placeholder="Filter">'
                 '<div class="scroll tall"><table id="%s"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div></div>'
-                % (title, num(rows.count("<tr>")), tid, tid, heads, rows or '<tr><td colspan=4 class=muted>None</td></tr>'))
+                % (title, num(rows.count("<tr>")), tid, tid, heads, rows))
     nums = '<th class=num>Tries</th><th class=num>IPs</th>'
     body = (('<h1>Credentials</h1><div class="chips">%s</div>' % tabs) + check + search + '<div class="grid3">'
             + card("Usernames", "t-cu", "<th>User</th>" + nums, t(users, [td("a"), tn("n"), tn("nip")]))
@@ -2858,18 +2926,16 @@ def v_campaigns():
                           "FROM sessions WHERE cmdhash IS NOT NULL GROUP BY cmdhash ORDER BY nip DESC, n DESC LIMIT 60").fetchall()
     srows = ""
     for s in scripts:
-        first = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts LIMIT 1", (s["sid"],)).fetchone()
-        srows += "<tr><td class=mono><a href='/campaign/script/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
-            esc(s["cmdhash"]), esc(s["cmdhash"]), esc(clean(first[0] if first else "", 120)), num(s["c"]), num(s["nip"]), num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
+        srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
+            script_cell(s["cmdhash"], first_cmds(con, s["sid"])), num(s["c"]), num(s["nip"]), num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
     hs = con.execute("SELECT hassh, COUNT(*) n, COUNT(DISTINCT ip) nip, MAX(version) v, MAX(start) l FROM sessions WHERE hassh IS NOT NULL "
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                     % (esc(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
     body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH).</p>'
-            '<h2>Command scripts</h2><div class="card"><table class="wide"><thead><tr><th>Script</th><th>First command</th><th class=num>Cmds</th><th class=num>IPs</th>'
-            '<th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
-            '<h2>SSH clients (HASSH)</h2><div class="card"><table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
-            % (srows or "<tr><td colspan=7 class=muted>None yet</td></tr>", hrows))
+            '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
+            % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
+               '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet")))
     return page("Campaigns", body, "/campaigns")
 
 
@@ -3061,11 +3127,11 @@ def v_blocklist(h, qs):
             '<div class="card span2"><h3>C2 and malware hosts <span class=muted>%s IPs</span></h3><p class="muted small">Addresses found inside captured malware and in its download URLs, seen from at least %d attackers. Attackers can choose these addresses, so treat this as advice and do not block from it automatically.</p>'
             '<div class="feed"><div class="feed-h"><b>Plain list</b><button class="btn-s" data-copy="%s">Copy URL</button></div><div class="mono url">%s</div></div>'
             '<div class="preview">%s</div></div>'
-            '<div class="card span2"><h3>Manual overrides</h3><table><thead><tr><th>IP</th><th>CC</th><th>Rule</th><th>Note</th><th>Updated</th></tr></thead><tbody>%s</tbody></table></div>'
+            '<div class="card span2"><h3>Manual overrides</h3>%s</div>'
             '<div class="card span2"><h3>Preview%s</h3><div class="preview">%s</div></div></div>'
             % (num(len(ips)), form, feeds, num(len(c2)), C2_MIN_SOURCES, esc("%s/feed/%s/c2" % (base_url(h), token)), esc("%s/feed/••••/c2" % base_url(h)),
                " ".join('<span class=mono title="%s">%s</span>' % (esc("; ".join(sorted(w))), esc(i)) for i, w in sorted(c2.items())) or "<span class=muted>None yet</span>",
-               frows or "<tr><td colspan=5 class=muted>None — set them on an attacker page.</td></tr>",
+               '<table><thead><tr><th>IP</th><th>CC</th><th>Rule</th><th>Note</th><th>Updated</th></tr></thead><tbody>%s</tbody></table>' % frows if frows else none_yet("None. Set them on an attacker page."),
                " (first 300)" if len(ips) > 300 else "", preview or "<span class=muted>Empty</span>"))
     return page("Blocklist", body, "/blocklist")
 
@@ -3134,6 +3200,47 @@ def v_account(cur, ok="", err=""):
     return page("Account", body, "/account")
 
 
+RECEIPT_DAYS = {"1": "Last 24 hours", "7": "Last 7 days", "30": "Last 30 days", "all": "All time"}
+
+
+def receipt_worth(secs):
+    # A dry comparison, not a claim about anyone's evening: recorded connection time only.
+    if secs >= 558 * 60:
+        return "Lord of the Rings trilogies", secs / (558 * 60.0)     # theatrical cuts: 178 + 179 + 201 minutes
+    if secs >= 2 * 3600:
+        return "Feature films", secs / 7200.0
+    if secs >= 15 * 60:
+        return "Coffee breaks", secs / 900.0
+    return None
+
+
+def v_receipt(qs):
+    con = db()
+    days = qs.get("days") if qs.get("days") in RECEIPT_DAYS else "7"
+    now = time.time()
+    since = 0 if days == "all" else now - int(days) * 86400
+    tw = time_wasted(con, since)
+    visits = (con.execute("SELECT COUNT(*) FROM events WHERE kind='tarpit' AND ts>=?", (since,)).fetchone()[0]
+              + con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND cmds>0 AND duration IS NOT NULL", (since,)).fetchone()[0])
+    row = lambda k, v: '<div class="rc-r"><span>%s</span><span>%s</span></div>' % (esc(k), v)
+    period = RECEIPT_DAYS[days] if days == "all" else "%s to %s" % (datetime.fromtimestamp(since, TZ).strftime("%Y-%m-%d"), datetime.fromtimestamp(now, TZ).strftime("%Y-%m-%d"))
+    chips = "" if DEMO else '<div class="chips">%s</div>' % "".join(
+        '<a class="chip%s" href="/receipt?days=%s">%s</a>' % (" on" if k == days else "", k, esc(v)) for k, v in RECEIPT_DAYS.items())
+    if not tw["total"]:
+        lines = '<div class="rc-c">Nothing to bill yet.</div>'
+    else:
+        worth = receipt_worth(tw["total"])
+        lines = (row("Tarpit", esc(dur(tw["tarpit"]))) + row("Fake shells", esc(dur(tw["shell"]))) + row("Visits", num(visits)) + "<hr>"
+                 + '<div class="rc-r rc-total"><span>TOTAL</span><span>%s</span></div><hr>' % esc(dur(tw["total"]))
+                 + (row("Longest visit", esc(dur(tw["longest"]["longest"]))) + (row("Guest", ip_link(tw["longest"]["ip"])) if tw["longest_shown"] else "") if tw["longest"] else "")
+                 + (row(worth[0], "× %.1f" % worth[1]) if worth else "") + "<hr>")
+    body = ('<h1>Receipt</h1>%s<div class="rcpt mono"><div class="rc-c rc-title">%s</div><div class="rc-c">Honeypot services rendered</div><div class="rc-c rc-dim">%s</div><hr>%s'
+            '<div class="rc-c">Thank you for your time.</div><div class="rc-c rc-dim">No refunds.</div><div class="rc-bar" aria-hidden="true"></div></div>'
+            '<p class="muted small rc-note">Recorded connection and session time. Parallel connections can overlap, and a bot waiting is not a person waiting.</p>'
+            % (chips, esc(settings(con)["title"].upper()), esc(period), lines))
+    return page("Receipt", body, "/")
+
+
 def v_replay(sha, ip):
     con = db()
     s = con.execute("SELECT * FROM sessions WHERE tty=? ORDER BY start DESC LIMIT 1", (sha,)).fetchone()
@@ -3143,10 +3250,12 @@ def v_replay(sha, ip):
     head = ('<div class="iphead"><h1>Replay</h1><div>%s %s</div></div><p class="links">%s · %s · %s · session <span class=mono>%s</span></p>'
             % (ip_link(ip, "#s-" + s["session"]), tag_html(PERSONA.get(s["port"] or 0, "")), esc(fmt_tss(s["start"])),
                esc((s["proto"] or "").upper()), esc(dur(s["duration"])), esc(s["session"])))
-    body = (head + '<div class="card"><div class="pctl"><button id="pPlay">Play</button><button class="btn-s" id="pRestart">Restart</button>'
+    title = " · ".join(x for x in ((s["proto"] or "").upper(), PERSONA.get(s["port"] or 0, "")) if x) or "session"
+    body = (head + '<div class="card replay-card"><div class="pctl"><button id="pPlay">Play</button><button class="btn-s" id="pRestart">Restart</button>'
             '<label>Speed <select id="pSpeed"><option value=1>1×</option><option value=4 selected>4×</option><option value=16>16×</option></select></label>'
             '<label><input type=checkbox id="pIdle" checked> Skip pauses</label><span class="muted" id="pTime"></span></div>'
-            '<pre class="term player" id="player" data-src="/api/tty/%s">Loading…</pre></div>' % esc(sha))
+            '<div class="twin"><div class="twin-bar"><i></i><i></i><i></i><span>%s</span></div><pre class="term player" id="player" data-src="/api/tty/%s">Loading…</pre></div>'
+            '<input type=range id="pSeek" class="pseek" min=0 max=0 value=0 aria-label="Position in the recording"></div>' % (esc(title), esc(sha)))
     return page("Replay", body, "/ips")
 
 
@@ -3407,7 +3516,14 @@ if(k==='Escape')hide()})})();
 var bt=document.getElementById('pPlay'),sp=document.getElementById('pSpeed'),idle=document.getElementById('pIdle'),tm=document.getElementById('pTime');
 function feed(s){s=s.replace(/\x1b\][^\x07]*\x07/g,'').replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'').replace(/\x1b[()][A-Z0-9]/g,'').replace(/\r\n/g,'\n');
 for(var k=0;k<s.length;k++){var c=s[k];if(c==='\b'){buf=buf.slice(0,-1)}else if(c==='\r'){var p=buf.lastIndexOf('\n');buf=buf.slice(0,p+1)}else if(c==='\x07'){}else{buf+=c}}}
-function show(){pl.textContent=buf;pl.scrollTop=pl.scrollHeight;tm.textContent=(fr.length?Math.round(t)+'s / '+Math.round(fr[fr.length-1][0])+'s':'')}
+var PR=/^((?:[^\s@]{1,64}@[\w.-]+:[^#$]{0,200}|[\w.\/~-]{0,200} ?)[#$](?: |$))(.*)$/,sk=document.getElementById('pSeek');
+function span(c,x){var e=document.createElement('span');e.className=c;e.textContent=x;return e}
+// Attacker text: built with textContent only, never as HTML. Very long recordings show their tail.
+function show(){var ls=buf.split('\n'),f=document.createDocumentFragment();if(ls.length>3000)ls=ls.slice(-3000);
+ls.forEach(function(l,n){var m=l.length<2000?PR.exec(l):null;if(m){f.appendChild(span('tp',m[1]));f.appendChild(span('tc',m[2]))}else f.appendChild(document.createTextNode(l));if(n<ls.length-1)f.appendChild(document.createTextNode('\n'))});
+pl.textContent='';pl.appendChild(f);pl.scrollTop=pl.scrollHeight;tm.textContent=(fr.length?Math.round(t)+'s / '+Math.round(fr[fr.length-1][0])+'s':'');if(sk){sk.max=fr.length;sk.value=i}}
+function seek(n){clearTimeout(timer);playing=false;bt.textContent='Play';buf='';for(var k=0;k<n;k++)feed(fr[k][1]);i=n;t=n?fr[n-1][0]:0;show()}
+if(sk)sk.addEventListener('input',function(){seek(Math.max(0,Math.min(fr.length,+sk.value||0)))});
 function step(){if(!playing)return;if(i>=fr.length){playing=false;bt.textContent='Play';return}
 feed(fr[i][1]);t=fr[i][0];i++;show();if(i>=fr.length){playing=false;bt.textContent='Play';return}
 var d=(fr[i][0]-t);if(idle.checked)d=Math.min(d,1);timer=setTimeout(step,Math.max(0,d*1000/(+sp.value||1)))}
@@ -3433,6 +3549,12 @@ d.setAttribute('class','wm-dot');d.setAttribute('fill-opacity',p.getAttribute('f
 d.addEventListener('click',function(){p.dispatchEvent(new Event('click'))});svg.appendChild(d)})}).catch(function(){box.textContent='Map not available.'})}
 card.querySelectorAll('[data-cview]').forEach(function(b){b.addEventListener('click',function(){view(b.dataset.cview)})});
 var v='map';try{v=localStorage.getItem('hgCview')||'map'}catch(e){}view(v==='list'?'list':'map')})();
+(function(){var b=document.getElementById('brand');if(!b)return;var now={f:+b.dataset.file||0,t:+b.dataset.took||0,r:+b.dataset.read||0},old=null;
+// Reacts once, to a real find since this browser last looked. The first visit only remembers.
+try{old=JSON.parse(localStorage.getItem('hgFinds')||'null');localStorage.setItem('hgFinds',JSON.stringify(now))}catch(e){return}
+if(!old||typeof old!=='object')return;
+var hit=now.t>old.t?['Bait used','/ips?tag=took-bait&days=7&sort=last']:now.r>old.r?['Bait read','/ips?tag=read-bait&days=7&sort=last']:now.f>old.f?['New file','/new']:null;
+if(!hit)return;var a=document.createElement('a');a.className='raven-note';a.href=hit[1];a.textContent=hit[0];b.appendChild(a);b.classList.add('raven-on')})();
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
 """
 CSS += ".offscreen{position:fixed;left:-9999px;top:0}"
@@ -3484,7 +3606,7 @@ CSS += "".join(".sbar .g%d{flex-grow:%d}" % (n, n) for n in range(1, 61))
 CSS += (".sbar{display:flex;gap:2px;height:8px;margin:12px 0 4px}.sbar i{display:block;flex-basis:0;min-width:3px;background:var(--accent)}"
         ".sbar i:nth-child(even){opacity:.55}.sbar i:first-child{border-radius:4px 0 0 4px}.sbar i:last-child{border-radius:0 4px 4px 0}.sleg{font-size:12px;margin-bottom:8px}"
         ".bcol i.partial{background:repeating-linear-gradient(135deg,var(--accent) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px var(--accent)}"
-        ".kpi.hot{border-color:var(--accent)}.kpi.hot .kpi-v{color:var(--accent)}.kpi-sw{position:absolute;opacity:0;pointer-events:none}.kpi-more{display:none}"
+        ".kpi.hot{border-color:var(--hot)}.kpi.hot .kpi-v{color:var(--hot)}.kpi-sw{position:absolute;opacity:0;pointer-events:none}.kpi-more{display:none}"
         ".nw{white-space:nowrap}.ft{margin-top:3px}.ioc-more summary{cursor:pointer;color:var(--accent);font-family:system-ui,sans-serif}"
         ".nav-n{margin-left:6px;padding:0 6px;border-radius:9px;font-size:11px;background:var(--accent2);color:var(--accent);font-variant-numeric:tabular-nums}"
         "nav a.on .nav-n{background:var(--panel)}.wrap{overflow-wrap:anywhere}"
@@ -3507,6 +3629,34 @@ CSS += (".story{font-size:15px;margin:8px 0}.ip-w{display:grid;grid-template-col
 CSS += ".c-k{color:#f0a050}.c-l{color:#7aa2f7;text-decoration:underline}.c-f{color:#5fc28a;text-decoration:underline}"
 CSS += (".note{margin:10px 0 0}mark{background:var(--accent2);color:var(--accent);border-radius:2px;padding:0 1px}"
         ".stack-w{display:flex;flex-direction:column;gap:14px;margin-bottom:10px}.stack-w>*{min-width:0}")
+CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--hot:#f0a050}}:root[data-theme=dark]{--hot:#f0a050}:root[data-accent=orange]{--hot:var(--red)}"
+        ".s-hot{color:var(--hot)}.sbar i.hot{background:var(--hot)}.empty{margin:2px 0}.m-row{display:none}"
+        ".ip-h{align-items:baseline}h1.ip-title{font-size:26px;font-weight:600;letter-spacing:.2px;overflow-wrap:anywhere}.ip-tags{order:3;flex-basis:100%}"
+        ".scr{display:block;max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hash.mono{font-size:11px;margin-top:1px}"
+        ".pager.top{margin:0 0 10px}.sizes{margin-left:14px}.sizes a,.sizes b{margin-left:6px;font-weight:500}.sizes b{color:var(--text)}"
+        ".replay-card{max-width:1240px}.twin{border:1px solid var(--line);border-radius:8px;overflow:hidden}"
+        ".twin-bar{display:flex;align-items:center;gap:6px;padding:7px 12px;background:var(--panel2);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}"
+        ".twin-bar i{display:block;width:10px;height:10px;border-radius:50%;background:var(--line)}.twin-bar span{margin-left:8px}"
+        ".twin .player{border-radius:0;min-height:min(340px,60vh)}.tp{color:#5fc28a}.tc{color:#fff;font-weight:500}"
+        ".pseek{width:100%;margin-top:10px;padding:0;border:0;background:none;accent-color:var(--accent)}"
+        ".pb{min-width:340px;width:55%}.dist{display:flex;gap:2px;height:10px}.dist i{display:block;flex-basis:0;min-width:3px;border-radius:2px}"
+        ".o-none{background:var(--line)}.o-one{background:color-mix(in srgb,var(--muted) 60%,var(--panel))}.o-short{background:var(--accent)}.o-pay{background:var(--hot)}"
+        ".dleg{display:flex;flex-wrap:wrap;gap:2px 16px;margin-top:6px;font-size:12px;color:var(--muted)}.dleg span{display:inline-flex;align-items:center;gap:5px}"
+        ".dleg i{display:block;width:8px;height:8px;border-radius:2px}.dleg b{font-weight:500;color:var(--text)}"
+        ".brand{display:flex;align-items:center;gap:10px}.raven-note{font-size:12px;color:var(--hot);white-space:nowrap}"
+        ".raven-on .brand-ic{animation:raven 1.1s ease-in-out 1;box-shadow:0 0 0 2px var(--hot),0 0 14px var(--hot)}"
+        "@keyframes raven{0%,100%{transform:rotate(0)}25%{transform:rotate(-16deg)}55%{transform:rotate(12deg)}80%{transform:rotate(-4deg)}}"
+        "@media (prefers-reduced-motion:reduce){.raven-on .brand-ic{animation:none}}"
+        ".rcpt{position:relative;max-width:400px;margin:4px 0 26px;padding:24px 26px 20px;background:#f4f1e8;color:#23211c;line-height:1.7}.rcpt.mono{font-size:14px}"
+        ".rcpt::after{content:'';position:absolute;left:0;right:0;bottom:-8px;height:8px;background:linear-gradient(135deg,#f4f1e8 50%,transparent 50%) 0 0/12px 8px,linear-gradient(225deg,#f4f1e8 50%,transparent 50%) 0 0/12px 8px}"
+        ".rcpt a{color:inherit;text-decoration:underline}.rcpt hr{border:0;border-top:1px dashed #8d887b;margin:10px 0}.rc-c{text-align:center}.rc-title{font-size:20px;font-weight:600;letter-spacing:3px}.rc-dim{color:#6a665b}"
+        ".rc-r{display:flex;justify-content:space-between;gap:16px}.rc-total{font-size:17px;font-weight:600}"
+        ".rc-bar{height:34px;margin-top:14px;background:repeating-linear-gradient(90deg,#23211c 0 2px,transparent 2px 5px,#23211c 5px 6px,transparent 6px 11px,#23211c 11px 14px,transparent 14px 17px)}.rc-note{max-width:400px}"
+        "@media (max-width:800px){[data-h]{display:none}.m-row{display:table-row}.m-row td{padding:0 8px 7px}.m-row td:empty{display:none}tr:has(+.m-row) td{border-bottom:0}.top5 tbody tr:nth-child(n+11){display:none}h1.ip-title{font-size:22px}"
+        ".ptab thead{display:none}.ptab tr{display:grid;grid-template-columns:1fr auto auto;gap:6px 14px;padding:10px 0;border-bottom:1px solid var(--line)}.ptab tr:last-child{border:0}.ptab td{border:0;padding:0}"
+        ".ptab td.pb{grid-column:1/-1;grid-row:2;min-width:0;width:auto}.ptab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}.ptab td[data-l='Payload share']{grid-column:1/-1;grid-row:3;text-align:left}"
+        ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
+CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -3695,7 +3845,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.send(200, v_overview())
         if path == "/ips":
-            return self.send(200, v_ips(qs))
+            return self.send(200, v_ips(qs, mobile="Mobi" in self.headers.get("User-Agent", "")))
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/export\.(json|csv)", path)
         if m:
             try:
@@ -3720,6 +3870,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_new(qs))
         if path == "/personas":
             return self.send(200, v_personas())
+        if path == "/receipt":
+            return self.send(200, v_receipt(qs))
         if path == "/search":
             return self.send(200, v_search(qs))
         if path == "/creds":

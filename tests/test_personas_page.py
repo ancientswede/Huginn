@@ -105,4 +105,4 @@ class Stats(unittest.TestCase):
 
     def test_page_when_empty(self):
         app._local.h12 = False
-        self.assertIn("Nothing yet", app.v_personas())
+        self.assertIn("No finished sessions yet", app.v_personas())

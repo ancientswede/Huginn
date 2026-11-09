@@ -75,7 +75,7 @@ class XSS(unittest.TestCase):
 
     def test_no_page_renders_planted_markup(self):
         q = urllib.parse.quote(P)
-        pages = ["/", "/search?q=" + q, "/search?q=%2Fbin", "/search?days=" + q + "&q=abc", "/personas", "/new", "/new?all=" + q, "/ips", "/ips?q=" + q, "/ips?cc=" + q, "/ips?sort=" + q, "/ip/" + IP, "/campaigns",
+        pages = ["/", "/search?q=" + q, "/search?q=%2Fbin", "/search?days=" + q + "&q=abc", "/personas", "/receipt", "/receipt?days=" + q, "/new", "/new?all=" + q, "/ips", "/ips?n=" + q, "/ips?q=" + q, "/ips?cc=" + q, "/ips?sort=" + q, "/ip/" + IP, "/campaigns",
                  "/campaign/script/%s" % self.cmdhash, "/campaign/hassh/" + "ab" * 16, "/campaign/file/" + SHA, "/files",
                  "/creds", "/creds?q=" + q, "/creds?days=" + q, "/blocklist", "/blocklist?min=" + q, "/settings", "/settings?ok=" + q,
                  "/account", "/account?ok=" + q, "/replay/%s?ip=%s" % (TTY, q), "/nope/" + q]

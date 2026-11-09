@@ -288,7 +288,7 @@ def link(m):
         target = "replay/%s.html" % path[8:]
     elif re.fullmatch(r"/campaign/(script|hassh|file)/[0-9a-f]+", path):
         target = path[1:] + ".html"
-    elif path in ("/new", "/personas", "/campaigns", "/files", "/creds", "/blocklist", "/settings"):
+    elif path in ("/new", "/personas", "/receipt", "/campaigns", "/files", "/creds", "/blocklist", "/settings"):
         target = path[1:] + ".html"
     elif path.startswith("/static/"):
         target = path[1:]
@@ -333,6 +333,7 @@ app._local.h12 = False
 save("index.html", fix(app.v_overview()))
 save("new.html", fix(app.v_new({})))
 save("personas.html", fix(app.v_personas()))
+save("receipt.html", fix(app.v_receipt({"days": "7"})))
 save("ips.html", fix(app.v_ips({"days": "30"})))
 total = con.execute("SELECT COUNT(*) FROM ips WHERE last>=?", (NOW - 30 * 86400,)).fetchone()[0]
 for p in range(1, (total + 99) // 100):
