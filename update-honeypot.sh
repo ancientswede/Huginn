@@ -27,7 +27,7 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -91,9 +91,17 @@ if [ "$UP_CANARY" = 1 ]; then
   ok "OpenCanary $BEFORE -> $AFTER"
   HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
   rc=0; [ -n "$HTTPPY" ] && patch_as opencanary opencanary-http "$HTTPPY" || rc=$?
-  case $rc in 0|3) ok "web logging patch in place" ;; *) warn "web logging patch no longer fits the new OpenCanary (only start-page visits are logged)" ;; esac
+  case $rc in 0|3) ok "web reply/logging patch in place" ;; *) warn "web reply/logging patch no longer fits the new OpenCanary (only start-page visits are logged)"; FAILED=1 ;; esac
   patch_as opencanary opencanary-ports "$O/.opencanary.conf" || true
   restart_ok opencanary
+fi
+
+# Apply local reply changes even without --opencanary (which upgrades the package).
+if [ "$UP_CANARY" = 0 ] && [ -x "$O/oc-env/bin/python3" ]; then
+  HTTPPY=$(find "$O/oc-env" -path '*opencanary/modules/http.py' | head -1)
+  rc=0
+  if [ -n "$HTTPPY" ]; then patch_as opencanary opencanary-http "$HTTPPY" || rc=$?; else rc=1; fi
+  case $rc in 0|3) ok "web reply/logging patch in place" ;; *) warn "web reply patch did not fit; no files changed"; FAILED=1 ;; esac
 fi
 
 say "Web identity"

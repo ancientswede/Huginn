@@ -10,7 +10,14 @@
 # Each change updates the login page, the Server header and the certificate together and restarts OpenCanary, nothing else.
 # The login pages are written from scratch: product names as plain text, no logos or code from any vendor.
 # Huginn reads the history through hp-export and cannot change any of this: the honeypot decides by itself.
+import runpy
 import fcntl, glob, html, http.client, json, os, random, re, shutil, subprocess, sys, tempfile, time
+
+# Installed alongside this tool's shared data; source-tree fallback supports local tests.
+_WEBREPLY = "/usr/local/share/hp-identity/webreply.py"
+if not os.path.isfile(_WEBREPLY):
+    _WEBREPLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webreply.py")
+hpw_write_skin = runpy.run_path(_WEBREPLY)["hpw_write_skin"]
 
 OC_USER = "opencanary"
 OC_HOME = "/home/opencanary"
@@ -75,6 +82,8 @@ def is_dark(colour):
 
 
 def login_page(ident, model):
+    if ident["layout"] == "builtin":
+        ident = dict(ident, layout="card", accent="#2875b5", bg="#eef2f6")
     e = {k: html.escape(str(ident[k])) for k in ("vendor", "product", "accent", "bg")}
     m, layout = html.escape(model), ident["layout"]
     vals = {"bg": ident["bg"], "accent": ident["accent"], "fg": "#fff" if is_dark(ident["bg"]) else "#222"}
@@ -109,6 +118,7 @@ def build_skin(ident, model, root=SKINS):
             fh.write(text)
         os.chmod(os.path.join(final, name), 0o644)       # whatever umask this shell has: OpenCanary is another user
     os.chmod(os.path.join(final, "static"), 0o755)
+    hpw_write_skin(final, ident)
     os.chmod(final, 0o755)
     return final
 
@@ -211,11 +221,11 @@ def lock():
     return fd
 
 
-def save_pending(before, stamp, ident_id):
+def save_pending(before, stamp, ident_id, refresh=False, committed=False):
     tmp = "%s.%d" % (PENDING, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"before": before, "stamp": stamp, "id": ident_id}, fh)
+        json.dump({"before": before, "stamp": stamp, "id": ident_id, "refresh": refresh, "committed": committed}, fh)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, PENDING)
@@ -242,7 +252,7 @@ def recover():
         print("A note about an interrupted change could not be read: see %s.bad" % PENDING)
         return
     last = history()[-1:]
-    if last and last[0][0] == p.get("stamp") and last[0][1] == p.get("id"):
+    if p.get("committed") or (not p.get("refresh") and last and last[0][0] == p.get("stamp") and last[0][1] == p.get("id")):
         clear_pending()                            # the history line was written: that change was finished, only the tidying was not
         return
     before = p.get("before", p) if "stamp" in p else p      # a note from 0.23.0 is the old settings on their own
@@ -269,10 +279,13 @@ def add_history(stamp, ident, label):
         os.fsync(fh.fileno())
 
 
-def apply_identity(ident):
+def apply_identity(ident, refresh=False):
     if not os.path.isdir(OC_HOME):
         raise SystemExit("OpenCanary is not installed here.")
+    previous = history()[-1:]
     model = random.SystemRandom().choice(ident["models"])
+    if refresh and previous:
+        model = previous[0][3].removeprefix(ident["vendor"] + " ")
     label = "%s %s" % (ident["vendor"], model)
     if not LABEL_RE.match(label):
         raise SystemExit("Bad label: %s" % label)
@@ -285,21 +298,23 @@ def apply_identity(ident):
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     stamp = int(time.time())       # also what ties this note to the history line, see recover()
     size_before = os.path.getsize(HISTORY) if os.path.exists(HISTORY) else 0
-    save_pending(before, stamp, ident["id"])
+    save_pending(before, stamp, ident["id"], refresh=refresh)
     try:
-        if ident["layout"] == "builtin":
-            change = {"http.skin": "nasLogin", "https.skin": "nasLogin", "http.skindir": ""}
-        else:
-            skin = build_skin(ident, model)
-            change = {"http.skin": ident["id"], "https.skin": ident["id"], "http.skindir": skin}
+        # Every identity gets a generated skin, including the formerly builtin Synology.
+        skin = build_skin(ident, model)
+        change = {"http.skin": ident["id"], "https.skin": ident["id"], "http.skindir": skin}
         change.update({"http.banner": ident["banner"], "https.certificate": pem, "https.key": key})
         write_conf(change)
         restart()
         if not serving(ident["banner"], port):
             raise RuntimeError("did not come up")
-        add_history(stamp, ident, label)
+        if not refresh:
+            add_history(stamp, ident, label)
     except (Exception, SystemExit) as e:
         go_back(ident, before, port, skin, e, size_before)
+    if refresh:
+        # Mark a history-preserving refresh committed before removing its recovery note.
+        save_pending(change, stamp, ident["id"], refresh=True, committed=True)
     clear_pending()
     prune_skins(skin)
     print("Now: %s (%s)" % (label, ident["kind"]))
@@ -357,8 +372,8 @@ def main(argv):
         return 0
     if os.geteuid() != 0:
         raise SystemExit("Run as root.")
-    if cmd not in ("set", "rotate"):
-        print("Usage: hp-identity list | status | set <id>|random | rotate")
+    if cmd not in ("set", "rotate", "refresh"):
+        print("Usage: hp-identity list | status | set <id>|random | rotate | refresh")
         return 2
     held = lock()
     if held is None:
@@ -367,6 +382,11 @@ def main(argv):
         raise SystemExit("Another change is running. Try again in a minute.")
     recover()
     h = history()                   # read under the lock, so it cannot change between here and the decision
+    if cmd == "refresh":
+        if not h or h[-1][1] not in IDENTITIES:
+            raise SystemExit("No known identity to refresh; set one first.")
+        apply_identity(IDENTITIES[h[-1][1]], refresh=True)
+        return 0
     if cmd == "set" and len(argv) == 3:
         pick = choose([x[1] for x in h]) if argv[2] == "random" else argv[2]
         if pick not in IDENTITIES:
@@ -379,7 +399,7 @@ def main(argv):
             return 0
         apply_identity(IDENTITIES[choose([x[1] for x in h])])
         return 0
-    print("Usage: hp-identity list | status | set <id>|random | rotate")
+    print("Usage: hp-identity list | status | set <id>|random | rotate | refresh")
     return 2
 
 

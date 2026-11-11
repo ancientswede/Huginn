@@ -112,7 +112,8 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - an "always block" / "never block" switch
 - **Personas:** how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof.
 - **Search:** commands, file hashes and names, addresses found inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history.
-- **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH), so one botnet shows up as one group.
+- **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack and mail client name (HELO), so one botnet shows up as one group.
+- **Web attacks:** every request to the web trap is matched against about 3,100 rules from [Krawl](https://github.com/BlessedRebuS/Krawl): CVE exploits (with a link to the CVE), path traversal, webshells, `.env`/`.git` hunting, scanners and probes for exposed MCP servers. Exploits tag the attacker `web-exploit`, probes `web-probe`. A plain GET of a path counts as a probe: it only asks whether the path is there.
 - **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up on [MalwareBazaar](https://bazaar.abuse.ch) by its hash.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
   - **Is my password in here?** Check whether attackers have tried one of your own passwords. The check runs in your browser: only the first 4 characters of the password's SHA-256 hash go to Huginn (the same idea as Have I Been Pwned), so the password itself never leaves your machine.
@@ -479,6 +480,10 @@ hp-identity set mikrotik      # change now (or: set random)
 
 `ROTATE_DAYS=21` in `/etc/default/hp-identity` sets how often it changes, `0` turns it off. Do not make it very short: a machine that keeps changing what it is on one address looks odd by itself, and scanners keep history. The login pages are written from scratch for Huginn, with product names as plain text and no logos or code from any vendor.
 
+**Fake replies.** For the files scanners hunt most, the trap answers 200 with believable fake content instead of 404: `.env` and its variants, `.git/config` and `HEAD`, `.aws/credentials` and `config`, phpinfo, `/etc/passwd` through path traversal, PHPUnit's `eval-stdin.php`, Spring `/actuator/env` and MCP servers (`/mcp`, `/sse`, with `initialize` and `tools/list`). Every secret in them is a bait value from `/etc/huginn-honeypot/bait.json`, the same for every request, so Huginn tags anyone who later uses one `took-bait`, and the request itself `read-bait`. Without a `bait.json` the trap answers 404 as before. Replies are plain text or JSON, small, and sent with a sandboxing `Content-Security-Policy`.
+
+**robots.txt trap.** Each identity gets a `robots.txt` with four `Disallow:` paths that exist nowhere else and stay the same for that identity. Only someone who reads robots.txt and goes looking finds them; Huginn tags them `robots-trap` (+5).
+
 Huginn only reads the history (through `hp-export`) and shows it on **Personas**: hits per day for each device, since each one runs for a different time. It cannot change the identity: nothing ever connects to the honeypot to control it.
 
 ## Configuration
@@ -596,7 +601,7 @@ If Huginn is useful in your homelab, you can [buy me a coffee](https://buymeacof
 
 ## License
 
-Copyright © 2026 Ancientswede. Licensed under [AGPL-3.0-or-later](LICENSE). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
+Copyright © 2026 Ancientswede. Licensed under [AGPL-3.0-or-later](LICENSE). The web attack rules in `static/web-rules.json.gz` are converted (by `tools/krawl-rules.py`) from the YARA rules of [Krawl](https://github.com/BlessedRebuS/Krawl) by Patrick Di Fazio, licensed under MIT (see `static/web-rules.LICENSE`). The world map in `static/world-map.json` is a simplified version of [@svg-maps/world](https://github.com/VictorCazanave/svg-maps) by Victor Cazanave, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (see `static/world-map.LICENSE.md`).
 
 The raven logo and the banner were made for this project with Grok Imagine and are shared under the same license.
 

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.24.1"
+HUGINN_VERSION = "0.25.0"
 CHANGELOG = [
+    ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
     ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
     ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
     ("0.23.1", "2026-11-09", "Security and bug hunt. Fixed: a specially crafted command line could freeze Huginn for minutes, web requests were counted as logins on the password lists, a failed update of New left permanent holes, backup and restore could collide, restore accepted a database that was not Huginn's, one huge captured file could stop all file analysis, firewall feeds did not clear IPv6 when the list became empty, a reverse DNS name containing a word like research could keep an attacker off the blocklist, and the database file was readable by other users on the machine."),
@@ -244,6 +245,9 @@ CREATE TABLE IF NOT EXISTS seen(kind TEXT, key TEXT, observed REAL, ip TEXT, ses
 CREATE INDEX IF NOT EXISTS seen_obs ON seen(observed);
 CREATE TABLE IF NOT EXISTS gaps(start REAL PRIMARY KEY, end REAL);
 CREATE TABLE IF NOT EXISTS web_identities(ts REAL PRIMARY KEY, id TEXT, kind TEXT, label TEXT);
+CREATE TABLE IF NOT EXISTS webhits(h TEXT PRIMARY KEY, ip TEXT, ts REAL, level TEXT, type TEXT, cve TEXT, sev INTEGER, rule TEXT, robots INTEGER, reply TEXT);
+CREATE INDEX IF NOT EXISTS wh_ip ON webhits(ip);
+CREATE INDEX IF NOT EXISTS wh_type ON webhits(type, ts);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 """
 
@@ -455,6 +459,151 @@ def vnc_logins_backfill(con):
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('vnc_logins','1')")
 
 
+# ---------------------------------------------------------------- web attacks (rules from Krawl, MIT)
+# static/web-rules.json.gz is made by tools/krawl-rules.py from Krawl's YARA rules (github.com/BlessedRebuS/Krawl).
+# Each web request is matched once, when it is stored: its path, query, body and user agent, raw and URL-decoded.
+# Rules are tried from the highest severity down, so the first match is the best one. A rule that only recognises a
+# scanner by its user agent is a label, not an attack, and only counts when nothing else matched.
+WEB_RULES_FILE = os.path.join(STATIC_DIR, "web-rules.json.gz")
+WEB_SCANNER_TYPES = {"research_scanner_ua", "scanner_user_agent"}
+WEB_EXPLOIT_SEV = 7
+WEB_B = re.compile(r"^(\S{1,10}) (\S+?)(?: \((\d{1,3})\))?(?:  \[reply ([a-z_]{1,20})\])?(  \[robots\])?(?:  body: (.*?))?(?:  · (.*))?$", re.S)
+WEB_BAIT_REPLIES = {"env", "aws", "phpinfo", "actuator", "robots_backup"}   # honeypot replies that hand out bait values (honeypot/webreply.py)
+_web = {"rules": None, "sig": "", "error": ""}
+_web_lock = threading.Lock()
+
+
+def web_rules():
+    with _web_lock:
+        if _web["rules"] is None:
+            rules, sig, err = [], "", ""
+            try:
+                with open(WEB_RULES_FILE, "rb") as fh:
+                    raw = fh.read(16 << 20)
+                sig = hashlib.sha1(raw).hexdigest()[:16]
+                for r in json.loads(gzip.decompress(raw))["rules"]:
+                    clauses = []
+                    for targets, pats in r["clauses"]:
+                        rx = []
+                        for nocase in (False, True):
+                            alt = [p for k, p, i in pats if k == "r" and bool(i) == nocase]
+                            if alt:
+                                rx.append(re.compile("|".join("(?:%s)" % p for p in alt), re.I if nocase else 0))
+                        clauses.append((None if "*" in targets else tuple(targets),
+                                        [p for k, p, i in pats if k == "l" and not i], [p.lower() for k, p, i in pats if k == "l" and i], rx))
+                    rules.append((int(r["sev"]), bool(r.get("cve")), str(r["type"])[:60], str(r.get("cve") or "")[:80], str(r["rule"])[:80], clauses,
+                                  str(r.get("desc") or "")[:200]))
+            except (OSError, ValueError, KeyError, TypeError, IndexError, re.error, EOFError) as e:
+                rules, err = [], repr(e)[:200]
+            rules.sort(key=lambda x: (-x[0], not x[1]))
+            _web.update(rules=rules, sig=sig, error=err)
+        return _web["rules"], _web["sig"]
+
+
+def web_fields(b):
+    m = WEB_B.match(b or "")
+    if not m:
+        return None
+    meth, url, status, reply, robots, body, ua = m.groups()
+    path, _, query = url.partition("?")
+    f = {"method": meth, "path": path, "query": query, "uri": url, "body": body or "", "user_agent": ua or ""}
+    for k, v in f.items():
+        d = urllib.parse.unquote_plus(v)
+        if d != v:
+            f[k] = v + "\n" + d
+    return f, reply, bool(robots)
+
+
+def web_rule_hits(rule, f, low):
+    for targets, lits, ilits, rx in rule[5]:
+        for t in targets or f:
+            v = f.get(t, "")
+            if not v:
+                continue
+            if any(x in v for x in lits) or any(x in low[t] for x in ilits) or any(r.search(v) for r in rx):
+                return True
+    return False
+
+
+def web_classify(b):
+    # (level, type, cve, sev, rule, robots, reply). level: exploit, probe, scanner, or "" when no rule matched.
+    parsed = web_fields(b)
+    if not parsed:
+        return ("", None, None, 0, None, 0, None)
+    f, reply, robots = parsed
+    low = {k: v.lower() for k, v in f.items()}
+    rules, _sig = web_rules()
+    scanner = None
+    for rule in rules:
+        if rule[2] in WEB_SCANNER_TYPES:
+            if scanner is None and web_rule_hits(rule, f, low):
+                scanner = rule
+            continue
+        if web_rule_hits(rule, f, low):
+            # A bare GET of a path only asks whether it exists: the attack itself needs input (query, body or "..").
+            bare = f["method"] in ("GET", "HEAD") and not f["query"] and not f["body"] and ".." not in low["path"]
+            level = "exploit" if rule[0] >= WEB_EXPLOIT_SEV and not bare else "probe"
+            return (level, rule[2], rule[3], rule[0], rule[4], int(robots), reply)
+    if scanner:
+        return ("scanner", scanner[2], scanner[3], scanner[0], scanner[4], int(robots), reply)
+    return ("", None, None, 0, None, int(robots), reply)
+
+
+def web_rule_info(rtype):
+    # Description and CVE of a rule type, for the pages.
+    for r in web_rules()[0]:
+        if r[2] == rtype:
+            return r
+    return None
+
+
+# The worst level among a group of web hits.
+WEB_LEVEL_SQL = ("CASE WHEN MAX(level='exploit') THEN 'exploit' WHEN MAX(level='probe') THEN 'probe' "
+                 "WHEN MAX(level='scanner') THEN 'scanner' ELSE '' END")
+
+
+def web_label(rtype, cve):
+    # Short name for a rule type: the CVE when there is one, otherwise the type in words.
+    if cve:
+        return cve.split(",")[0].strip()
+    return (rtype or "?").replace("_", " ")
+
+
+def web_tag(level, rtype, cve):
+    cls = {"exploit": "t-red", "probe": "t-yellow", "scanner": "t-grey"}.get(level)
+    if not cls:
+        return ""
+    return '<a class="tag %s" href="/campaign/web/%s" title="%s">%s</a>' % (cls, esc(rtype), esc(level), esc(web_label(rtype, cve)))
+
+
+def classify_web(con, budget=20.0, limit=5000):
+    # Web requests not matched yet, newest first, until the time budget is used. New rules start again from the top.
+    rules, sig = web_rules()
+    if not rules:
+        return 0
+    if get_meta(con, "webrules") != sig:
+        with con:
+            con.execute("DELETE FROM webhits")
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('webrules',?)", (sig,))
+    rows = con.execute("SELECT e.h, e.ip, e.ts, e.b FROM events e WHERE e.kind='canary' AND e.a IN ('http','https') "
+                       "AND NOT EXISTS (SELECT 1 FROM webhits w WHERE w.h=e.h) ORDER BY e.ts DESC LIMIT ?", (limit,)).fetchall()
+    end = time.time() + budget
+    out, touched = [], set()
+    for h, ip, ts, b in rows:
+        r = web_classify(b)
+        out.append((h, ip, ts) + r)
+        if r[0] in ("exploit", "probe") or r[5] or r[6]:
+            touched.add(ip)
+        if time.time() > end:
+            break
+    if out:
+        with con:
+            con.executemany("INSERT OR IGNORE INTO webhits(h, ip, ts, level, type, cve, sev, rule, robots, reply) VALUES(?,?,?,?,?,?,?,?,?,?)", out)
+            for ip in touched:
+                recompute_ip(con, ip)
+    return len(out)
+
+
 def p_canary(line):
     if not line.startswith("{"):
         return None
@@ -481,6 +630,11 @@ def p_canary(line):
         return (datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp(), ip, "canary", "canary", None, svc, trunc("%s / %s" % (user or "", pw or ""), 600))
     if svc in ("http", "https") and ld.get("PATH"):
         b = "%s %s%s" % (ld.get("METHOD") or "GET", ld.get("PATH"), " (%s)" % ld["STATUS"] if ld.get("STATUS") else "")
+        # Set by the honeypot when it answered with fake content (which type) or the path is only listed in robots.txt.
+        if isinstance(ld.get("HP_REPLY"), str) and re.fullmatch(r"[a-z_]{1,20}", ld["HP_REPLY"]):
+            b += "  [reply %s]" % ld["HP_REPLY"]
+        if ld.get("HP_ROBOTS") == "1":
+            b += "  [robots]"
         if ld.get("BODY"):
             b += "  body: " + str(ld["BODY"])[:300]
         if ld.get("USERAGENT"):
@@ -1029,17 +1183,19 @@ def sshole_password(proto, password):
     return proto == "ssh" and SSHOLE_MIN <= len((password or "").encode("utf-8", "surrogatepass")) <= SSHOLE_MAX
 
 
-def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False):
-    # The one place that defines the score: (label, points), zero points left out.
+def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False, web=""):
+    # The one place that defines the score: (label, points), zero points left out. web: "exploit", "probe" and/or "robots".
     parts = [("seen", 1), ("SSHole probe", 10 if sshole else 0), ("took bait", 20 if took else 0), ("read bait", 5 if read else 0),
+             ("web exploit", 8 if "exploit" in web else 0), ("web probe", 3 if "probe" in web and "exploit" not in web else 0),
+             ("robots.txt trap", 5 if "robots" in web else 0),
              ("login attempts", 2 if lo + lf else 0), ("brute force", 2 if lo + lf >= 10 else 0), ("commands", min(10, cmds // 2)),
              ("files", 15 if files else 0), ("proxy", 10 if tcpip else 0), ("exploit", 10 if expl else 0),
              ("decoy services", 3 * len(csvcs)), ("repeat visits", min(5, sess // 20))]
     return [(k, v) for k, v in parts if v]
 
 
-def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False):
-    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole))
+def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web=""):
+    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web))
     tags = []
     if took:
         tags.append("took-bait")
@@ -1057,6 +1213,12 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("exploit")
     if sshole:
         tags.append("sshole-probe")
+    if "exploit" in web:
+        tags.append("web-exploit")
+    elif "probe" in web:
+        tags.append("web-probe")
+    if "robots" in web:
+        tags.append("robots-trap")
     if len(set(protos) | set(csvcs)) >= 2:
         tags.append("multi-service")
     if tarpit_s >= 60:
@@ -1084,7 +1246,11 @@ def recompute_ip(con, ip):
     csvcs = sorted({x for x in (c["svcs"] or "").split(",") if x})
     took, read = bait_flags(con.execute("SELECT kind,a,b FROM events WHERE ip=? AND kind IN ('cmd','login_ok','login_fail','canary')", (ip,)).fetchall())
     sshole = con.execute("SELECT 1 FROM events e WHERE e.ip=? AND %s LIMIT 1" % SSHOLE_SQL, (ip,)).fetchone() is not None
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole)
+    w = con.execute("SELECT MAX(level='exploit'), MAX(level='probe'), MAX(robots), MAX(reply IN (%s)) FROM webhits WHERE ip=?"
+                    % ",".join("'%s'" % x for x in sorted(WEB_BAIT_REPLIES)), (ip,)).fetchone()
+    web = " ".join(k for k, v in zip(("exploit", "probe", "robots"), w[:3]) if v)
+    read = read or bool(w[3])
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -1151,6 +1317,7 @@ def retention(con):
         touched = [r[0] for r in con.execute("SELECT DISTINCT session FROM events WHERE ts < ? AND session IS NOT NULL", (cutoff,))]
         con.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         con.execute("DELETE FROM mails WHERE h NOT IN (SELECT h FROM events)")
+        con.execute("DELETE FROM webhits WHERE h NOT IN (SELECT h FROM events)")
         con.execute("DELETE FROM sessions WHERE end < ?", (cutoff,))
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
         for sid in touched:              # a session across the limit keeps only its newer events: count again
@@ -1360,6 +1527,7 @@ def collector_loop():
             n = store(con, rows)
             store_files(con, parse_export.files)
             store_mails(con, parse_export.mails)
+            classify_web(con)
             note_sync(con, t0)
             skip = hashes  # only set once everything is stored
             set_meta(con, "last_ingest", t0)
@@ -1845,7 +2013,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 def tag_html(tags):
@@ -2269,7 +2437,7 @@ def board_detail(con, st, rng, svc):
             meta[r["ip"]] = r
     top = sorted(((ip, p[0], len(p[1])) for ip, p in per_ip.items() if ip in meta), key=lambda x: (-meta[x[0]]["score"], -x[1]))[:10]
     # Latest raw data: identical rows from the same IP are folded into one line with a count (VNC alone sends thousands).
-    feed = con.execute("SELECT " + BOARD_SVC + " svc, e.ip, e.kind, e.a, e.b, COUNT(*) n, MAX(e.ts) ts" + BOARD_FROM
+    feed = con.execute("SELECT " + BOARD_SVC + " svc, e.ip, e.kind, e.a, e.b, COUNT(*) n, MAX(e.ts) ts, MAX(e.h) h" + BOARD_FROM
                        + " AND e.kind IN (%s) AND NOT (e.kind='canary' AND COALESCE(e.b,'')='')" % ",".join("?" * len(BOARD_FEED))
                        + sf + hs + " GROUP BY svc, e.ip, e.kind, e.a, e.b ORDER BY ts DESC LIMIT 25", [since] + list(BOARD_FEED) + sa + ha).fetchall()
     ccs = {r[0]: r[1] for r in con.execute("SELECT ip, cc FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(feed)), [r["ip"] for r in feed])} if feed else {}
@@ -2279,7 +2447,12 @@ def board_detail(con, st, rng, svc):
             creds[(user, pw)] = creds.get((user, pw), 0) + cnt
     creds = sorted(creds.items(), key=lambda x: (-x[1], x[0]))[:12]
     return {"ips": ips, "logins": logins, "labels": labels, "since": since, "creds": creds, "top": [(ip, nn, ns, meta[ip]) for ip, nn, ns in top],
-            "feed": [dict(r) for r in feed], "ccs": ccs}
+            "feed": [dict(r, web=web_of(con, r["h"]) if r["kind"] == "canary" and r["svc"] in ("http", "https") else None) for r in feed], "ccs": ccs}
+
+
+def web_of(con, h):
+    w = con.execute("SELECT level, type, cve FROM webhits WHERE h=?", (h,)).fetchone()
+    return tuple(w) if w and w[0] else None
 
 
 def board_text(kind, a, b):
@@ -2369,6 +2542,8 @@ def v_board(con, qs):
         txt = clean(board_text(r["kind"], r["a"], r["b"]), 600)
         cell = ('<details class="fd"><summary>%s</summary><div>%s</div></details>' % (esc(txt[:100]) + "…", esc(txt))) if len(txt) > 100 else esc(txt)
         mark = ' <span class="tag t-orange">accepted</span>' if r["kind"] == "login_ok" else ""
+        if r.get("web"):
+            mark += " " + web_tag(*r["web"])
         frows += ('<tr><td class="muted nowrap" title="%s">%s</td><td>%s</td><td class=nowrap>%s %s</td><td class="mono fd-d">%s%s%s</td></tr>'
                   % (esc(fmt_tss(r["ts"])), esc(ago(r["ts"])), esc(r["svc"]), ip_link(r["ip"]), cc_html(d["ccs"].get(r["ip"])), cell, mark,
                      (' <span class="fd-n">×%s</span>' % num(r["n"])) if r["n"] > 1 else ""))
@@ -2636,7 +2811,7 @@ def v_ips(qs, mobile=False):
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
                ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "",
                '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
     pager, pager_top = "", ""
@@ -2722,7 +2897,8 @@ def score_html(r):
     have = set((r["tags"] or "").split(","))
     parts = sorted(score_parts(r["sessions"] or 0, r["logins_ok"] or 0, r["logins_fail"] or 0, r["cmds"] or 0, r["files"] or 0, r["tcpip"] or 0,
                                r["exploits"] or 0, [c for c in (r["canary_svcs"] or "").split(",") if c],
-                               "took-bait" in have, "read-bait" in have, "sshole-probe" in have), key=lambda p: -p[1])
+                               "took-bait" in have, "read-bait" in have, "sshole-probe" in have,
+                               " ".join(k for k, t in (("exploit", "web-exploit"), ("probe", "web-probe"), ("robots", "robots-trap")) if t in have)), key=lambda p: -p[1])
     if sum(v for _k, v in parts) != r["score"]:         # scored by an older version: do not show numbers that do not add up
         return '<div class="sleg muted">Breakdown unavailable</div>'
     segs = "".join('<i class="g%d%s" title="%s: %d"></i>' % (min(v, 60), " hot" if k in ("took bait", "read bait", "SSHole probe", "files", "exploit") else "", esc(k), v) for k, v in parts)
@@ -2914,6 +3090,17 @@ def v_ip(ip):
     if can:
         can_html = ('<div class="card span2"><h3>Other services (decoys)</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
                     % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
+
+    # Web attacks: what the rules recognised in this IP's web requests, worst first.
+    wh = con.execute("SELECT " + WEB_LEVEL_SQL + " level, type, MAX(cve) cve, MAX(sev) sev, COUNT(*) n, MAX(ts) l, MAX(robots) rb, GROUP_CONCAT(DISTINCT reply) rp "
+                     "FROM webhits WHERE ip=? AND (level!='' OR robots OR reply IS NOT NULL) GROUP BY type ORDER BY sev DESC, n DESC LIMIT 40", (ip,)).fetchall()
+    if wh:
+        wrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>"
+                        % (web_tag(w["level"], w["type"], w["cve"]) or '<span class=muted>–</span>',
+                           esc(", ".join(x for x in (("robots.txt trap" if w["rb"] else ""), ("fake reply: " + w["rp"] if w["rp"] else "")) if x) or (web_rule_info(w["type"]) or [""] * 7)[6]),
+                           esc(w["sev"] or "–"), num(w["n"]), esc(ago(w["l"]))) for w in wh)
+        can_html += ('<div class="card span2"><h3>Web attacks <span class=muted>rules from Krawl</span></h3><div class="scroll"><table class=wide><thead><tr>'
+                     '<th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>' % wrows)
 
     # Mail sent to the relay trap: every recipient and the start of the message (attacker text, escaped, never a link).
     mails = con.execute("SELECT e.ts, e.a, m.mail_from, m.subject, m.rcpts, m.helo, m.size, m.sample FROM mails m JOIN events e ON e.h = m.h "
@@ -3276,9 +3463,14 @@ def v_search(qs):
     attackers = section("Attackers", ip_n, "<th>IP</th><th>CC</th><th>Network</th><th>Last</th><th class=num>Score</th>",
                         ["<td>%s</td><td>%s</td><td class=trunc>%s</td>%s%s" % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["org"] or ""), when(r["last"]), n(r["score"])) for r in ips_])
 
+    wa = con.execute("SELECT type, MAX(cve) cve, MAX(level='exploit') x, COUNT(DISTINCT ip) nip, MAX(ts) l FROM webhits WHERE ts>=? AND level IN ('exploit','probe') "
+                     "AND (cve LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\') GROUP BY type ORDER BY l DESC LIMIT ?", (since, like, like, SEARCH_ROWS)).fetchall()
+    webs = section("Web attacks", len(wa), "<th>Attack</th><th>Type</th><th class=num>IPs</th><th>Last</th>",
+                   ["<td>%s</td><td class=mono>%s</td>%s%s" % (web_tag("exploit" if r["x"] else "probe", r["type"], r["cve"]), snippet(r["type"], q), n(r["nip"]), when(r["l"])) for r in wa])
+
     quoted = esc(urllib.parse.quote(q))
     also = '<p class="muted small">Also look in <a href="/ips?q=%s">attacker networks</a> or <a href="/creds?q=%s">credentials</a>.</p>' % (quoted, quoted)
-    found_any = cmds + files_ + fails + decoys + sessions_ + attackers
+    found_any = cmds + files_ + fails + webs + decoys + sessions_ + attackers
     return page("Search", form + '<div class="stack-w">%s</div>%s' % (found_any or '<div class="card muted">Nothing found.</div>', also), "/search")
 
 
@@ -3514,22 +3706,32 @@ def v_campaigns():
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                     % (esc(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
+    # Web attacks by rule: how many addresses tried the same thing.
+    wa = con.execute("SELECT type, MAX(cve) cve, MAX(sev) sev, MAX(level='exploit') x, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM webhits "
+                     "WHERE level IN ('exploit','probe') GROUP BY type ORDER BY x DESC, nip DESC, n DESC LIMIT 60").fetchall()
+    warows = "".join("<tr><td class=nowrap>%s</td><td class=trunc>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>"
+                     % (web_tag("exploit" if w["x"] else "probe", w["type"], w["cve"]), esc((web_rule_info(w["type"]) or [""] * 7)[6]),
+                        num(w["sev"]), num(w["nip"]), num(w["n"]), esc(ago(w["l"]))) for w in wa)
+
     # Mail clients: the name a bot gives in HELO/EHLO is often its own and stays the same across many addresses.
     hl = con.execute("SELECT LOWER(SUBSTR(b, 6)) name, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events "
                      "WHERE kind='canary' AND src='traps' AND b LIKE 'HELO %' GROUP BY name ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
     hlrows = "".join("<tr><td class='mono fd-d'><a href='/search?q=%s&days=all'>%s</a></td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                      % (esc(urllib.parse.quote("HELO " + h["name"], safe="")), esc(clean(h["name"], 120)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hl)
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH) and mail client name (HELO).</p>'
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl) and mail client name (HELO).</p>'
             '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
-            '<h2>Mail clients (HELO)</h2><div class="card">%s</div>'
+            '<h2>Web attacks</h2><div class="card">%s</div><h2>Mail clients (HELO)</h2><div class="card">%s</div>'
             % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
+               '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
                '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet")))
     return page("Campaigns", body, "/campaigns")
 
 
 def v_campaign(kind, val):
     con = db()
+    if kind == "web":
+        return v_campaign_web(con, val)
     if not re.fullmatch(r"[0-9a-f]{8,64}", val or ""):
         return None
     if kind == "script":
@@ -3560,6 +3762,30 @@ def v_campaign(kind, val):
                       num(i["n"]), esc(ago(i["l"]))) for i in ips)
     body = ('<h1 class=mono>%s</h1><div class="grid"><div class="span2">%s</div><div class="card span2"><h3>IPs <span class=muted>%s</span></h3>'
             '<table class="wide"><thead><tr><th>IP</th><th>CC</th><th>Network</th><th class=num>Count</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>'
+            % (esc(title), detail, num(len(ips)), rows))
+    return page(title, body, "/campaigns")
+
+
+def v_campaign_web(con, rtype):
+    info = web_rule_info(rtype)
+    ips = con.execute("SELECT ip, COUNT(*) n, MAX(ts) l FROM webhits WHERE type=? GROUP BY ip ORDER BY l DESC LIMIT 500", (rtype,)).fetchall()
+    if not ips:
+        return None
+    ex = con.execute("SELECT e.b, w.level, COUNT(*) n, MAX(e.ts) l FROM webhits w JOIN events e ON e.h=w.h WHERE w.type=? "
+                     "GROUP BY e.b ORDER BY l DESC LIMIT 30", (rtype,)).fetchall()
+    cves = [c.strip() for c in (info[3] if info else "").split(",") if re.fullmatch(r"CVE-\d{4}-\d{3,7}", c.strip())]
+    detail = ('<div class="card"><h3>%s <span class=muted>severity %s</span></h3><p>%s</p>%s<p class="muted small">Rule %s from Krawl (MIT).</p></div>'
+              % (esc(web_label(rtype, info[3] if info else "")), esc(info[0] if info else "?"), esc(info[6] if info else "This rule is no longer in the rule set."),
+                 ("<p>%s</p>" % " · ".join(ext("https://nvd.nist.gov/vuln/detail/" + c, c) for c in cves)) if cves else "", esc(info[4] if info else rtype)))
+    detail += ('<div class="card"><h3>Requests <span class=muted>latest %s, attacker text</span></h3><table class=wide><thead><tr><th>Request</th><th class=num>Count</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div>'
+               % (num(len(ex)), "".join("<tr><td class='mono fd-d'>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>" % (esc(clean(x["b"], 400)), num(x["n"]), esc(ago(x["l"]))) for x in ex)))
+    en = {x["ip"]: x for x in con.execute("SELECT ip, cc, org FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(ips)), [i["ip"] for i in ips])}
+    rows = "".join("<tr><td>%s</td><td>%s</td><td class=trunc>%s</td><td class=num>%s</td><td>%s</td></tr>"
+                   % (ip_link(i["ip"]), cc_html(en[i["ip"]]["cc"] if i["ip"] in en else None), esc(en[i["ip"]]["org"] or "" if i["ip"] in en else ""),
+                      num(i["n"]), esc(ago(i["l"]))) for i in ips)
+    title = "Web attack " + web_label(rtype, info[3] if info else "")
+    body = ('<h1>%s</h1><div class="grid"><div class="span2">%s</div><div class="card span2"><h3>IPs <span class=muted>%s</span></h3>'
+            '<table class="wide"><thead><tr><th>IP</th><th>CC</th><th>Network</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>'
             % (esc(title), detail, num(len(ips)), rows))
     return page(title, body, "/campaigns")
 
@@ -4502,7 +4728,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(cred_check(db(), m.group(1))), "application/json")
         if path == "/campaigns":
             return self.send(200, v_campaigns())
-        m = re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path)
+        m = re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path) or re.fullmatch(r"/campaign/(web)/([a-z0-9_]{1,60})", path)
         if m:
             out = v_campaign(m.group(1), m.group(2))
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1>"))
@@ -4818,6 +5044,8 @@ def ingest_once():
     n = store(con, rows)
     store_files(con, parse_export.files)
     store_mails(con, parse_export.mails)
+    while classify_web(con, budget=60.0):
+        pass
     note_sync(con, t0)
     set_meta(con, "last_ingest", t0)
     print("parsed %d rows, %d new, %.1fs" % (len(rows), n, time.time() - t0))
