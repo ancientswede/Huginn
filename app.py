@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.24.0"
+HUGINN_VERSION = "0.24.1"
 CHANGELOG = [
+    ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
     ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
     ("0.23.1", "2026-11-09", "Security and bug hunt. Fixed: a specially crafted command line could freeze Huginn for minutes, web requests were counted as logins on the password lists, a failed update of New left permanent holes, backup and restore could collide, restore accepted a database that was not Huginn's, one huge captured file could stop all file analysis, firewall feeds did not clear IPv6 when the list became empty, a reverse DNS name containing a word like research could keep an attacker off the blocklist, and the database file was readable by other users on the machine."),
     ("0.23.0", "2026-11-09", "The web trap can pretend to be many NAS and router brands and changes by itself every few weeks (hp-identity on the honeypot, ROTATE_DAYS sets how often, 0 turns it off). Personas shows which device drew the most attention, per day, because each one runs for a different time."),
@@ -243,6 +244,7 @@ CREATE TABLE IF NOT EXISTS seen(kind TEXT, key TEXT, observed REAL, ip TEXT, ses
 CREATE INDEX IF NOT EXISTS seen_obs ON seen(observed);
 CREATE TABLE IF NOT EXISTS gaps(start REAL PRIMARY KEY, end REAL);
 CREATE TABLE IF NOT EXISTS web_identities(ts REAL PRIMARY KEY, id TEXT, kind TEXT, label TEXT);
+CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 """
 
 
@@ -295,6 +297,8 @@ def init_db():
             for (ip,) in con.execute("SELECT DISTINCT e.ip FROM events e WHERE %s" % SSHOLE_SQL).fetchall():
                 recompute_ip(con, ip)
         set_meta(con, "sshole_backfilled", "1")
+    if not get_meta(con, "vnc_logins"):
+        vnc_logins_backfill(con)
     # One time only, all or nothing: script campaigns are grouped by the shape of their commands since 0.19.
     if not get_meta(con, "cmdhash_shapes"):
         with con:
@@ -423,6 +427,34 @@ def p_cowrie(line):
     return (iso_ts(ev["timestamp"]), ip, "cowrie", kind, ev.get("session"), trunc(a), trunc(b))
 
 
+# VNC never sends the password itself, only an answer to a challenge. OpenCanary tries a list of common passwords
+# against it and logs the one that fits, or this placeholder. A known password is a login like any other; an unknown
+# one stays a plain hit, so it cannot fill the password lists with the placeholder.
+VNC_UNKNOWN = "<Password was not in the common list>"
+
+
+def vnc_password(ld):
+    if not isinstance(ld, dict):
+        return None
+    rest = [k for k in ld if "Challenge" not in k and "Response" not in k]
+    pw = ld.get("VNC Password") if rest == ["VNC Password"] else None
+    return pw if isinstance(pw, str) and pw and pw != VNC_UNKNOWN else None
+
+
+def vnc_logins_backfill(con):
+    # One time only (0.24.1): VNC lines stored before VNC passwords counted as logins get the login form " / password".
+    with con:
+        for h, b in con.execute("SELECT h, b FROM events WHERE kind='canary' AND b LIKE '{\"VNC Password\": %' "
+                                "AND b NOT LIKE '%not in the common list%'").fetchall():
+            try:
+                pw = vnc_password(json.loads(b))
+            except ValueError:
+                continue
+            if pw:
+                con.execute("UPDATE events SET b=? WHERE h=?", (trunc(" / " + pw, 600), h))
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('vnc_logins','1')")
+
+
 def p_canary(line):
     if not line.startswith("{"):
         return None
@@ -443,6 +475,8 @@ def p_canary(line):
     for k in ("HOSTNAME", "SKIN"):
         ld.pop(k, None)
     user, pw = ld.get("USERNAME") or ld.get("USER"), ld.get("PASSWORD")
+    if not user and not pw:
+        pw = vnc_password(ld)
     if user or pw:
         return (datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp(), ip, "canary", "canary", None, svc, trunc("%s / %s" % (user or "", pw or ""), 600))
     if svc in ("http", "https") and ld.get("PATH"):
@@ -480,6 +514,37 @@ def not_a_login(text):
     return re.sub(r"(?<= )/(?= )", "\u2044", text)       # lookarounds: " / / " shares its middle space
 
 
+def mail_list(v, n=20):
+    # Recipients as the honeypot sent them: a list of strings. Anything else (a broken or hostile honeypot) gives nothing.
+    return [str(x)[:200] for x in v[:n]] if isinstance(v, list) else []
+
+
+def mail_summary(ev):
+    # One line for the event: who sent it, to whom, and the subject. A relay test usually goes to the sender's own mailbox.
+    rcpts = mail_list(ev.get("rcpts"))
+    try:
+        count = max(int(ev.get("rcpt_count") or 0), len(rcpts))
+    except (TypeError, ValueError):
+        count = len(rcpts)
+    to = ", ".join(rcpts[:5]) or ("%d recipient(s)" % count if count else "?")
+    if rcpts and count > 5:
+        to += " +%d more" % (count - 5)
+    return not_a_login("relay: %s -> %s: %s" % (str(ev.get("mail_from") or "?")[:200], to, str(ev.get("subject") or "")[:200]))
+
+
+def trap_mail(line):
+    # The rest of a relay attempt, kept beside its event: every recipient, HELO name, size and the start of the message.
+    ev = json.loads(line)
+    if ev.get("event") != "mail":
+        return None
+    try:
+        size = max(0, min(int(ev.get("size") or 0), 1 << 40))
+    except (TypeError, ValueError):
+        size = 0
+    return (str(ev.get("mail_from") or "")[:200], str(ev.get("subject") or "")[:200], json.dumps(mail_list(ev.get("rcpts")), ensure_ascii=False),
+            str(ev.get("helo") or "")[:200], size, str(ev.get("sample") or "")[:1500])
+
+
 def p_traps(line):
     # hp-traps (our own service on the honeypot): stored as "canary" events, a = service, b = summary.
     if not line.startswith("{"):
@@ -494,7 +559,12 @@ def p_traps(line):
         if ev.get("database"):
             b += "  (db %s)" % ev["database"]
     elif e == "mail":
-        b = not_a_login("relay: %s -> %s recipient(s): %s" % (ev.get("mail_from") or "?", ev.get("rcpt_count") or 0, ev.get("subject") or ""))
+        b = mail_summary(ev)
+    elif e == "helo":
+        name = str(ev.get("helo") or "").strip()[:200]
+        if not name:
+            return None
+        b = not_a_login("HELO " + name)
     elif e == "proxy":
         b = not_a_login("proxy -> %s" % (ev.get("target") or "?"))
     elif e == "connect":
@@ -509,7 +579,7 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
-    files, personas, bait, identities = [], [], {}, []
+    files, personas, bait, identities, mails = [], [], {}, [], []
     seen = set()
     # Only "\n" ends a line. str.splitlines() also breaks on characters such as U+2028, which an attacker can send.
     for line in text.split("\n"):
@@ -550,7 +620,15 @@ def parse_export(text, skip):
             r = None
         if r and sane_row(r):
             rows.append((h,) + r)
+            if section == "TRAPS" and r[5] and r[6].startswith("relay: "):
+                try:
+                    m = trap_mail(line)
+                except Exception:
+                    m = None
+                if m:
+                    mails.append((h, r[6]) + m)
     parse_export.files = files
+    parse_export.mails = mails
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
                          "warnings": sorted(x[5:] for x in seen if x.startswith("WARN "))[:10]}
@@ -604,6 +682,16 @@ def load_honeypot_meta(con):
     except (ValueError, TypeError):
         hp_bait = []
     BAIT[:] = sorted(set(BAIT_LOCAL) | set(hp_bait))
+
+
+def store_mails(con, mails):
+    # Kept beside the event (same key). The event line is rewritten too: relay lines stored before 0.24.1 had no recipients.
+    with con:
+        for h, b, frm, subj, rcpts, helo, size, sample in mails[:10000]:
+            if con.execute("SELECT 1 FROM events WHERE h=?", (h,)).fetchone():
+                con.execute("UPDATE events SET b=? WHERE h=?", (trunc(b, 600), h))
+                con.execute("INSERT OR IGNORE INTO mails(h, mail_from, subject, rcpts, helo, size, sample) VALUES(?,?,?,?,?,?,?)",
+                            (h, frm, subj, rcpts, helo, size, sample))
 
 
 def store_files(con, files):
@@ -1062,6 +1150,7 @@ def retention(con):
         old_ips = [r[0] for r in con.execute("SELECT ip FROM ips WHERE first < ?", (cutoff,))]
         touched = [r[0] for r in con.execute("SELECT DISTINCT session FROM events WHERE ts < ? AND session IS NOT NULL", (cutoff,))]
         con.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+        con.execute("DELETE FROM mails WHERE h NOT IN (SELECT h FROM events)")
         con.execute("DELETE FROM sessions WHERE end < ?", (cutoff,))
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
         for sid in touched:              # a session across the limit keeps only its newer events: count again
@@ -1270,6 +1359,7 @@ def collector_loop():
             apply_honeypot_meta(con, parse_export.meta)
             n = store(con, rows)
             store_files(con, parse_export.files)
+            store_mails(con, parse_export.mails)
             note_sync(con, t0)
             skip = hashes  # only set once everything is stored
             set_meta(con, "last_ingest", t0)
@@ -2825,6 +2915,13 @@ def v_ip(ip):
         can_html = ('<div class="card span2"><h3>Other services (decoys)</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
                     % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
 
+    # Mail sent to the relay trap: every recipient and the start of the message (attacker text, escaped, never a link).
+    mails = con.execute("SELECT e.ts, e.a, m.mail_from, m.subject, m.rcpts, m.helo, m.size, m.sample FROM mails m JOIN events e ON e.h = m.h "
+                        "WHERE e.ip=? ORDER BY e.ts DESC LIMIT 50", (ip,)).fetchall()
+    if mails:
+        can_html += ('<div class="card span2"><h3>Mail to the relay trap <span class=muted>%s</span></h3><div class="scroll">%s</div></div>'
+                     % (num(len(mails)), "".join(mail_block(m) for m in mails)))
+
     # Sessions come first in the page itself, so reading and keyboard order match what a phone shows.
     body = ('<div class="iphead ip-h"><h1 class="ip-title mono">%s</h1><div class="ip-tags">%s</div><div class="score">Score <b>%s</b></div></div>%s<p class="story">%s</p>'
             '<div class="links">%s</div>'
@@ -3386,6 +3483,25 @@ def cred_search(con, q, limit=200):
     return sorted(agg.items(), key=lambda x: (-x[1]["n"], -x[1]["last"]))[:limit], len(agg)
 
 
+def mail_block(m):
+    try:
+        rcpts = [str(x) for x in json.loads(m["rcpts"] or "[]")]
+    except ValueError:
+        rcpts = []
+    head = ("<div class=mail-h><b>%s</b> <span class=muted>%s · %s · %s</span></div>"
+            "<div class=mono>From %s</div><div class='mono fd-d'>To %s</div><div>Subject: %s</div>"
+            % (esc(fmt_tss(m["ts"])), esc(m["a"]), esc("HELO " + clean(m["helo"], 120) if m["helo"] else "no HELO"), esc(size_fmt(m["size"])),
+               esc(clean(m["mail_from"], 200) or "?"), esc(", ".join(clean(r, 200) for r in rcpts) or "?"), esc(clean(m["subject"], 200))))
+    body = ('<details><summary>Message (first %s characters)</summary><pre class="mono mail-body">%s</pre></details>'
+            % (num(len(m["sample"])), esc(m["sample"]))) if m["sample"] else ""
+    return '<div class=mail>%s%s</div>' % (head, body)
+
+
+def size_fmt(n):
+    n = n or 0
+    return "%d bytes" % n if n < 1024 else "%.1f KB" % (n / 1024.0) if n < 1048576 else "%.1f MB" % (n / 1048576.0)
+
+
 def v_campaigns():
     con = db()
     scripts = con.execute("SELECT cmdhash, COUNT(*) n, COUNT(DISTINCT ip) nip, MIN(start) f, MAX(start) l, MAX(cmds) c, MIN(session) sid "
@@ -3398,10 +3514,17 @@ def v_campaigns():
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                     % (esc(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored) and SSH client fingerprint (HASSH).</p>'
+    # Mail clients: the name a bot gives in HELO/EHLO is often its own and stays the same across many addresses.
+    hl = con.execute("SELECT LOWER(SUBSTR(b, 6)) name, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events "
+                     "WHERE kind='canary' AND src='traps' AND b LIKE 'HELO %' GROUP BY name ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
+    hlrows = "".join("<tr><td class='mono fd-d'><a href='/search?q=%s&days=all'>%s</a></td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
+                     % (esc(urllib.parse.quote("HELO " + h["name"], safe="")), esc(clean(h["name"], 120)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hl)
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH) and mail client name (HELO).</p>'
             '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
+            '<h2>Mail clients (HELO)</h2><div class="card">%s</div>'
             % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
-               '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet")))
+               '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
+               '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet")))
     return page("Campaigns", body, "/campaigns")
 
 
@@ -4040,6 +4163,8 @@ CSS += (".ov-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;ma
         ".board .card{padding:12px 14px;border-radius:6px}.board h3{font-size:12px;margin-bottom:8px}.board table{font-size:13px}.board th,.board td{padding:4px 6px}"
         ".board .bval{display:none}.board .bars{height:92px;gap:2px}.board .bcol i{max-width:none;border-radius:2px 2px 0 0}"
         ".board tr.sel td{background:var(--accent2)}.board tr.sel .svc-l{color:var(--accent);font-weight:600}.svc-l{color:var(--text)}.b-note{margin:8px 0 0}"
+        ".mail{padding:8px 0;border-top:1px solid var(--line)}.mail:first-child{border-top:0}.mail-h{margin-bottom:2px}"
+        ".mail-body{white-space:pre-wrap;overflow-wrap:anywhere;max-height:22em;overflow:auto;margin:6px 0 0}"
         ".nowrap{white-space:nowrap}.fd-d{overflow-wrap:anywhere;word-break:break-word}.fd-n{color:var(--muted);font-family:system-ui,sans-serif;font-size:12px;margin-left:4px;white-space:nowrap}"
         "details.fd summary{cursor:pointer;list-style:none}details.fd summary::-webkit-details-marker{display:none}details.fd[open] summary{display:none}"
         ".b-creds .trunc{max-width:150px}"
@@ -4692,6 +4817,7 @@ def ingest_once():
     apply_honeypot_meta(con, parse_export.meta)
     n = store(con, rows)
     store_files(con, parse_export.files)
+    store_mails(con, parse_export.mails)
     note_sync(con, t0)
     set_meta(con, "last_ingest", t0)
     print("parsed %d rows, %d new, %.1fs" % (len(rows), n, time.time() - t0))
