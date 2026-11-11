@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.23.1"
+HUGINN_VERSION = "0.24.0"
 CHANGELOG = [
+    ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
     ("0.23.1", "2026-11-09", "Security and bug hunt. Fixed: a specially crafted command line could freeze Huginn for minutes, web requests were counted as logins on the password lists, a failed update of New left permanent holes, backup and restore could collide, restore accepted a database that was not Huginn's, one huge captured file could stop all file analysis, firewall feeds did not clear IPv6 when the list became empty, a reverse DNS name containing a word like research could keep an attacker off the blocklist, and the database file was readable by other users on the machine."),
     ("0.23.0", "2026-11-09", "The web trap can pretend to be many NAS and router brands and changes by itself every few weeks (hp-identity on the honeypot, ROTATE_DAYS sets how often, 0 turns it off). Personas shows which device drew the most attention, per day, because each one runs for a different time."),
     ("0.22.0", "2026-11-09", "A visual pass: the attacker page is headed by its address, phones get shorter lists with paging at the top and readable rows, campaigns and New lead with the commands instead of a hash, rare finds (bait, files, exploits) have their own warm colour, Replay looks like a terminal and has a timeline, Personas shows how far attackers got as bars, and empty sections no longer draw empty tables. Two small extras: the raven in the header reacts once to a new file or used bait, and Time wasted has a receipt."),
@@ -1853,7 +1854,7 @@ SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable",
                     "cards": ["hero", "chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
                     "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "weekly"], "v": 3,
                     "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
-                    "hide_cc": [], "hide_asn": []}
+                    "hide_cc": [], "hide_asn": [], "overview": "cards"}
 # Optional columns of the Attackers list: key -> (header, sort key, css class)
 IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "ASN", None, ""), ("rdns", "Reverse DNS", None, ""),
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
@@ -1952,17 +1953,15 @@ def page(title, body, active="/"):
 
 # ---------------------------------------------------------------- pages
 
-def v_overview():
-    con = db()
+def overview_kpis(con, st):
+    # The metric strip at the top of both Overview layouts. Returns the HTML and the week summary (the Cards view reuses it).
     now = time.time()
     d1, d7 = now - 86400, now - 7 * 86400
     k = con.execute("SELECT SUM(last>=?) a, SUM(last>=?) b, COUNT(*) c, SUM(first>=?) d FROM ips", (d1, d7, d1)).fetchone()
     s24 = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=?", (d1,)).fetchone()[0]
     sh24 = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND cmds>0", (d1,)).fetchone()[0]
     files = con.execute("SELECT COUNT(DISTINCT b) FROM events WHERE kind='file'").fetchone()[0]
-    st = settings(con)
     bl = len(blocklist_ips(con, int(st["bl_min"]), int(st["bl_days"]), False, True))
-    st = settings(con)
     tw = time_wasted(con, now - 7 * 86400)
     bait7 = con.execute("SELECT SUM(','||tags||',' LIKE '%,took-bait,%'), SUM(','||tags||',' LIKE '%,read-bait,%') FROM ips WHERE last>=?", (d7,)).fetchone()
     w = week_summary(con, d7, now)
@@ -1979,6 +1978,26 @@ def v_overview():
             ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else ""), " kpi-x"),
             ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]), " kpi-x")]
     kp = "".join('<div class="kpi%s"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (d, esc(a), b, esc(c)) for a, b, c, d in kpis)
+    html_ = ('<input class="kpi-sw" type="checkbox" id="kpiMore" aria-label="More metrics"><div class="kpis">%s</div>'
+             '<label class="kpi-more" for="kpiMore"><span class="a">More metrics</span><span class="b">Fewer metrics</span></label>' % kp)
+    return html_, w, tw
+
+
+def overview_switch(view, extra=""):
+    # Cards or Board: saved in the settings, so the Overview opens the way it was left.
+    return ('<div class="ov-bar"><form method=post action="/settings/overview" class="vtabs ov-tabs" aria-label="Overview layout">'
+            '<button name=view value=cards%s>Cards</button><button name=view value=board%s>Board</button></form>%s</div>'
+            % (" class=on" if view == "cards" else "", " class=on" if view == "board" else "", extra))
+
+
+def v_overview(qs=None):
+    con = db()
+    if settings(con).get("overview") == "board":
+        return v_board(con, qs or {})
+    now = time.time()
+    d7 = now - 7 * 86400
+    st = settings(con)
+    kp, w, tw = overview_kpis(con, st)
 
     days = []
     for i in range(13, -1, -1):
@@ -2034,10 +2053,246 @@ def v_overview():
              "week": week_card(con, w) if "week" in st["cards"] else "",
              "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
                          % heat_html(heatmap(con))) if "heatmap" in st["cards"] else ""}
-    body = ((hero_card(con, st) if "hero" in st["cards"] else "")
-            + '<input class="kpi-sw" type="checkbox" id="kpiMore" aria-label="More metrics"><div class="kpis">%s</div>'
-              '<label class="kpi-more" for="kpiMore"><span class="a">More metrics</span><span class="b">Fewer metrics</span></label>'
-              '<div class="grid">%s</div>' % (kp, "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero")))
+    body = ((hero_card(con, st) if "hero" in st["cards"] else "") + overview_switch("cards") + kp
+            + '<div class="grid">%s</div>' % "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero"))
+    return page("Overview", body, "/")
+
+
+# ---------------------------------------------------------------- Overview, Board layout
+# Everything side by side on one screen, for one time range and optionally one service: what each service saw, two
+# charts on the same time axis, and the latest raw data. Same data and definitions as the other pages (a login is what
+# the Credentials page counts as one); only the layout is different.
+
+BOARD_RANGES = {"24h": (86400, 3600, "per hour"), "7d": (7 * 86400, 4 * 3600, "per 4 hours")}
+BOARD_SKIP = ("version", "hassh", "closed", "tty", "tarpit_open")         # bookkeeping rows, not something an attacker did
+BOARD_FEED = ("login_ok", "login_fail", "cmd", "file", "file_fail", "tcpip", "exploit", "canary", "tarpit")
+BOARD_SVC = "CASE WHEN e.src='cowrie' THEN COALESCE(s.proto,'ssh') WHEN e.src='endlessh' THEN 'tarpit' ELSE COALESCE(e.a,'?') END"
+BOARD_FROM = " FROM events e LEFT JOIN sessions s ON e.src='cowrie' AND s.session=e.session WHERE e.ts>=?"
+ACCEPT_KNOWN = ("ssh", "telnet")      # only Cowrie says whether it let a login in; the other decoys do not record it
+_board_cache = {}
+
+
+def board_hidden(st):
+    # "Hide from views" for queries on events: leave out IPs whose country/network is hidden.
+    hs, ha = hidden_sql(st, "x")
+    if not hs:
+        return "", []
+    return " AND e.ip NOT IN (SELECT x.ip FROM enrich x WHERE NOT (1" + hs + "))", ha
+
+
+def board_cached(con, st, key, fn):
+    full = (key, get_meta(con, "last_ingest", ""), tuple(st["hide_cc"]), tuple(st["hide_asn"]))
+    if full not in _board_cache:
+        if len(_board_cache) > 16:
+            _board_cache.clear()
+        _board_cache[full] = fn()
+    return _board_cache[full]
+
+
+def board_logins(con, since, hs, ha):
+    # Decoy logins (not Cowrie): the same rule as the Credentials page (canary_is_login, and "(db x)" is not the password).
+    out = []
+    for ts, svc, src, b in con.execute("SELECT e.ts, COALESCE(e.a,'?'), e.src, e.b FROM events e WHERE e.ts>=? AND e.kind='canary' AND e.b LIKE '% / %'" + hs,
+                                       [since] + ha):
+        if canary_is_login(svc, b):
+            user, _, pw = b.partition(" / ")
+            if src == "traps":
+                pw = re.sub(r"  \(db .*\)$", "", pw)
+            out.append((ts, svc, user, pw))
+    return out
+
+
+def board_rows(con, st, rng):
+    # One pass over the period, folded per service, IP, kind and time bucket (a few thousand rows for a week instead of
+    # several hundred thousand events). The service table, both charts and the top list are counted from this in Python.
+    # The alias is "bkt", not "b": in GROUP BY, SQLite would take events.b (the password column) before an alias.
+    span, step, _ = BOARD_RANGES[rng]
+    since = time.time() - span
+    hs, ha = board_hidden(st)
+    rows = con.execute("SELECT " + BOARD_SVC + " svc, e.ip, e.kind, CAST((e.ts-?)/? AS INTEGER) bkt, COUNT(*) n, MAX(e.ts) last" + BOARD_FROM
+                       + " AND e.kind NOT IN (%s)" % ",".join("?" * len(BOARD_SKIP)) + hs + " GROUP BY svc, e.ip, e.kind, bkt",
+                       [since, step, since] + list(BOARD_SKIP) + ha).fetchall()
+    decoy = board_logins(con, since, hs, ha)
+    creds = {}
+    for svc, user, pw, n in con.execute("SELECT COALESCE(s.proto,'ssh'), COALESCE(e.a,''), COALESCE(e.b,''), COUNT(*)" + BOARD_FROM
+                                        + " AND e.kind IN ('login_ok','login_fail')" + hs + " GROUP BY 1, 2, 3", [since] + ha):
+        if user or pw:
+            creds[(svc, user, pw)] = n
+    for _ts, svc, user, pw in decoy:
+        if user or pw:
+            creds[(svc, user, pw)] = creds.get((svc, user, pw), 0) + 1
+    return {"since": since, "rows": [tuple(r) for r in rows], "logins": [(svc, int((ts - since) // step)) for ts, svc, _u, _p in decoy],
+            "creds": creds}
+
+
+def board_services(con, st, rng):
+    data = board_cached(con, st, ("rows", rng), lambda: board_rows(con, st, rng))
+    out, ips = {}, {}
+    for svc, ip, kind, _b, n, last in data["rows"]:
+        v = out.setdefault(svc, {"ips": 0, "hits": 0, "logins": 0, "ok": 0 if svc in ACCEPT_KNOWN else None, "last": 0})
+        ips.setdefault(svc, set()).add(ip)
+        if kind in ("connect", "canary", "tarpit"):
+            v["hits"] += n
+        if kind in ("login_ok", "login_fail"):
+            v["logins"] += n
+        if kind == "login_ok" and v["ok"] is not None:
+            v["ok"] += n
+        v["last"] = max(v["last"], last)
+    for svc, _b in data["logins"]:
+        if svc in out:
+            out[svc]["logins"] += 1
+    for svc, s in ips.items():
+        out[svc]["ips"] = len(s)
+    return out
+
+
+def board_detail(con, st, rng, svc):
+    span, step, _ = BOARD_RANGES[rng]
+    n = int(span // step)
+    data = board_cached(con, st, ("rows", rng), lambda: board_rows(con, st, rng))
+    since = data["since"]
+    hs, ha = board_hidden(st)
+    sf, sa = ((" AND " + BOARD_SVC + "=?"), [svc]) if svc else ("", [])
+    per_bucket = [set() for _ in range(n)]
+    logins = [0] * n
+    per_ip = {}
+    for s, ip, kind, b, cnt, _last in data["rows"]:
+        if svc and s != svc:
+            continue
+        if 0 <= b < n:
+            per_bucket[b].add(ip)
+            if kind in ("login_ok", "login_fail"):
+                logins[b] += cnt
+        p = per_ip.setdefault(ip, [0, set()])
+        p[0] += cnt
+        p[1].add(s)
+    for s, b in data["logins"]:
+        if (not svc or s == svc) and 0 <= b < n:
+            logins[b] += 1
+    ips = [len(x) for x in per_bucket]
+    labels = [fmt_time(since + i * step, "%a %H:%M") for i in range(n)]
+    meta, cand = {}, list(per_ip)
+    for i in range(0, len(cand), 500):
+        part = cand[i:i + 500]
+        for r in con.execute("SELECT i.ip, i.score, i.tags, en.cc, en.org, en.research, f.flag FROM ips i LEFT JOIN enrich en USING(ip) "
+                             "LEFT JOIN flags f USING(ip) WHERE i.ip IN (%s)" % ",".join("?" * len(part)), part):
+            meta[r["ip"]] = r
+    top = sorted(((ip, p[0], len(p[1])) for ip, p in per_ip.items() if ip in meta), key=lambda x: (-meta[x[0]]["score"], -x[1]))[:10]
+    # Latest raw data: identical rows from the same IP are folded into one line with a count (VNC alone sends thousands).
+    feed = con.execute("SELECT " + BOARD_SVC + " svc, e.ip, e.kind, e.a, e.b, COUNT(*) n, MAX(e.ts) ts" + BOARD_FROM
+                       + " AND e.kind IN (%s) AND NOT (e.kind='canary' AND COALESCE(e.b,'')='')" % ",".join("?" * len(BOARD_FEED))
+                       + sf + hs + " GROUP BY svc, e.ip, e.kind, e.a, e.b ORDER BY ts DESC LIMIT 25", [since] + list(BOARD_FEED) + sa + ha).fetchall()
+    ccs = {r[0]: r[1] for r in con.execute("SELECT ip, cc FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(feed)), [r["ip"] for r in feed])} if feed else {}
+    creds = {}
+    for (s, user, pw), cnt in data["creds"].items():
+        if not svc or s == svc:
+            creds[(user, pw)] = creds.get((user, pw), 0) + cnt
+    creds = sorted(creds.items(), key=lambda x: (-x[1], x[0]))[:12]
+    return {"ips": ips, "logins": logins, "labels": labels, "since": since, "creds": creds, "top": [(ip, nn, ns, meta[ip]) for ip, nn, ns in top],
+            "feed": [dict(r) for r in feed], "ccs": ccs}
+
+
+def board_text(kind, a, b):
+    # One line for the raw data list. Attacker text: always escaped by the caller.
+    if kind in ("login_ok", "login_fail"):
+        return "%s / %s" % (a or "", b or "")
+    if kind == "cmd":
+        return a or ""
+    if kind == "file":
+        return "%s%s" % (a or "?", ("  sha256 " + b[:16]) if b else "")
+    if kind == "file_fail":
+        return "download failed: %s" % (a or "?")
+    if kind == "tcpip":
+        return "proxy -> %s" % (a or "?")
+    if kind == "exploit":
+        return "exploit %s: %s" % (a or "?", b or "")
+    if kind == "tarpit":
+        try:
+            return "held in the tarpit for %s" % dur(float(a))
+        except (TypeError, ValueError):
+            return "held in the tarpit"
+    if b and b.startswith("{"):
+        try:
+            d = json.loads(b)
+            if isinstance(d, dict):
+                return ", ".join("%s: %s" % (k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)) for k, v in d.items() if v not in ("", None))
+        except ValueError:
+            pass
+    return b or ""
+
+
+def board_link(rng, svc):
+    q = {"range": rng}
+    if svc:
+        q["svc"] = svc
+    return "/?" + urllib.parse.urlencode(q)
+
+
+def v_board(con, qs):
+    st = settings(con)
+    rng = qs.get("range") if qs.get("range") in BOARD_RANGES else "24h"
+    svcs = board_cached(con, st, ("svc", rng), lambda: board_services(con, st, rng))
+    svc = qs.get("svc") if qs.get("svc") in svcs else None
+    d = board_cached(con, st, ("detail", rng, svc), lambda: board_detail(con, st, rng, svc))
+    kp, _w, _tw = overview_kpis(con, st)
+    every = BOARD_RANGES[rng][2]
+    what = esc(svc) if svc else "all services"
+
+    chips = "".join('<a class="chip%s" href="%s">%s</a>' % (" on" if r == rng else "", esc(board_link(r, svc)), r) for r in BOARD_RANGES)
+    opts = '<option value="">All services</option>' + "".join('<option value="%s"%s>%s</option>' % (esc(k), " selected" if k == svc else "", esc(k))
+                                                               for k in sorted(svcs))
+    li = float(get_meta(con, "last_ingest", "0") or 0)
+    filt = ('<div class="ov-f"><div class="chips">%s</div><form method=get action="/" class="ov-svc"><input type=hidden name=range value="%s">'
+            '<select name=svc data-autosubmit aria-label="Service">%s</select><button class="btn-s ov-go">Show</button></form>%s</div>'
+            '<span class="ov-asof">%s · data until %s</span>'
+            % (chips, esc(rng), opts, ('<a class="chip" href="%s">Clear</a>' % esc(board_link(rng, None))) if svc else "",
+               "Last 24 hours" if rng == "24h" else "Last 7 days", esc(fmt_ts(li)) if li else "–"))
+
+    rows = ""
+    for name, v in sorted(svcs.items(), key=lambda x: (-x[1]["ips"], x[0])):
+        acc = num(v["ok"]) if v["ok"] is not None else '<span class=muted title="Not recorded for this service">–</span>'
+        rows += ('<tr%s><td><a class="svc-l" href="%s">%s</a></td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td>'
+                 '<td class="num muted" data-h>%s</td></tr>' % (' class="sel"' if name == svc else "", esc(board_link(rng, None if name == svc else name)),
+                                                               esc(name), num(v["ips"]), num(v["hits"]), num(v["logins"]) if v["logins"] else "–", acc, esc(ago(v["last"]))))
+    services = ('<div class="card"><h3>Services</h3><table class="b-svc"><thead><tr><th>Service</th><th class=num>IPs</th>'
+                '<th class=num title="Connections, requests and tarpit catches">Hits</th><th class=num>Logins</th>'
+                '<th class=num title="Logins the honeypot let in. Only SSH and Telnet record this.">Accepted</th><th class=num data-h>Last</th></tr></thead>'
+                '<tbody>%s</tbody></table><p class="muted small b-note">Click a service to filter the board. Accepted is only known for SSH and Telnet.</p></div>'
+                % rows) if rows else '<div class="card"><h3>Services</h3>%s</div>' % none_yet("Nothing in this period")
+
+    def chart(title, vals):
+        peak = max(vals) if vals else 0
+        return ('<div class="card b-chart"><h3>%s <span class=muted>%s, %s · peak %s</span></h3>%s<div class="axis"><span>%s</span><span>now</span></div></div>'
+                % (title, what, every, num(peak), bars(vals, d["labels"], h=60, partial_last=True), esc(d["labels"][0])))
+    charts = chart("Attacker IPs", d["ips"]) + chart("Login attempts", d["logins"])
+
+    trows = ""
+    for ip, nn, ns, m in d["top"]:
+        trows += ('<tr><td>%s</td><td>%s</td><td class=trunc data-h>%s</td><td class=num>%s</td><td class=num data-h>%s</td>%s</tr>'
+                  % (ip_link(ip), cc_html(m["cc"]), esc(m["org"] or ""), num(nn), ns, score_html_cell(m)))
+    top = ('<div class="card"><h3>Top attackers <span class=muted>%s</span></h3><table><thead><tr><th>IP</th><th>CC</th><th data-h>Network</th>'
+           '<th class=num>Events</th><th class=num data-h>Services</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table></div>'
+           % (what, trows)) if trows else ""
+
+    frows = ""
+    for r in d["feed"]:
+        txt = clean(board_text(r["kind"], r["a"], r["b"]), 600)
+        cell = ('<details class="fd"><summary>%s</summary><div>%s</div></details>' % (esc(txt[:100]) + "…", esc(txt))) if len(txt) > 100 else esc(txt)
+        mark = ' <span class="tag t-orange">accepted</span>' if r["kind"] == "login_ok" else ""
+        frows += ('<tr><td class="muted nowrap" title="%s">%s</td><td>%s</td><td class=nowrap>%s %s</td><td class="mono fd-d">%s%s%s</td></tr>'
+                  % (esc(fmt_tss(r["ts"])), esc(ago(r["ts"])), esc(r["svc"]), ip_link(r["ip"]), cc_html(d["ccs"].get(r["ip"])), cell, mark,
+                     (' <span class="fd-n">×%s</span>' % num(r["n"])) if r["n"] > 1 else ""))
+    feed = ('<div class="card b-feed"><h3>Latest data <span class=muted>%s</span></h3>%s</div>'
+            % (what, '<table><thead><tr><th>When</th><th>Service</th><th>IP</th><th>Data</th></tr></thead><tbody>%s</tbody></table>' % frows
+               if frows else none_yet("Nothing in this period")))
+
+    crows = "".join('<tr><td class="mono trunc">%s</td><td class="mono trunc">%s</td><td class=num>%s</td></tr>' % (esc(clean(u, 40)), esc(clean(p, 40)), num(c))
+                    for (u, p), c in d["creds"])
+    creds = ('<div class="card"><h3>Top credentials <span class=muted>%s</span><a class=more href="/creds">all →</a></h3><table class="b-creds"><thead><tr><th>User</th>'
+             '<th>Password</th><th class=num>Tries</th></tr></thead><tbody>%s</tbody></table></div>' % (what, crows)) if crows else ""
+
+    body = (overview_switch("board", filt) + '<div class="board-kpis">%s</div>' % kp
+            + '<div class="board"><div class="board-col">%s%s</div><div class="board-col">%s%s</div>%s</div>' % (services, creds, charts, top, feed))
     return page("Overview", body, "/")
 
 
@@ -3771,8 +4026,26 @@ try{old=JSON.parse(localStorage.getItem('hgFinds')||'null');localStorage.setItem
 if(!old||typeof old!=='object')return;
 var hit=now.t>old.t?['Bait used','/ips?tag=took-bait&days=7&sort=last']:now.r>old.r?['Bait read','/ips?tag=read-bait&days=7&sort=last']:now.f>old.f?['New file','/new']:null;
 if(!hit)return;var a=document.createElement('a');a.className='raven-note';a.href=hit[1];a.textContent=hit[0];b.appendChild(a);b.classList.add('raven-on')})();
+document.documentElement.classList.add('js');document.querySelectorAll('select[data-autosubmit]').forEach(function(s){s.addEventListener('change',function(){s.form.submit()})});
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
 """
+CSS += (".ov-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-bottom:12px}.ov-bar form{margin:0}.ov-bar .vtabs{margin-left:0}"
+        ".ov-tabs button{padding:5px 14px;font-size:13px}.ov-f{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.ov-f .chips{margin:0}.ov-f .chip{padding:4px 12px}"
+        ".ov-svc{display:flex;gap:6px;align-items:center}.ov-svc select{padding:4px 8px}.js .ov-go{display:none}"
+        ".ov-asof{margin-left:auto;font-size:12px;color:var(--muted)}"
+        ".board-kpis .kpis{gap:10px;margin-bottom:10px}.board-kpis .kpi{padding:9px 12px;border-radius:6px}.board-kpis .kpi-v{font-size:21px}"
+        ".board{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;align-items:start}.board-col{display:flex;flex-direction:column;gap:10px;min-width:0}"
+        "@media (min-width:1001px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}.board .b-feed{grid-column:span 2}}"
+        "@media (min-width:1500px){.board{grid-template-columns:minmax(0,25fr) minmax(0,45fr) minmax(0,30fr)}.board .b-feed{grid-column:auto}}"
+        ".board .card{padding:12px 14px;border-radius:6px}.board h3{font-size:12px;margin-bottom:8px}.board table{font-size:13px}.board th,.board td{padding:4px 6px}"
+        ".board .bval{display:none}.board .bars{height:92px;gap:2px}.board .bcol i{max-width:none;border-radius:2px 2px 0 0}"
+        ".board tr.sel td{background:var(--accent2)}.board tr.sel .svc-l{color:var(--accent);font-weight:600}.svc-l{color:var(--text)}.b-note{margin:8px 0 0}"
+        ".nowrap{white-space:nowrap}.fd-d{overflow-wrap:anywhere;word-break:break-word}.fd-n{color:var(--muted);font-family:system-ui,sans-serif;font-size:12px;margin-left:4px;white-space:nowrap}"
+        "details.fd summary{cursor:pointer;list-style:none}details.fd summary::-webkit-details-marker{display:none}details.fd[open] summary{display:none}"
+        ".b-creds .trunc{max-width:150px}"
+        "@media (max-width:800px){.b-feed thead{display:none}.b-feed tr{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;padding:7px 0;border-bottom:1px solid var(--line)}"
+        ".b-feed td{border:0;padding:0}.b-feed td.fd-d{flex-basis:100%}.b-feed tbody tr:hover{background:none}}"
+        "@media (max-width:1000px){.ov-asof{margin-left:0;width:100%}.ov-svc select{min-height:40px}.ov-f .chip{padding:9px 14px}}")
 CSS += ".offscreen{position:fixed;left:-9999px;top:0}"
 # Accent colours: light first, then dark (higher specificity wins in dark mode), then compact layout and settings page.
 CSS += "".join(".bcol i.h%d{height:calc((100%% - 16px) * %.2f)}" % (n, n / 100) for n in range(0, 101, 2))
@@ -4059,7 +4332,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             return self.redirect("/login")
         if path == "/":
-            return self.send(200, v_overview())
+            return self.send(200, v_overview(qs))
         if path == "/ips":
             return self.send(200, v_ips(qs, mobile="Mobi" in self.headers.get("User-Agent", "")))
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/export\.(json|csv)", path)
@@ -4164,6 +4437,13 @@ class Handler(BaseHTTPRequestHandler):
             st["theme"] = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
             set_meta(con, "settings", json.dumps(st))
             return self.redirect(self.back())
+        if path == "/settings/overview":
+            view = self.form().get("view")
+            if view in ("cards", "board"):
+                st = settings(con)
+                st["overview"] = view
+                set_meta(con, "settings", json.dumps(st))
+            return self.redirect("/")
         if path == "/settings/test-ntfy":
             if not NTFY_URL:
                 return self.send(400, v_settings(err="HUGINN_NTFY_URL is not set."))
