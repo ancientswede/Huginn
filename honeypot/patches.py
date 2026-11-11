@@ -5,6 +5,7 @@
 #   patches.py cowrie-free FILE        Cowrie's "free" reads the persona's fake /proc/meminfo, not the host's
 #   patches.py opencanary-http FILE    OpenCanary logs every probed web path (it never logged 404s)
 #   patches.py opencanary-ports CONF   move disabled OpenCanary modules off ports used by enabled ones
+#   patches.py cowrie-forward FILE     Cowrie answers a plain HTTP proxy check with 200 and holds TLS for a while (never forwards)
 #
 # Exit code: 0 = patched/changed, 3 = already patched/nothing to do, 1 = the upstream code changed (not patched).
 import json, sys
@@ -94,6 +95,105 @@ def opencanary_http(path):
     target.write_text(desired)
     return 0
 
+# Cowrie's fake SSH proxy (direct-tcpip) logs the first data and answers "Connection refused". Most logged-in bots
+# only came to use the box as a proxy, so they test it (GET yahoo.com/ ...) and leave. The patch answers such a plain
+# HTTP check with an empty 200 page and holds TLS silently for a while. Nothing is ever forwarded or connected.
+FWD_OLD = """                data=repr(data),
+                id=self.id,
+            )
+        self._close("Connection refused")"""
+FWD_NEW = """                data=repr(data),
+                id=self.id,
+            )
+        # Huginn proxyreply v1: answer a plain HTTP proxy check, hold TLS for a while; never connect anywhere.
+        if getattr(self, "_hp_answered", False):
+            return
+        try:
+            reply = hp_proxy_reply(self.hostport[1], data)
+        except Exception:
+            reply = None
+        if reply is None:
+            self._close("Connection refused")
+            return
+        self._hp_answered = True
+        if events:
+            events.dispatch(
+                "cowrie.direct-tcpip.hp-reply",
+                "huginn: answered direct-tcp forward request %(id)s to %(dst_ip)s:%(dst_port)s with %(hp_reply)s",
+                dst_ip=self.hostport[0],
+                dst_port=self.hostport[1],
+                hp_reply=reply[0],
+                hp_request=reply[2],
+                id=self.id,
+            )
+        if reply[0] == "hold":
+            hp_hold(self)
+            return
+        self.write(reply[1])
+        self.loseConnection()"""
+FWD_HELPER = r"""
+# Huginn proxyreply helper v1. Pure parsing; no network calls, no evaluation of what the client sent.
+import re as hp_re
+from email.utils import formatdate as hp_formatdate
+
+HP_HOLD_SECS = 30
+HP_HOLD_MAX = 64
+HP_HOLDS = [0]
+HP_REQUEST = hp_re.compile(rb"(GET|HEAD|POST) (/[\x21-\x7e]{0,2047}|http://[\x21-\x7e]{1,2040}) HTTP/1\.[01]\r?\n")
+HP_HOST = hp_re.compile(rb"\nhost:[ \t]*([A-Za-z0-9.-]{1,253})(?::[0-9]{1,5})?\r?\n", hp_re.I)
+
+
+def hp_proxy_reply(port, data):
+    # (kind, bytes to send, short request text) or None for the old "Connection refused".
+    if not isinstance(data, bytes):
+        return None
+    if port == 80:
+        m = HP_REQUEST.match(data[:4096])
+        if not m:
+            return None
+        h = HP_HOST.search(data[:4096])
+        host = h.group(1).decode("ascii").lower().strip(".") if h else ""
+        path = m.group(2).decode("ascii")
+        if path.startswith("http://"):
+            rest = path[7:]
+            host = host or rest.split("/", 1)[0].split(":", 1)[0].lower()
+            path = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
+        page = ('<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>%s</title></head><body></body></html>\n' % host).encode("ascii")
+        head = ("HTTP/1.1 200 OK\r\nDate: %s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n"
+                "Cache-Control: no-store\r\nConnection: close\r\n\r\n" % (hp_formatdate(usegmt=True), len(page))).encode("ascii")
+        method = m.group(1).decode("ascii")
+        return ("http200", head + (b"" if method == "HEAD" else page), ("%s %s%s" % (method, host or "?", path))[:200])
+    if port == 443 and data[:1] == b"\x16" and HP_HOLDS[0] < HP_HOLD_MAX:
+        return ("hold", b"", "TLS")
+    return None
+
+
+def hp_hold(channel):
+    # Say nothing until the client gives up or HP_HOLD_SECS pass, like a slow upstream; then close.
+    from twisted.internet import reactor
+    HP_HOLDS[0] += 1
+    def done():
+        HP_HOLDS[0] = max(0, HP_HOLDS[0] - 1)
+        try:
+            channel.loseConnection()
+        except Exception:
+            pass
+    reactor.callLater(HP_HOLD_SECS, done)
+"""
+
+
+def cowrie_forward(path):
+    s = open(path).read()
+    if "Huginn proxyreply v1" in s:
+        return 3
+    if s.count(FWD_OLD) != 1:
+        return 1
+    new = s.replace(FWD_OLD, FWD_NEW) + FWD_HELPER
+    compile(new, path, "exec")
+    open(path + ".orig", "w").write(s)
+    open(path, "w").write(new)
+    return 0
+
 
 def opencanary_ports(p):
     c = json.load(open(p))
@@ -111,7 +211,8 @@ def opencanary_ports(p):
 
 
 if __name__ == "__main__":
-    cmds = {"cowrie-free": cowrie_free, "opencanary-http": opencanary_http, "opencanary-ports": opencanary_ports}
+    cmds = {"cowrie-free": cowrie_free, "cowrie-forward": cowrie_forward, "opencanary-http": opencanary_http,
+            "opencanary-ports": opencanary_ports}
     if len(sys.argv) != 3 or sys.argv[1] not in cmds:
-        sys.exit("usage: patches.py {cowrie-free|opencanary-http|opencanary-ports} FILE")
+        sys.exit("usage: patches.py {cowrie-free|cowrie-forward|opencanary-http|opencanary-ports} FILE")
     sys.exit(cmds[sys.argv[1]](sys.argv[2]))

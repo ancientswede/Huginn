@@ -71,7 +71,7 @@ if [ "$UP_COWRIE" = 1 ]; then
   [ -d "$C/.git" ] || die "$C is not a git checkout of Cowrie."
   FREE="$C/src/cowrie/commands/free.py"
   # Put Cowrie's own free.py back so git can update it, then patch the new version again.
-  runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py 2>/dev/null || true
+  runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py src/cowrie/ssh/forwarding.py 2>/dev/null || true
   BEFORE=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
   runuser -u cowrie -- git -C "$C" pull -q --ff-only || die "git pull failed in $C (local changes?) — Cowrie was not updated."
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
@@ -79,6 +79,8 @@ if [ "$UP_COWRIE" = 1 ]; then
   ok "Cowrie $BEFORE -> $AFTER"
   rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
   case $rc in 0|3) ok "free.py patch in place" ;; *) warn "free.py patch no longer fits the new Cowrie (harmless: free shows the host's memory)" ;; esac
+  rc=0; patch_as cowrie cowrie-forward "$C/src/cowrie/ssh/forwarding.py" || rc=$?
+  case $rc in 0|3) ok "proxy reply patch in place" ;; *) warn "proxy reply patch no longer fits the new Cowrie (harmless: proxy checks are refused as before)" ;; esac
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
 
@@ -102,6 +104,18 @@ if [ "$UP_CANARY" = 0 ] && [ -x "$O/oc-env/bin/python3" ]; then
   rc=0
   if [ -n "$HTTPPY" ]; then patch_as opencanary opencanary-http "$HTTPPY" || rc=$?; else rc=1; fi
   case $rc in 0|3) ok "web reply/logging patch in place" ;; *) warn "web reply patch did not fit; no files changed"; FAILED=1 ;; esac
+fi
+
+# Same for Cowrie's fake proxy (--cowrie patches it after the upgrade instead).
+FWD="$C/src/cowrie/ssh/forwarding.py"
+if [ "$UP_COWRIE" = 0 ] && [ -f "$FWD" ]; then
+  rc=0; patch_as cowrie cowrie-forward "$FWD" || rc=$?
+  case $rc in
+    0) ok "Cowrie answers proxy checks now"
+       for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done ;;
+    3) ok "proxy reply patch in place" ;;
+    *) warn "proxy reply patch did not fit this Cowrie; no files changed (proxy checks are refused as before)" ;;
+  esac
 fi
 
 say "Web identity"

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.25.0"
+HUGINN_VERSION = "0.26.0"
 CHANGELOG = [
+    ("0.26.0", "2026-11-11", "Proxy that seems to work: most bots that log in to the SSH honeypot only want to use it as a proxy, test it with a plain web request and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
     ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
     ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
     ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
@@ -389,6 +390,9 @@ def sane_row(r):
     return session is None or (isinstance(session, str) and SESSION_RE.fullmatch(session) is not None)
 
 
+PROXY_REPLIES = {"http200": "answered 200", "hold": "held, no answer"}
+
+
 def p_cowrie(line):
     if not line.startswith("{"):
         return None
@@ -412,6 +416,12 @@ def p_cowrie(line):
         kind, a = "file_fail", ev.get("url")
     elif k == "cowrie.direct-tcpip.request":
         kind, a = "tcpip", "%s:%s" % (ev.get("dst_ip"), ev.get("dst_port"))
+    elif k == "cowrie.direct-tcpip.hp-reply":
+        # Huginn's Cowrie patch answered a proxy check (http200) or held TLS (hold); see honeypot/patches.py.
+        how, req = ev.get("hp_reply"), ev.get("hp_request")
+        if how not in PROXY_REPLIES or not isinstance(req, str):
+            return None
+        kind, a, b = "proxy_reply", clean(req, 200), how
     elif k == "cowrie.telnet.exploit_attempt":
         kind, a, b = "exploit", ev.get("cve"), "%s=%s" % (ev.get("name"), ev.get("value"))
     elif k == "cowrie.client.version":
@@ -2467,6 +2477,8 @@ def board_text(kind, a, b):
         return "download failed: %s" % (a or "?")
     if kind == "tcpip":
         return "proxy -> %s" % (a or "?")
+    if kind == "proxy_reply":
+        return "proxy %s: %s" % (PROXY_REPLIES.get(b, "?"), a or "?")
     if kind == "exploit":
         return "exploit %s: %s" % (a or "?", b or "")
     if kind == "tarpit":
@@ -3036,7 +3048,7 @@ def v_ip(ip):
     evs = {}
     if sids:
         ph = ",".join("?" * len(sids))
-        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','tcpip','exploit') ORDER BY ts" % ph, sids):
+        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','tcpip','proxy_reply','exploit') ORDER BY ts" % ph, sids):
             evs.setdefault(x["session"], []).append(x)
     sblocks = []
     for s in sess:
@@ -3064,6 +3076,8 @@ def v_ip(ip):
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, cmd_html(clean(x["a"], 300))))
             elif k == "tcpip":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">proxy</span><code>→ %s</code></div>' % (rel_t, esc(x["a"])))
+            elif k == "proxy_reply":
+                lines.append('<div class="ln"><span class=t>%s</span><span class="pr">proxy</span><code>%s · %s</code></div>' % (rel_t, esc(clean(x["a"], 200)), esc(PROXY_REPLIES.get(x["b"], "?"))))
             elif k == "exploit":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">exploit</span><code>%s %s</code></div>' % (rel_t, esc(x["a"]), esc(clean(x["b"], 200))))
         persona = PERSONA.get(s["port"] or 0, "")
@@ -3718,13 +3732,26 @@ def v_campaigns():
                      "WHERE kind='canary' AND src='traps' AND b LIKE 'HELO %' GROUP BY name ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
     hlrows = "".join("<tr><td class='mono fd-d'><a href='/search?q=%s&days=all'>%s</a></td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                      % (esc(urllib.parse.quote("HELO " + h["name"], safe="")), esc(clean(h["name"], 120)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hl)
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl) and mail client name (HELO).</p>'
+    # Proxy use: what bots fetch through the fake SSH proxy, and whether the honeypot answered (Cowrie patch).
+    since = time.time() - 7 * 86400
+    ps = con.execute("SELECT COUNT(*) n, SUM(tcpip) t, COUNT(DISTINCT ip) nip FROM sessions WHERE tcpip > 0 AND start >= ?", (since,)).fetchone()
+    pa = con.execute("SELECT COUNT(*) FROM events WHERE kind='proxy_reply' AND ts >= ?", (since,)).fetchone()[0]
+    pr = con.execute("SELECT a, b, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events WHERE kind='proxy_reply' "
+                     "GROUP BY a, b ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
+    prows = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>"
+                    % (esc(clean(r["a"], 120)), esc(PROXY_REPLIES.get(r["b"], "?")), num(r["nip"]), num(r["n"]), esc(ago(r["l"]))) for r in pr)
+    psum = ("<p class=muted>Last 7 days: %s proxy sessions from %s IPs, %s proxy requests (%.1f per session), %s answered by the honeypot. "
+            "Nothing is ever forwarded: plain HTTP checks get an empty 200 page, TLS is held silently for up to 30 s.</p>"
+            % (num(ps["n"] or 0), num(ps["nip"] or 0), num(ps["t"] or 0), (ps["t"] or 0) / float(ps["n"] or 1), num(pa)))
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
             '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
             '<h2>Web attacks</h2><div class="card">%s</div><h2>Mail clients (HELO)</h2><div class="card">%s</div>'
+            '<h2>Proxy use</h2><div class="card">%s%s</div>'
             % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
                '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
-               '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet")))
+               '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
+               psum, '<table class="wide"><thead><tr><th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % prows if prows else none_yet("No proxy checks answered yet")))
     return page("Campaigns", body, "/campaigns")
 
 

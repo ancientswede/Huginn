@@ -295,6 +295,12 @@ if [ -f "$FREE" ]; then
   rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
   case $rc in 0) ok "patched free.py to read the fake /proc/meminfo" ;; 3) ok "free.py already patched" ;; *) warn "free.py not patched (Cowrie changed); harmless" ;; esac
 fi
+# Cowrie's fake proxy refuses everything, so bots that log in only to use it as a proxy leave at once.
+FWD="$C/src/cowrie/ssh/forwarding.py"
+if [ -f "$FWD" ]; then
+  rc=0; patch_as cowrie cowrie-forward "$FWD" || rc=$?
+  case $rc in 0) ok "Cowrie answers plain HTTP proxy checks (nothing is forwarded)" ;; 3) ok "proxy reply already patched" ;; *) warn "proxy reply not patched (Cowrie changed); harmless" ;; esac
+fi
 cat > /etc/systemd/system/cowrie.service <<EOF
 [Unit]
 Description=Cowrie SSH/Telnet honeypot
