@@ -80,6 +80,45 @@ class Mail(unittest.TestCase):
         self.t._mail = 0
 
 
+class Deadline(unittest.TestCase):
+    def test_slow_message_body_is_cut_off(self):
+        # A bot that keeps sending one line of DATA now and then used to stay past the cap: now the whole session ends.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        os.environ["LOGS_DIRECTORY"] = d
+        t = load("hp_traps_deadline", os.path.join(ROOT, "honeypot", "hp-traps.py"))
+        t.SMTP_MAX_SECS = 1.0
+
+        async def run():
+            srv = await asyncio.start_server(t.make("smtp"), "127.0.0.1", 0)
+            r, w = await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+            await r.readline()
+            w.write(b"EHLO bot\r\nMAIL FROM:<a@example.net>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n")
+            start = time.monotonic()
+            reader = asyncio.ensure_future(r.read())                       # collects until the server hangs up
+            for _ in range(8):
+                if reader.done():
+                    break
+                try:
+                    w.write(b"line\r\n")
+                    await w.drain()
+                except (ConnectionError, OSError):
+                    break
+                await asyncio.sleep(0.3)
+            got = await asyncio.wait_for(reader, 5)
+            took = time.monotonic() - start
+            w.close()
+            srv.close()
+            await srv.wait_closed()
+            await asyncio.sleep(0.1)
+            return took, got
+        took, got = asyncio.run(run())
+        self.assertIn(b"421 4.4.2", got)
+        self.assertLess(took, 4)
+        ev = [json.loads(l) for f in os.listdir(d) for l in open(os.path.join(d, f))]
+        self.assertEqual([e["event"] for e in ev][-1], "end")
+
+
 class Reactor:
     def __init__(self):
         self.calls = []
@@ -155,6 +194,18 @@ class Drip(unittest.TestCase):
         self.assertEqual((req.out, req.finished, ended), (payload, True, ["done"]))
         self.assertAlmostEqual(sum(c.delay for c in rx.calls), self.ns["HPW_DRIP_SECS"] * (1 - 1.0 / 10), places=3)
         self.assertEqual(self.ns["HPW_DRIPS"], {})
+
+    def test_finish_error_and_startup_error(self):
+        rx, req, ended = Reactor(), Req(), []
+        req.finish = lambda: 1 / 0                                        # finishing failed: not counted as sent in full
+        self.ns["hpw_drip"](req, b"x" * 20, IP, lambda h, s: ended.append(h), rx)
+        rx.run()
+        self.assertEqual((ended, self.ns["HPW_DRIPS"]), (["gone"], {}))
+        req = Req()
+        req.notifyFinish = lambda: 1 / 0                                  # startup failed: the slot is free again
+        with self.assertRaises(ZeroDivisionError):
+            self.ns["hpw_drip"](req, b"x" * 20, IP, lambda h, s: None, rx)
+        self.assertEqual((self.ns["HPW_DRIPS"], req.out), ({}, b""))
 
     def test_client_leaves_and_caps(self):
         rx, req, ended = Reactor(), Req(), []
@@ -278,9 +329,9 @@ class Huginn(unittest.TestCase):
         app.store(self.con, [(hashlib.sha1(repr(r).encode()).hexdigest(),) + r for r in rows])
         camp = app.v_campaigns()
         self.assertIn("Slow replies", camp)
-        self.assertIn("2 slow exports (robots paths, about 5 s), 1 read to the end, 1 left early, 3.1 s on average", camp)
+        self.assertIn("2 slow exports (robots paths, about 4.5 s), 1 sent in full, 1 left early, 3.1 s on average", camp)
         self.assertIn("1 sessions that sent mail, from 1 IPs, 3.0 messages and 12 s per session, 5 s of it waiting", camp)
-        self.assertEqual(app.board_text("web_drip", "/backup/a/x", "gone 1.2"), "slow export /backup/a/x left after 1.2 s")
+        self.assertEqual(app.board_text("web_drip", "/backup/a/x", "gone 1.2"), "slow export /backup/a/x left early after 1.2 s")
         self.assertEqual(app.board_text("trap_end", "smtp", "12.5 3 5.1"), "mail session ended after 12.5 s, 3 message(s)")
         self.assertNotIn("/backup/a/<b>", app.v_ip(IP) + app.v_campaigns())
 

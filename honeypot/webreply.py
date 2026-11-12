@@ -242,7 +242,8 @@ def hpw_drip_ok(kind, method, ip):
 
 
 def hpw_drip(request, payload, ip, ended, reactor=None):
-    """Send payload in small parts over HPW_DRIP_SECS without blocking the reactor. ended(how, secs) runs exactly once."""
+    """Send payload in small parts over HPW_DRIP_SECS without blocking the reactor. ended(how, secs) runs exactly once:
+    "done" when the whole reply was handed to the connection and finished, "gone" when the client left first."""
     if reactor is None:
         from twisted.internet import reactor
     from twisted.web.server import NOT_DONE_YET
@@ -282,11 +283,15 @@ def hpw_drip(request, payload, ip, ended, reactor=None):
             if i + 1 < len(parts):
                 state['call'] = reactor.callLater(step, tick, i + 1)
                 return
-            close('done')
             request.finish()
+            close('done')
         except Exception:
             close('gone')
 
-    request.notifyFinish().addErrback(lost)
+    try:
+        request.notifyFinish().addErrback(lost)
+    except Exception:
+        close('gone')    # nothing was sent yet: free the slot, the caller answers at once instead
+        raise
     tick(0)          # headers and the first part at once, the rest slowly
     return NOT_DONE_YET

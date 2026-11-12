@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.27.0"
+HUGINN_VERSION = "0.27.1"
 CHANGELOG = [
+    ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; most telnet bots check the network that way and left (about 1,500 of 2,500 telnet sessions with commands ended there). And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
     ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
     ("0.26.0", "2026-11-11", "Proxy that seems to work: most bots that log in to the SSH honeypot only want to use it as a proxy, test it with a plain web request and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
     ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
@@ -2497,7 +2498,7 @@ def board_text(kind, a, b):
         return "proxy -> %s" % (a or "?")
     if kind == "web_drip":
         how, _, secs = (b or "").partition(" ")
-        return "slow export %s %s after %s s" % (a or "?", "read to the end" if how == "done" else "left", secs or "?")
+        return "slow export %s %s after %s s" % (a or "?", "sent in full" if how == "done" else "left early", secs or "?")
     if kind == "trap_end":
         f = (b or "").split()
         return "mail session ended after %s s, %s message(s)" % (f[0], f[1]) if len(f) == 3 else "mail session ended"
@@ -3760,8 +3761,8 @@ def v_campaigns():
     since = time.time() - 7 * 86400
     ps = con.execute("SELECT COUNT(*) n, SUM(tcpip) t, COUNT(DISTINCT ip) nip FROM sessions WHERE tcpip > 0 AND start >= ?", (since,)).fetchone()
     pa = con.execute("SELECT COUNT(*) FROM events WHERE kind='proxy_reply' AND ts >= ?", (since,)).fetchone()[0]
-    pr = con.execute("SELECT a, b, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events WHERE kind='proxy_reply' "
-                     "GROUP BY a, b ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
+    pr = con.execute("SELECT a, b, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events WHERE kind='proxy_reply' AND ts >= ? "
+                     "GROUP BY a, b ORDER BY nip DESC, n DESC LIMIT 40", (since,)).fetchall()
     prows = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>"
                     % (esc(clean(r["a"], 120)), esc(PROXY_REPLIES.get(r["b"], "?")), num(r["nip"]), num(r["n"]), esc(ago(r["l"]))) for r in pr)
     psum = ("<p class=muted>Last 7 days: %s proxy sessions from %s IPs, %s proxy requests (%.1f per session), %s answered by the honeypot. "
@@ -3777,7 +3778,7 @@ def v_campaigns():
             continue
         if mails > 0:
             mt.append((secs, mails, waited)); mip.add(r["ip"])
-    slow = ("<p class=muted>Last 7 days. Web: %s slow exports (robots paths, about 5 s), %s read to the end, %s left early, %.1f s on average. "
+    slow = ("<p class=muted>Last 7 days. Web: %s slow exports (robots paths, about 4.5 s), %s sent in full, %s left early, %.1f s on average. "
             "Mail: %s sessions that sent mail, from %s IPs, %.1f messages and %.0f s per session, %.0f s of it waiting for the fake queue (1 to 2.5 s per message, after the message is logged).</p>"
             % (num(dr["n"] or 0), num(dr["d"] or 0), num((dr["n"] or 0) - (dr["d"] or 0)), dr["s"] or 0.0,
                num(len(mt)), num(len(mip)), sum(x[1] for x in mt) / float(len(mt) or 1),

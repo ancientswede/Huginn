@@ -13,8 +13,7 @@ IP = "198.51.100.131"
 # The shape of Cowrie's FakeForwardingChannel.dataReceived around the patched lines (upstream text in FWD_OLD).
 FIXTURE = '''class FakeForwardingChannel:
     def dataReceived(self, data):
-        events = self.conn.transport.events
-        if events:
+''' + patches.FWD_TOP_OLD + '''        if events:
             events.dispatch(
                 "cowrie.direct-tcpip.data",
                 "discarded",
@@ -84,9 +83,11 @@ class Patch(unittest.TestCase):
         self.assertIsNone(ch.refused)
         rep = [e for e in ch.events.sent if e["eventid"] == "cowrie.direct-tcpip.hp-reply"][0]
         self.assertEqual((rep["hp_reply"], rep["hp_request"]), ("http200", "GET yahoo.com/"))
-        # More data on the same channel is not answered twice.
+        # More data on the same channel is not answered twice, nor logged again.
+        logged = len(ch.events.sent)
         ns["FakeForwardingChannel"].dataReceived(ch, b"GET / HTTP/1.1\r\n\r\n")
         self.assertEqual(ch.out.count(b"HTTP/1.1 200"), 1)
+        self.assertEqual(len(ch.events.sent), logged)
 
     def test_tls_is_held_and_other_refused(self):
         patches.cowrie_forward(self.path)
@@ -117,6 +118,54 @@ class Patch(unittest.TestCase):
         ns["HP_HOLDS"][0] = 0
         self.assertEqual(len(r(80, b"GET / HTTP/1.1\r\n" + b"A" * 90000)[1]) < 1024, True)   # reply size never follows the input
         self.assertEqual(r(80, b"GET / HTTP/1.1\r\n\r\n")[2], "GET ?/")
+
+    def test_hold_slot_freed_when_channel_closes(self):
+        ns = {}
+        exec(patches.FWD_HELPER, ns)
+        calls = []
+
+        class Rx:
+            def callLater(self, delay, fn):
+                c = type("C", (), {"live": True})()
+                c.active = lambda: c.live
+                c.cancel = lambda: setattr(c, "live", False)
+                c.fn = fn
+                calls.append(c)
+                return c
+
+        ch = Chan(443)
+        ch.closed_upstream = 0
+        ch.closed = lambda: setattr(ch, "closed_upstream", ch.closed_upstream + 1)
+        ns["hp_hold"](ch, Rx())
+        self.assertEqual(ns["HP_HOLDS"][0], 1)
+        ch.closed()                                   # the client hung up after 2 s: slot free now, timer dropped
+        self.assertEqual((ns["HP_HOLDS"][0], calls[0].live, ch.closed_upstream), (0, False, 1))
+        ch2 = Chan(443)
+        ch2.closed = lambda: None
+        ns["hp_hold"](ch2, Rx())
+        calls[1].fn()                                 # 30 s passed: close, and the later closed() does not free twice
+        ch2.closed()
+        self.assertEqual((ns["HP_HOLDS"][0], ch2.lost), (0, True))
+
+    def test_upgrade_from_026(self):
+        import subprocess
+        try:
+            old = subprocess.run(["git", "-C", ROOT, "show", "v0.27.0:honeypot/patches.py"], capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("no git history")
+        ns = {}
+        exec(old.split("\ndef opencanary_ports")[0], ns)
+        self.assertEqual(ns["cowrie_forward"](self.path), 0)
+        self.assertIn("Huginn proxyreply v1", open(self.path).read())
+        self.assertEqual(patches.cowrie_forward(self.path), 0)
+        code = open(self.path).read()
+        self.assertIn("Huginn proxyreply v2", code)
+        self.assertNotIn("proxyreply v1", code)
+        self.assertEqual(open(self.path + ".orig").read(), FIXTURE)      # .orig stays the true upstream file
+        self.assertEqual(patches.cowrie_forward(self.path), 3)
+        # An unknown local change to the 0.26 patch is never overwritten.
+        open(self.path, "w").write(code.replace("proxyreply v2", "proxyreply v1").replace("HP_HOLD_MAX = 64", "HP_HOLD_MAX = 9"))
+        self.assertEqual(patches.cowrie_forward(self.path), 1)
 
 
 class Huginn(unittest.TestCase):

@@ -71,7 +71,9 @@ if [ "$UP_COWRIE" = 1 ]; then
   [ -d "$C/.git" ] || die "$C is not a git checkout of Cowrie."
   FREE="$C/src/cowrie/commands/free.py"
   # Put Cowrie's own free.py back so git can update it, then patch the new version again.
-  runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py src/cowrie/ssh/forwarding.py 2>/dev/null || true
+  runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py src/cowrie/ssh/forwarding.py src/cowrie/commands/ping.py \
+    src/cowrie/shell/server.py src/cowrie/shell/session.py src/cowrie/shell/filetransfer.py \
+    src/cowrie/commands/scp.py src/cowrie/shell/fs.py 2>/dev/null || true
   BEFORE=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
   runuser -u cowrie -- git -C "$C" pull -q --ff-only || die "git pull failed in $C (local changes?) — Cowrie was not updated."
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
@@ -81,6 +83,10 @@ if [ "$UP_COWRIE" = 1 ]; then
   case $rc in 0|3) ok "free.py patch in place" ;; *) warn "free.py patch no longer fits the new Cowrie (harmless: free shows the host's memory)" ;; esac
   rc=0; patch_as cowrie cowrie-forward "$C/src/cowrie/ssh/forwarding.py" || rc=$?
   case $rc in 0|3) ok "proxy reply patch in place" ;; *) warn "proxy reply patch no longer fits the new Cowrie (harmless: proxy checks are refused as before)" ;; esac
+  rc=0; patch_as cowrie cowrie-ping "$C/src/cowrie/commands/ping.py" || rc=$?
+  case $rc in 0|3) ok "ping patch in place" ;; *) warn "ping patch no longer fits the new Cowrie (harmless: ping -c fails as upstream)" ;; esac
+  rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
+  case $rc in 0|3) ok "upload patch in place" ;; *) warn "upload patch no longer fits the new Cowrie (harmless: uploads vanish as upstream)" ;; esac
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
 
@@ -110,16 +116,31 @@ if [ "$UP_CANARY" = 0 ] && [ -x "$O/oc-env/bin/python3" ]; then
   esac
 fi
 
-# Same for Cowrie's fake proxy (--cowrie patches it after the upgrade instead).
+# Same for Cowrie's own patches (--cowrie patches them after the upgrade instead). Restart once if any changed.
 FWD="$C/src/cowrie/ssh/forwarding.py"
 if [ "$UP_COWRIE" = 0 ] && [ -f "$FWD" ]; then
+  CHANGED=0
   rc=0; patch_as cowrie cowrie-forward "$FWD" || rc=$?
   case $rc in
-    0) ok "Cowrie answers proxy checks now"
-       for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done ;;
+    0) ok "Cowrie answers proxy checks now"; CHANGED=1 ;;
     3) ok "proxy reply patch in place" ;;
     *) warn "proxy reply patch did not fit this Cowrie; no files changed (proxy checks are refused as before)" ;;
   esac
+  rc=0; patch_as cowrie cowrie-ping "$C/src/cowrie/commands/ping.py" || rc=$?
+  case $rc in
+    0) ok "ping accepts -c now"; CHANGED=1 ;;
+    3) ok "ping patch in place" ;;
+    *) warn "ping patch did not fit this Cowrie; no files changed" ;;
+  esac
+  rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
+  case $rc in
+    0) ok "uploaded files stay for the next command now"; CHANGED=1 ;;
+    3) ok "upload patch in place" ;;
+    *) warn "upload patch did not fit this Cowrie; no files changed" ;;
+  esac
+  if [ "$CHANGED" = 1 ]; then
+    for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
+  fi
 fi
 
 say "Web identity"

@@ -301,6 +301,13 @@ if [ -f "$FWD" ]; then
   rc=0; patch_as cowrie cowrie-forward "$FWD" || rc=$?
   case $rc in 0) ok "Cowrie answers plain HTTP proxy checks (nothing is forwarded)" ;; 3) ok "proxy reply already patched" ;; *) warn "proxy reply not patched (Cowrie changed); harmless" ;; esac
 fi
+# Cowrie's ping never accepted "-c N", and a file uploaded over SFTP/scp vanished before the next command.
+if [ -f "$C/src/cowrie/commands/ping.py" ]; then
+  rc=0; patch_as cowrie cowrie-ping "$C/src/cowrie/commands/ping.py" || rc=$?
+  case $rc in 0|3) ok "ping accepts -c" ;; *) warn "ping not patched (Cowrie changed); harmless" ;; esac
+  rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
+  case $rc in 0|3) ok "uploaded files stay for the next command" ;; *) warn "upload not patched (Cowrie changed); harmless" ;; esac
+fi
 cat > /etc/systemd/system/cowrie.service <<EOF
 [Unit]
 Description=Cowrie SSH/Telnet honeypot

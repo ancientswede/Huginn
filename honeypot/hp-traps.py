@@ -11,10 +11,10 @@ PORTS = {"smtp": 2525, "submission": 2587, "pop3": 2110, "imap": 2143, "postgres
 MAX_CONN = 300
 IDLE = 90          # seconds without data -> close
 MAX_LINE = 4096
-MAX_DATA = 1024 * 1024
+MAX_DATA = 10240000   # the SIZE the EHLO reply advertises; only the first 4 KiB is kept
 KEEP_DAYS = 30
 SMTP_WAIT = (1.0, 2.5)    # seconds to "queue" a message, after it is fully received and logged (keeps relay bots a little longer)
-SMTP_MAX_SECS = 600       # a mail session never lasts longer than this
+SMTP_MAX_SECS = 600       # a mail session never lasts longer than this, whatever it is doing (DATA, AUTH, a slow reader)
 SMTP_MAX_MAILS = 50       # nor takes more messages
 SMTP_MAX_CONN = 150       # mail may use at most half of MAX_CONN, so it cannot crowd out the other traps
 MAX_LOG_DAY = 200 * 1024 * 1024  # stop logging for the day past this size, so a flood cannot fill the disk
@@ -79,7 +79,12 @@ def qid():
 async def smtp(r, w, peer, service):
     st = {"mails": 0, "waited": 0.0, "start": time.monotonic()}
     try:
-        await smtp_talk(r, w, peer, service, st)
+        await asyncio.wait_for(smtp_talk(r, w, peer, service, st), SMTP_MAX_SECS)
+    except asyncio.TimeoutError:
+        try:
+            w.write(b"421 4.4.2 %s Error: timeout exceeded\r\n" % HOSTNAME.encode())
+        except Exception:
+            pass
     finally:
         # One record when the session ends, however it ends: how long the bot stayed and how much it sent.
         log(peer, service, "end", secs=round(time.monotonic() - st["start"], 1), mails=st["mails"], waited=round(st["waited"], 1))
@@ -89,8 +94,6 @@ async def smtp_talk(r, w, peer, service, st):
     w.write(b"220 %s ESMTP Postfix (Ubuntu)\r\n" % HOSTNAME.encode()); await w.drain()
     mail_from, rcpts, helo = "", [], ""
     while True:
-        if time.monotonic() - st["start"] > SMTP_MAX_SECS:
-            w.write(b"421 4.4.2 %s Error: timeout exceeded\r\n" % HOSTNAME.encode()); await w.drain(); return
         line = await readline(r)
         cmd = line[:4].upper()
         arg = line[5:].decode("utf-8", "replace") if len(line) > 5 else ""
