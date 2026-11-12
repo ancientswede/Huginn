@@ -17,6 +17,16 @@ check() {  # check NAME FILE COMMAND
 git clone -q --depth 1 https://github.com/cowrie/cowrie "$W/cowrie"
 echo "Cowrie $(git -C "$W/cowrie" log -1 --format='%h %cs')"
 check "Cowrie free.py" "$W/cowrie/src/cowrie/commands/free.py" cowrie-free
+check "Cowrie forwarding.py" "$W/cowrie/src/cowrie/ssh/forwarding.py" cowrie-forward
+check "Cowrie ping.py" "$W/cowrie/src/cowrie/commands/ping.py" cowrie-ping
+# The upload patch changes several files at once (all or none).
+rc=0
+python3 "$HERE/honeypot/patches.py" cowrie-upload "$W/cowrie/src/cowrie" || rc=$?
+if [ "$rc" = 0 ] && (cd "$W/cowrie/src/cowrie" && python3 -m py_compile shell/server.py shell/session.py shell/fs.py shell/filetransfer.py commands/scp.py); then
+  echo "ok    Cowrie upload (server, session, fs, filetransfer, scp)"
+else
+  echo "FAIL  Cowrie upload (patches.py exit $rc)"; FAIL=1
+fi
 
 python3 -m pip download -q --no-deps --no-binary :none: -d "$W/oc" opencanary >/dev/null
 WHL=$(ls "$W"/oc/opencanary-*.whl 2>/dev/null | head -1 || true)
