@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.26.0"
+HUGINN_VERSION = "0.27.0"
 CHANGELOG = [
+    ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
     ("0.26.0", "2026-11-11", "Proxy that seems to work: most bots that log in to the SSH honeypot only want to use it as a proxy, test it with a plain web request and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
     ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
     ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
@@ -638,6 +639,14 @@ def p_canary(line):
         pw = vnc_password(ld)
     if user or pw:
         return (datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp(), ip, "canary", "canary", None, svc, trunc("%s / %s" % (user or "", pw or ""), 600))
+    if svc in ("http", "https") and ld.get("HP_DRIP") in ("done", "gone"):
+        # The end of a slow export (honeypot/webreply.py): did the client wait for the last byte?
+        try:
+            secs = max(0.0, min(float(ld.get("HP_DRIP_SECS")), 3600.0))
+        except (TypeError, ValueError):
+            return None
+        ts = datetime.fromisoformat(ev["utc_time"]).replace(tzinfo=timezone.utc).timestamp()
+        return (ts, ip, "canary", "web_drip", None, clean(str(ld.get("PATH") or "?"), 200), "%s %.1f" % (ld["HP_DRIP"], secs))
     if svc in ("http", "https") and ld.get("PATH"):
         b = "%s %s%s" % (ld.get("METHOD") or "GET", ld.get("PATH"), " (%s)" % ld["STATUS"] if ld.get("STATUS") else "")
         # Set by the honeypot when it answered with fake content (which type) or the path is only listed in robots.txt.
@@ -645,6 +654,8 @@ def p_canary(line):
             b += "  [reply %s]" % ld["HP_REPLY"]
         if ld.get("HP_ROBOTS") == "1":
             b += "  [robots]"
+        if ld.get("HP_SLOW") == "1":
+            b += "  [slow]"
         if ld.get("BODY"):
             b += "  body: " + str(ld["BODY"])[:300]
         if ld.get("USERAGENT"):
@@ -733,6 +744,13 @@ def p_traps(line):
         b = not_a_login("proxy -> %s" % (ev.get("target") or "?"))
     elif e == "connect":
         b = ""
+    elif e == "end" and svc in ("smtp", "submission"):
+        # End of a mail session: how long the bot stayed, how many messages it sent, how long the fake queue made it wait.
+        try:
+            secs, mails, waited = (max(0.0, min(float(ev.get(k) or 0), 86400.0)) for k in ("secs", "mails", "waited"))
+        except (TypeError, ValueError):
+            return None
+        return (iso_ts(ev["ts"]), ip, "traps", "trap_end", None, svc, "%.1f %d %.1f" % (secs, mails, waited))
     else:
         return None
     return (iso_ts(ev["ts"]), ip, "traps", "canary", None, svc, trunc(b, 600))
@@ -2477,6 +2495,12 @@ def board_text(kind, a, b):
         return "download failed: %s" % (a or "?")
     if kind == "tcpip":
         return "proxy -> %s" % (a or "?")
+    if kind == "web_drip":
+        how, _, secs = (b or "").partition(" ")
+        return "slow export %s %s after %s s" % (a or "?", "read to the end" if how == "done" else "left", secs or "?")
+    if kind == "trap_end":
+        f = (b or "").split()
+        return "mail session ended after %s s, %s message(s)" % (f[0], f[1]) if len(f) == 3 else "mail session ended"
     if kind == "proxy_reply":
         return "proxy %s: %s" % (PROXY_REPLIES.get(b, "?"), a or "?")
     if kind == "exploit":
@@ -3743,15 +3767,30 @@ def v_campaigns():
     psum = ("<p class=muted>Last 7 days: %s proxy sessions from %s IPs, %s proxy requests (%.1f per session), %s answered by the honeypot. "
             "Nothing is ever forwarded: plain HTTP checks get an empty 200 page, TLS is held silently for up to 30 s.</p>"
             % (num(ps["n"] or 0), num(ps["nip"] or 0), num(ps["t"] or 0), (ps["t"] or 0) / float(ps["n"] or 1), num(pa)))
+    # Slow replies (0.27): the slow robots export and the mail queue wait. Did bots stay, and did they still go on?
+    dr = con.execute("SELECT COUNT(*) n, SUM(b LIKE 'done %') d, AVG(CAST(substr(b, 6) AS REAL)) s FROM events WHERE kind='web_drip' AND ts >= ?", (since,)).fetchone()
+    mt, mip = [], set()
+    for r in con.execute("SELECT ip, b FROM events WHERE kind='trap_end' AND ts >= ?", (since,)):
+        try:
+            secs, mails, waited = (float(x) for x in (r["b"] or "").split())
+        except ValueError:
+            continue
+        if mails > 0:
+            mt.append((secs, mails, waited)); mip.add(r["ip"])
+    slow = ("<p class=muted>Last 7 days. Web: %s slow exports (robots paths, about 5 s), %s read to the end, %s left early, %.1f s on average. "
+            "Mail: %s sessions that sent mail, from %s IPs, %.1f messages and %.0f s per session, %.0f s of it waiting for the fake queue (1 to 2.5 s per message, after the message is logged).</p>"
+            % (num(dr["n"] or 0), num(dr["d"] or 0), num((dr["n"] or 0) - (dr["d"] or 0)), dr["s"] or 0.0,
+               num(len(mt)), num(len(mip)), sum(x[1] for x in mt) / float(len(mt) or 1),
+               sum(x[0] for x in mt) / float(len(mt) or 1), sum(x[2] for x in mt) / float(len(mt) or 1)))
     body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
             '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
             '<h2>Web attacks</h2><div class="card">%s</div><h2>Mail clients (HELO)</h2><div class="card">%s</div>'
-            '<h2>Proxy use</h2><div class="card">%s%s</div>'
+            '<h2>Proxy use</h2><div class="card">%s%s</div><h2>Slow replies</h2><div class="card">%s</div>'
             % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
                '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
                '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
-               psum, '<table class="wide"><thead><tr><th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % prows if prows else none_yet("No proxy checks answered yet")))
+               psum, '<table class="wide"><thead><tr><th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % prows if prows else none_yet("No proxy checks answered yet"), slow))
     return page("Campaigns", body, "/campaigns")
 
 

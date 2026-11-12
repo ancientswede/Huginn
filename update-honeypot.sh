@@ -103,7 +103,11 @@ if [ "$UP_CANARY" = 0 ] && [ -x "$O/oc-env/bin/python3" ]; then
   HTTPPY=$(find "$O/oc-env" -path '*opencanary/modules/http.py' | head -1)
   rc=0
   if [ -n "$HTTPPY" ]; then patch_as opencanary opencanary-http "$HTTPPY" || rc=$?; else rc=1; fi
-  case $rc in 0|3) ok "web reply/logging patch in place" ;; *) warn "web reply patch did not fit; no files changed"; FAILED=1 ;; esac
+  case $rc in
+    0) ok "web reply/logging patch updated"; restart_ok opencanary ;;
+    3) ok "web reply/logging patch in place" ;;
+    *) warn "web reply patch did not fit; no files changed"; FAILED=1 ;;
+  esac
 fi
 
 # Same for Cowrie's fake proxy (--cowrie patches it after the upgrade instead).

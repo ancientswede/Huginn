@@ -226,7 +226,7 @@ class Patch(WorkspaceTest):
             self.target.with_suffix('.py.orig').write_text(self.upstream)
             self.target.write_text(self.upstream.replace(p.HTTP_OLD, p.HTTP_LEGACY))
         self.assertEqual(p.opencanary_http(str(self.target)), 0)
-        self.assertIn('Huginn webreply v1', self.target.read_text())
+        self.assertIn('Huginn webreply v2', self.target.read_text())
         self.assertEqual(self.target.with_suffix('.py.orig').read_text(), self.upstream)
 
     def test_unknown_patch_or_missing_backup_is_not_overwritten(self):

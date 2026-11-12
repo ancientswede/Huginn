@@ -12,6 +12,13 @@ HPW_MAX_BODY = 4096
 HPW_MAX_BUNDLE = 65536
 HPW_BUNDLE = 'webreply.json'
 HPW_BAIT = '/etc/huginn-honeypot/bait.json'
+# Slow export: the robots-only backup file trickles out like a slow device. Bounded so it can never tie up the honeypot.
+HPW_DRIP_KINDS = ('robots_backup',)
+HPW_DRIP_SECS = 5.0
+HPW_DRIP_PARTS = 10
+HPW_DRIP_MAX = 32
+HPW_DRIP_PER_IP = 2
+HPW_DRIPS = {}
 
 
 def hpw_bait(path=HPW_BAIT):
@@ -226,3 +233,60 @@ def hpw_reply(factory, uri, method, body=b''):
     if len(raw) > HPW_MAX_BODY:
         return None, None, None, hit
     return kind, raw, ctype, hit
+
+
+def hpw_drip_ok(kind, method, ip):
+    """Only a GET of a chosen export, and only while there is room; otherwise the fast reply as before."""
+    return (kind in HPW_DRIP_KINDS and method == b'GET' and isinstance(ip, str)
+            and sum(HPW_DRIPS.values()) < HPW_DRIP_MAX and HPW_DRIPS.get(ip, 0) < HPW_DRIP_PER_IP)
+
+
+def hpw_drip(request, payload, ip, ended, reactor=None):
+    """Send payload in small parts over HPW_DRIP_SECS without blocking the reactor. ended(how, secs) runs exactly once."""
+    if reactor is None:
+        from twisted.internet import reactor
+    from twisted.web.server import NOT_DONE_YET
+    size = max(1, -(-len(payload) // HPW_DRIP_PARTS))
+    parts = [payload[i:i + size] for i in range(0, len(payload), size)] or [b'']
+    step = HPW_DRIP_SECS / len(parts)
+    start = hpw_time.monotonic()
+    state = {'call': None, 'open': True}
+    HPW_DRIPS[ip] = HPW_DRIPS.get(ip, 0) + 1
+
+    def close(how):
+        if not state['open']:
+            return
+        state['open'] = False
+        if state['call'] is not None and state['call'].active():
+            state['call'].cancel()
+        state['call'] = None
+        left = HPW_DRIPS.get(ip, 1) - 1
+        if left > 0:
+            HPW_DRIPS[ip] = left
+        else:
+            HPW_DRIPS.pop(ip, None)
+        try:
+            ended(how, round(hpw_time.monotonic() - start, 1))
+        except Exception:
+            pass
+
+    def lost(_result):
+        close('gone')   # the client hung up before the last byte
+
+    def tick(i):
+        state['call'] = None
+        if not state['open']:
+            return
+        try:
+            request.write(parts[i])
+            if i + 1 < len(parts):
+                state['call'] = reactor.callLater(step, tick, i + 1)
+                return
+            close('done')
+            request.finish()
+        except Exception:
+            close('gone')
+
+    request.notifyFinish().addErrback(lost)
+    tick(0)          # headers and the first part at once, the rest slowly
+    return NOT_DONE_YET

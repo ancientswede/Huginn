@@ -13,9 +13,14 @@ IDLE = 90          # seconds without data -> close
 MAX_LINE = 4096
 MAX_DATA = 1024 * 1024
 KEEP_DAYS = 30
+SMTP_WAIT = (1.0, 2.5)    # seconds to "queue" a message, after it is fully received and logged (keeps relay bots a little longer)
+SMTP_MAX_SECS = 600       # a mail session never lasts longer than this
+SMTP_MAX_MAILS = 50       # nor takes more messages
+SMTP_MAX_CONN = 150       # mail may use at most half of MAX_CONN, so it cannot crowd out the other traps
 MAX_LOG_DAY = 200 * 1024 * 1024  # stop logging for the day past this size, so a flood cannot fill the disk
 HOSTNAME = os.environ.get("TRAPS_HOSTNAME", "mail.example.com")
 _active = 0
+_mail = 0
 
 
 def log(peer, service, event, **kw):
@@ -72,9 +77,20 @@ def qid():
 
 # ---------------------------------------------------------------- SMTP (open relay bait)
 async def smtp(r, w, peer, service):
+    st = {"mails": 0, "waited": 0.0, "start": time.monotonic()}
+    try:
+        await smtp_talk(r, w, peer, service, st)
+    finally:
+        # One record when the session ends, however it ends: how long the bot stayed and how much it sent.
+        log(peer, service, "end", secs=round(time.monotonic() - st["start"], 1), mails=st["mails"], waited=round(st["waited"], 1))
+
+
+async def smtp_talk(r, w, peer, service, st):
     w.write(b"220 %s ESMTP Postfix (Ubuntu)\r\n" % HOSTNAME.encode()); await w.drain()
     mail_from, rcpts, helo = "", [], ""
     while True:
+        if time.monotonic() - st["start"] > SMTP_MAX_SECS:
+            w.write(b"421 4.4.2 %s Error: timeout exceeded\r\n" % HOSTNAME.encode()); await w.drain(); return
         line = await readline(r)
         cmd = line[:4].upper()
         arg = line[5:].decode("utf-8", "replace") if len(line) > 5 else ""
@@ -135,8 +151,15 @@ async def smtp(r, w, peer, service):
             subj = next((l[8:].strip() for l in text.splitlines() if l.lower().startswith("subject:")), "")
             log(peer, service, "mail", mail_from=mail_from, rcpts=rcpts[:20], rcpt_count=len(rcpts), subject=subj,
                 size=size, helo=helo, sample=text[:1500])
-            # Pretend to queue — never delivered (the honeypot has no outbound internet, and there is no delivery code).
+            st["mails"] += 1
+            # Pretend to queue, slowly like a busy server: the message is already logged, so waiting loses nothing.
+            # Never delivered (the honeypot has no outbound internet, and there is no delivery code).
+            wait = random.uniform(*SMTP_WAIT)
+            await asyncio.sleep(wait)
+            st["waited"] += wait
             w.write(b"250 2.0.0 Ok: queued as %s\r\n" % qid().encode())
+            if st["mails"] >= SMTP_MAX_MAILS:
+                w.write(b"421 4.7.0 %s Error: too many messages\r\n" % HOSTNAME.encode()); await w.drain(); return
         elif cmd == b"RSET":
             mail_from, rcpts = "", []; w.write(b"250 2.0.0 Ok\r\n")
         elif cmd == b"NOOP":
@@ -326,11 +349,13 @@ HANDLERS = {"smtp": smtp, "submission": smtp, "pop3": pop3, "imap": imap, "postg
 
 def make(service):
     async def handle(r, w):
-        global _active
+        global _active, _mail
         peer = w.get_extra_info("peername") or ("?", 0)
-        if _active >= MAX_CONN:
+        mail = service in ("smtp", "submission")
+        if _active >= MAX_CONN or (mail and _mail >= SMTP_MAX_CONN):
             w.close(); return
         _active += 1
+        _mail += mail
         try:
             log(peer, service, "connect")
             await HANDLERS[service](r, w, peer, service)
@@ -343,6 +368,7 @@ def make(service):
                 pass
         finally:
             _active -= 1
+            _mail -= mail
             try:
                 w.close()
             except Exception:
