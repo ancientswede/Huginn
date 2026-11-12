@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.27.1"
+HUGINN_VERSION = "0.27.2"
 CHANGELOG = [
+    ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
     ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; most telnet bots check the network that way and left (about 1,500 of 2,500 telnet sessions with commands ended there). And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
     ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
     ("0.26.0", "2026-11-11", "Proxy that seems to work: most bots that log in to the SSH honeypot only want to use it as a proxy, test it with a plain web request and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
@@ -2694,7 +2695,7 @@ def heat_html(grid):
 
 
 def hero_card(con, st):
-    # The raven banner with what Huginn has seen so far. The picture is dark in both themes, so the text is always light.
+    # The raven banner with what Huginn has seen so far. Two pictures of the same raven: CSS shows the one for the theme (and the text colour with it).
     n_ips, first = con.execute("SELECT COUNT(*), MIN(first) FROM ips").fetchone()
     n_cc = con.execute("SELECT COUNT(DISTINCT e.cc) FROM enrich e JOIN ips i USING(ip) WHERE e.cc IS NOT NULL AND e.cc!=''").fetchone()[0]
     n_logins = con.execute("SELECT COALESCE(SUM(logins_ok + logins_fail), 0) FROM ips").fetchone()[0]
@@ -2703,7 +2704,8 @@ def hero_card(con, st):
     if first:
         facts.append("watching since %s" % datetime.fromtimestamp(first, TZ).strftime("%Y-%m-%d"))
     facts += ["%s attackers" % num(n_ips), "%s countries" % num(n_cc), "%s login attempts" % num(n_logins)]
-    return ('<div class="hero"><img src="/static/hero.jpg" alt="" width="1600" height="400">'
+    return ('<div class="hero"><img class="hero-dark" src="/static/hero.jpg" alt="" width="1600" height="400">'
+            '<img class="hero-light" src="/static/hero-light.jpg" alt="" width="1600" height="400">'
             '<div class="hero-txt"><div class="hero-name">%s</div><div class="hero-tag">Attacker intelligence for a homelab honeypot</div>'
             '<div class="hero-facts">%s%s</div></div></div>'
             % (esc(st["title"] or "Huginn"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
@@ -4242,13 +4244,16 @@ def v_login(err=""):
 # ---------------------------------------------------------------- static files
 
 CSS = r"""
-.hero{position:relative;border-radius:12px;overflow:hidden;margin-bottom:14px;background:#06080d;border:1px solid var(--line)}
-.hero img{display:block;width:100%;height:190px;object-fit:cover;object-position:20% 35%}
+.hero{position:relative;border-radius:12px;overflow:hidden;margin-bottom:14px;background:var(--hero-bg);border:1px solid var(--line)}
+.hero-dark{display:none!important}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) .hero-dark{display:block!important}:root:not([data-theme=light]) .hero-light{display:none!important}}
+:root[data-theme=dark] .hero-dark{display:block!important}:root[data-theme=dark] .hero-light{display:none!important}
+.hero img{display:block;width:100%;height:190px;object-fit:cover;object-position:0 5%}
 @media (min-width:1600px){.hero img{height:230px}.hero-name{font-size:48px}}
-.hero-txt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 32px 0 46%;color:#e8ecf2}
+.hero-txt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 32px 0 46%;color:var(--hero-text)}
 .hero-name{font-size:42px;font-weight:800;letter-spacing:.5px;line-height:1.05}
-.hero-tag{font-size:17px;color:#c8cfd9;margin-top:6px}.hero-facts{font-size:13px;color:#7aa2f7;margin-top:12px}
-@media (max-width:800px){.hero img{height:64px;object-position:15% 30%}.hero-txt{flex-direction:row;align-items:center;justify-content:flex-start;padding:0 14px 0 34%}.hero-name{font-size:22px}.hero-tag,.hero-facts{display:none}}
+.hero-tag{font-size:17px;color:var(--hero-tag);margin-top:6px}.hero-facts{font-size:13px;color:var(--hero-facts);margin-top:12px}
+@media (max-width:800px){.hero img{height:64px;object-position:0 8%}.hero-txt{flex-direction:row;align-items:center;justify-content:flex-start;padding:0 14px 0 34%}.hero-name{font-size:22px}.hero-tag,.hero-facts{display:none}}
 .heat{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
 .hm-row{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;align-items:center}
 .hm-row i{display:block;aspect-ratio:1;border-radius:3px;background:var(--panel2);min-height:10px}.hm-head span{text-align:left}
@@ -4264,13 +4269,14 @@ CSS = r"""
 .pwc-out th{text-align:left;font-weight:500;color:var(--muted);padding-right:14px}.pwc-ok{color:#2f9e5b;font-weight:600}.pwc-bad{color:#d1453b;font-weight:600}
 :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f8f9fb;--line:#e3e6ea;--text:#1b1f24;--muted:#6b7480;--accent:#3b6fd8;--accent2:#e9effb;
 --red:#c73a3a;--orange:#c46a12;--yellow:#9a7b00;--green:#2e8b57;--blue:#3b6fd8;--purple:#7d4fc7;--teal:#178a8a;--grey:#6b7480;
---term:#11151a;--termtext:#d6dde6;--shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04)}
+--term:#11151a;--termtext:#d6dde6;--shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04);
+--hero-bg:#eef1f5;--hero-text:#1b1f24;--hero-tag:#4a5361;--hero-facts:#3b6fd8}
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0e1116;--panel:#161b22;--panel2:#1b212a;--line:#262d37;--text:#e4e8ee;--muted:#8b95a3;
 --accent:#7aa2f7;--accent2:#1d2a44;--red:#f07070;--orange:#f0a050;--yellow:#e0c050;--green:#5fc28a;--blue:#7aa2f7;--purple:#b394f0;--teal:#4cc6c6;--grey:#8b95a3;
---term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark}}
+--term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark;--hero-bg:#06080d;--hero-text:#e8ecf2;--hero-tag:#c8cfd9;--hero-facts:#7aa2f7}}
 :root[data-theme=dark]{--bg:#0e1116;--panel:#161b22;--panel2:#1b212a;--line:#262d37;--text:#e4e8ee;--muted:#8b95a3;
 --accent:#7aa2f7;--accent2:#1d2a44;--red:#f07070;--orange:#f0a050;--yellow:#e0c050;--green:#5fc28a;--blue:#7aa2f7;--purple:#b394f0;--teal:#4cc6c6;--grey:#8b95a3;
---term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark}
+--term:#0a0d11;--termtext:#cdd6e0;--shadow:none;color-scheme:dark;--hero-bg:#06080d;--hero-text:#e8ecf2;--hero-tag:#c8cfd9;--hero-facts:#7aa2f7}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
@@ -4725,9 +4731,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, fh.read(), "image/png", cache=True)
             except OSError:
                 return self.send(200, ICON, "image/svg+xml", cache=True)
-        if path == "/static/hero.jpg":
+        if path in ("/static/hero.jpg", "/static/hero-light.jpg"):
             try:
-                with open(os.path.join(STATIC_DIR, "hero.jpg"), "rb") as fh:
+                with open(os.path.join(STATIC_DIR, path.rsplit("/", 1)[1]), "rb") as fh:
                     return self.send(200, fh.read(), "image/jpeg", cache=True)
             except OSError:
                 return self.send(404, "", "text/plain")
