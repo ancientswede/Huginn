@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.27.2"
+HUGINN_VERSION = "0.27.3"
 CHANGELOG = [
+    ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
     ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
     ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; most telnet bots check the network that way and left (about 1,500 of 2,500 telnet sessions with commands ended there). And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
     ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
@@ -2704,8 +2705,8 @@ def hero_card(con, st):
     if first:
         facts.append("watching since %s" % datetime.fromtimestamp(first, TZ).strftime("%Y-%m-%d"))
     facts += ["%s attackers" % num(n_ips), "%s countries" % num(n_cc), "%s login attempts" % num(n_logins)]
-    return ('<div class="hero"><img class="hero-dark" src="/static/hero.jpg" alt="" width="1600" height="400">'
-            '<img class="hero-light" src="/static/hero-light.jpg" alt="" width="1600" height="400">'
+    return ('<div class="hero"><img class="hero-dark" src="/static/hero.jpg" alt="" width="2000" height="500">'
+            '<img class="hero-light" src="/static/hero-light.jpg" alt="" width="2000" height="500">'
             '<div class="hero-txt"><div class="hero-name">%s</div><div class="hero-tag">Attacker intelligence for a homelab honeypot</div>'
             '<div class="hero-facts">%s%s</div></div></div>'
             % (esc(st["title"] or "Huginn"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
