@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.28.0"
+HUGINN_VERSION = "0.29.0"
 CHANGELOG = [
+    ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
     ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). One VNC brute forcer alone was nearly a fifth of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
     ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
     ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
@@ -430,6 +431,12 @@ def p_cowrie(line):
         kind, a = "file_fail", ev.get("url")
     elif k == "cowrie.direct-tcpip.request":
         kind, a = "tcpip", "%s:%s" % (ev.get("dst_ip"), ev.get("dst_port"))
+    elif k == "cowrie.session.hp-exec":
+        # Huginn's Cowrie patch: the attacker ran an uploaded program; it "ran" silently, nothing was executed (honeypot/patches.py).
+        sha = str(ev.get("shasum") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            return None
+        kind, a, b = "exec_sim", clean(("%s %s" % (ev.get("path") or "?", ev.get("args") or "")).strip(), 300), sha
     elif k == "cowrie.direct-tcpip.hp-reply":
         # Huginn's Cowrie patch answered a proxy check (http200) or held TLS (hold); see honeypot/patches.py.
         how, req = ev.get("hp_reply"), ev.get("hp_request")
@@ -1624,6 +1631,98 @@ def undo_review(con):
 GAP_MIN = max(600, POLL * 5)
 
 
+# Collection health (0.29): is data still coming in, per source? "Quiet" is measured against each source's own longest
+# silence in the last week, so a tarpit that is often idle for hours does not raise an alarm that a busy SSH port would.
+HEALTH_SYNC_LATE = max(1800, POLL * 6)
+
+
+def health_sources(con, now=None):
+    # {key: newest time}: OpenCanary, hp-traps and endlessh from events, Cowrie per listening port from sessions (last 2 days).
+    now = now or time.time()
+    out = {}
+    for src, last in con.execute("SELECT src, MAX(ts) FROM events WHERE ts>=? AND src IN ('canary','traps','endlessh') GROUP BY src", (now - 2 * 86400,)):
+        out[src] = last
+    for port, last in con.execute("SELECT port, MAX(start) FROM sessions WHERE start>=? AND port IS NOT NULL GROUP BY port", (now - 2 * 86400,)):
+        out["cowrie:%s" % port] = last
+    return out
+
+
+def health_label(key):
+    if key == "sync":
+        return "Honeypot sync"
+    if key.startswith("cowrie:"):
+        port = key.split(":", 1)[1]
+        name = PERSONA.get(int(port)) if port.isdigit() else None
+        return "Cowrie port %s%s" % (port, " (%s)" % name if name else "")
+    return {"canary": "OpenCanary", "traps": "hp-traps", "endlessh": "endlessh tarpit"}.get(key, key)
+
+
+def health_limits(con):
+    # Once a day: 2.5 x each source's longest silence in the last 7 days, at least 2 hours, at most 2 days.
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        cached = json.loads(get_meta(con, "health_limits", "{}"))
+        if cached.get("day") == day and isinstance(cached.get("lim"), dict):
+            return cached["lim"]
+    except ValueError:
+        pass
+    since = time.time() - 7 * 86400
+    lim = {}
+    q = ("SELECT COUNT(*), MAX(t - p) FROM (SELECT t, LAG(t) OVER (ORDER BY t) p FROM (%s))")
+    for src in ("canary", "traps", "endlessh"):
+        n, gap = con.execute(q % "SELECT ts t FROM events WHERE src=? AND ts>=?", (src, since)).fetchone()
+        if n >= 20 and gap:
+            lim[src] = min(2 * 86400, max(7200, 2.5 * gap))
+    for (port,) in con.execute("SELECT DISTINCT port FROM sessions WHERE start>=? AND port IS NOT NULL", (since,)).fetchall():
+        n, gap = con.execute(q % "SELECT start t FROM sessions WHERE port=? AND start>=?", (port, since)).fetchone()
+        if n >= 20 and gap:
+            lim["cowrie:%s" % port] = min(2 * 86400, max(7200, 2.5 * gap))
+    set_meta(con, "health_limits", json.dumps({"day": day, "lim": lim}))
+    return lim
+
+
+def health_check(con, now=None):
+    # Problems now, alerted once each by ntfy, and "back to normal" when they go away. Saved for Account and /healthz.
+    now = now or time.time()
+    issues = {}
+    last = float(get_meta(con, "last_success", "0") or 0)
+    if last and now - last > HEALTH_SYNC_LATE:
+        err = (get_meta(con, "last_error", "") or "").strip()
+        issues["sync"] = "No data from the honeypot for %s%s" % (dur(now - last), ("; last error: " + err[:120]) if err else "")
+    else:
+        lim = health_limits(con)
+        for key, newest in health_sources(con, now).items():
+            if key in lim and now - newest > lim[key]:
+                issues[key] = "%s quiet for %s (longer than any time last week)" % (health_label(key), dur(now - newest))
+    try:
+        alerted = json.loads(get_meta(con, "health_alerted", "{}"))
+        alerted = alerted if isinstance(alerted, dict) else {}
+    except ValueError:
+        alerted = {}
+    new = sorted(k for k in issues if k not in alerted)
+    back = sorted(k for k in alerted if k not in issues)
+    if NTFY_URL and settings(con)["notify"]:
+        if new:
+            ntfy_post("\n".join(issues[k] for k in new), "Huginn: collection problem", 4)
+        if back:
+            ntfy_post("Back to normal: " + ", ".join(health_label(k) for k in back), "Huginn: collection is back", 2)
+    set_meta(con, "health_alerted", json.dumps({k: alerted.get(k, now) for k in issues}))
+    set_meta(con, "health_now", json.dumps(issues))
+    return issues
+
+
+def health_note(con):
+    # One line for Account: every source with its newest data, problems first.
+    try:
+        issues = json.loads(get_meta(con, "health_now", "{}"))
+    except ValueError:
+        issues = {}
+    now = time.time()
+    parts = ['<span class="err">%s</span>' % esc(v) for v in issues.values()]
+    parts += ["%s %s" % (esc(health_label(k)), esc(ago(t))) for k, t in sorted(health_sources(con, now).items()) if k not in issues]
+    return " · ".join(parts) or "no data in the last 2 days"
+
+
 def note_sync(con, t0):
     # A long time since the last good sync is a gap, whatever the reason (honeypot away, Huginn stopped). Measured from
     # the end of the last good sync to the start of this one, so a slow export is no gap. No earlier sync known: no gap.
@@ -1692,6 +1791,10 @@ def collector_loop():
             mb_lookup(con)
         except Exception as e:
             set_meta(con, "last_tty_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
+        try:
+            health_check(con)
+        except Exception as e:
+            set_meta(con, "last_health_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
         try:
             note_size(con)
             notify(con)
@@ -1781,6 +1884,9 @@ def notify(con):
     newf = con.execute("SELECT COUNT(*) FROM (SELECT b, MIN(ts) f FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b) WHERE f>?", (last,)).fetchone()[0]
     if newf and "files" in ev:
         lines.append("New files captured: %d" % newf)
+    runs = con.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>? AND kind='exec_sim'", (last,)).fetchone()[0]
+    if runs and "files" in ev:
+        lines.append("Uploaded programs run (simulated) by %d IP(s)" % runs)
     hum = [r[0] for r in con.execute("SELECT session FROM sessions WHERE start>? AND cmds>=3", (last,)) if human_like(con, r[0])] if "human" in ev else []
     if hum:
         lines.append("Human-like sessions: %d" % len(hum))
@@ -2628,6 +2734,8 @@ def board_text(kind, a, b):
         return a or ""
     if kind == "file":
         return "%s%s" % (a or "?", ("  sha256 " + b[:16]) if b else "")
+    if kind == "exec_sim":
+        return "ran an uploaded program (simulated): %s" % (a or "?")
     if kind == "file_fail":
         return "download failed: %s" % (a or "?")
     if kind == "tcpip":
@@ -3212,7 +3320,7 @@ def v_ip(ip):
     evs = {}
     if sids:
         ph = ",".join("?" * len(sids))
-        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','tcpip','proxy_reply','exploit') ORDER BY ts" % ph, sids):
+        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','exec_sim','tcpip','proxy_reply','exploit') ORDER BY ts" % ph, sids):
             evs.setdefault(x["session"], []).append(x)
     sblocks = []
     for s in sess:
@@ -3236,6 +3344,9 @@ def v_ip(ip):
                 lines.append('<div class="ln %s"><span class=t>%s</span><span class="pr">login</span><code>%s / %s</code></div>' % ("ok" if k == "login_ok" else "fail", rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100))))
             elif k == "file":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">file</span><code>%s · %s</code></div>' % (rel_t, cmd_html(clean(x["a"], 300), fmap), ('<a class="c-f" href="/campaign/file/%s">%s</a>' % (esc(x["b"]), esc(x["b"]))) if re.fullmatch(r"[0-9a-f]{64}", x["b"] or "") else esc(x["b"] or "")))
+            elif k == "exec_sim":
+                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">run</span><code>%s · <a class="c-f" href="/campaign/file/%s">%s</a> (simulated, nothing ran)</code></div>'
+                             % (rel_t, esc(clean(x["a"], 300)), esc(x["b"]), esc((x["b"] or "")[:16])))
             elif k == "file_fail":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, cmd_html(clean(x["a"], 300))))
             elif k == "tcpip":
@@ -4239,6 +4350,7 @@ def v_account(cur, ok="", err=""):
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
+                 ("Collection", health_note(con)),
                  ("Disk", esc(growth_note(con))),
                  ("Repeated decoy tries", esc(capped_note(con))),
                  ("Sync gaps", gap_summary(con)),
@@ -4894,7 +5006,12 @@ class Handler(BaseHTTPRequestHandler):
             con = db()
             li = float(get_meta(con, "last_ingest", "0") or 0)
             ok = (time.time() - li) < POLL * 3
-            return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None}), "application/json")
+            try:
+                problems = sorted(json.loads(get_meta(con, "health_now", "{}")))
+            except ValueError:
+                problems = []
+            return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
+                                                             "collection_problems": problems}), "application/json")
         if not self.host_ok():
             return self.send(421, "Unknown host", "text/plain")
         if path == "/static/app.css":

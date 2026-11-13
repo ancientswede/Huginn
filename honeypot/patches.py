@@ -8,6 +8,8 @@
 #   patches.py cowrie-forward FILE     Cowrie answers a plain HTTP proxy check with 200 and holds TLS for a while (never forwards)
 #   patches.py cowrie-ping FILE        Cowrie's ping accepts "-c N" (upstream bug: every "ping -c 1 host" failed)
 #   patches.py cowrie-upload DIR       a file uploaded over SFTP/scp is still there for the next command (DIR = src/cowrie)
+#   patches.py cowrie-wget FILE        wget prints what a real wget prints (BusyBox on the camera, no early "connected")
+#   patches.py cowrie-exec FILE        an uploaded program for this CPU "runs" silently and is logged (nothing is executed)
 #
 # Exit code: 0 = patched/changed, 3 = already patched/nothing to do, 1 = the upstream code changed (not patched).
 import hashlib, json, sys
@@ -448,6 +450,49 @@ def cowrie_upload(srcdir):
         return 3
     return write_group(changes)
 
+# Cowrie's wget answers in GNU wget's words even on the BusyBox camera, prints "connected" before it has tried, and says
+# "unable to resolve host address" for a plain IP address. Rewrite only what is printed (see hp_wget_text).
+WGET_OLD = 'class Command_wget(HoneyPotCommand):\n    """\n    wget command\n    """\n'
+WGET_NEW = WGET_OLD + (
+    '\n    # Huginn wget v1: print what a real wget on this box would print.\n'
+    '    def errorWrite(self, data):\n'
+    '        for out in hp_wget_text(self, data):\n'
+    '            super().errorWrite(out)\n')
+WGET_HELPER = '\n\n# Huginn wget helper v1. Only rewrites what wget prints; nothing here connects anywhere or changes what is downloaded.\nimport ipaddress as hp_ipaddress\n\nHP_WGET_ERRORS = {"failed: Connection timed out.\\n": "Connection timed out", "failed: Network is unreachable.\\n": "Network is unreachable",\n                  "failed: Operation timed out.\\n": "Connection timed out", "cancel failed: Operation timed out.\\n": "Connection timed out",\n                  "No data received.\\n": "Connection timed out", "failed: Connection refused.\\n": "Connection refused"}\n\n\ndef hp_wget_busybox(cmd):\n    # Embedded personas (ARM/MIPS/PowerPC) have BusyBox wget, not GNU wget.\n    try:\n        arch = str(cmd.protocol.user.server.arch or "")\n    except Exception:\n        arch = ""\n    return any(k in arch for k in ("arm", "aarch64", "mips", "ppc"))\n\n\ndef hp_is_ip(host):\n    try:\n        hp_ipaddress.ip_address(str(host).strip("[]"))\n        return True\n    except ValueError:\n        return False\n\n\ndef hp_wget_text(cmd, data):\n    # Returns what to print instead of `data` (possibly nothing, possibly several pieces).\n    if not isinstance(data, str):\n        return [data]\n    bb = hp_wget_busybox(cmd)\n    host, port = str(getattr(cmd, "host", "") or ""), getattr(cmd, "port", 80) or 80\n    quiet = bool(getattr(cmd, "quiet", False))\n    pend = getattr(cmd, "_hp_pend", None)\n    conn_bb = "Connecting to %s:%s (%s:%s)\\n" % (host, port, host, port)\n    if data.startswith("--") and "--  " in data[:40]:                  # GNU\'s "--date--  URL" line\n        return [] if bb else [data]\n    if data.startswith("Resolving ") or data.startswith("wget: unable to resolve host address"):\n        if hp_is_ip(host):                                               # an address is never "resolved": the connection fails\n            if data.startswith("wget: unable"):\n                return []\n            if bb:\n                return [conn_bb, "wget: can\'t connect to remote host (%s): Connection refused\\n" % host]\n            return [] if quiet else ["Connecting to %s:%s... failed: Connection refused.\\n" % (host, port)]\n        if bb:\n            return [] if data.startswith("Resolving ") else ["wget: bad address \'%s\'\\n" % host]\n        return [data]\n    if data.startswith("Connecting to ") and data.endswith("... connected.\\n"):\n        cmd._hp_pend = data                                              # Cowrie says "connected" before it has tried: wait\n        return []\n    if data.endswith("request sent, awaiting response... "):\n        if pend is not None:\n            cmd._hp_pend = pend + data\n            return []\n        return [] if bb else [data]\n    if data.startswith("Connecting to ") and data.endswith("... "):     # the rate-limited path, failure follows\n        cmd._hp_conn = True\n        return [conn_bb] if bb else [data]\n    if data == "Retrying.\\n\\n":\n        return [] if bb else [data]\n    if data in HP_WGET_ERRORS:\n        why = HP_WGET_ERRORS[data]\n        cmd._hp_pend = None\n        if bb:\n            return ([] if getattr(cmd, "_hp_conn", False) or quiet else [conn_bb]) + ["wget: can\'t connect to remote host (%s): %s\\n" % (host, why)]\n        if pend is not None:\n            return ["Connecting to %s:%s... failed: %s.\\n" % (host, port, why)]\n        return [] if quiet else [data]\n    out = []\n    if pend is not None:                                                 # something came back: the connection was real\n        out.append(conn_bb if bb else pend)\n        cmd._hp_pend = None\n    out.append(data)\n    return out\n'
+
+# An uploaded program used to fail with "cannot execute binary file: Exec format error", so bots stopped right there.
+EXEC_OLD = ('                    self.exit_code = 126\n'
+            '                    return\n'
+            '                run_script_file(\n')
+EXEC_NEW = ('                    self.exit_code = 126\n'
+            '                    return\n'
+            '                # Huginn exec v1: a program for this CPU "runs" silently and is logged; nothing is executed.\n'
+            '                if hp_exec_sim(self, path, name):\n'
+            '                    return\n'
+            '                run_script_file(\n')
+EXEC_HELPER = '\n\n# Huginn exec helper v1. Nothing is ever executed: an uploaded program for this persona\'s CPU "runs" silently (exit 0), and\n# the attempt is logged with its arguments and hash. Wrong CPU keeps upstream\'s "cannot execute binary file", as a real box.\nimport hashlib as hp_hashlib\n\nHP_ELF_MACHINES = {"aarch64": {183}, "x64": {62, 3}, "x86": {3}, "arm": {40}, "mips": {8}, "ppc": {20, 21}}\n\n\ndef hp_exec_sim(cmd, path, name):\n    try:\n        data = cmd.fs.file_contents(path)\n    except Exception:\n        return False\n    if not isinstance(data, bytes) or len(data) < 20 or data[:4] != b"\\x7fELF":\n        return False\n    machine = int.from_bytes(data[18:20], "little" if data[5] == 1 else "big")\n    try:\n        arch = str(cmd.protocol.user.server.arch or "")\n    except Exception:\n        arch = ""\n    family = next((k for k in HP_ELF_MACHINES if k in arch), "")\n    if machine not in HP_ELF_MACHINES.get(family, set()):\n        return False\n    try:\n        cmd.protocol.events.dispatch(\n            "cowrie.session.hp-exec",\n            "huginn: simulated run of %(path)s",\n            path=str(path)[:300],\n            args=" ".join(str(a) for a in cmd.args)[:500],\n            shasum=hp_hashlib.sha256(data).hexdigest(),\n            arch=arch,\n        )\n    except Exception:\n        pass\n    cmd.exit_code = 0\n    return True\n'
+
+
+def patch_append(path, marker, old, new, helper):
+    # Replace one block and append a helper, all at once (see write_group).
+    s = open(path).read()
+    if marker in s:
+        return 3
+    if s.count(old) != 1:
+        return 1
+    out = s.replace(old, new) + helper
+    compile(out, path, "exec")
+    return write_group({path: (s, out)})
+
+
+def cowrie_wget(path):
+    return patch_append(path, "Huginn wget v1", WGET_OLD, WGET_NEW, WGET_HELPER)
+
+
+def cowrie_exec(path):
+    return patch_append(path, "Huginn exec v1", EXEC_OLD, EXEC_NEW, EXEC_HELPER)
+
+
 def opencanary_ports(p):
     c = json.load(open(p))
     mods = {k[:-8] for k in c if k.endswith(".enabled")}
@@ -465,7 +510,8 @@ def opencanary_ports(p):
 
 if __name__ == "__main__":
     cmds = {"cowrie-free": cowrie_free, "cowrie-forward": cowrie_forward, "cowrie-ping": cowrie_ping,
-            "cowrie-upload": cowrie_upload, "opencanary-http": opencanary_http, "opencanary-ports": opencanary_ports}
+            "cowrie-upload": cowrie_upload, "cowrie-wget": cowrie_wget, "cowrie-exec": cowrie_exec,
+            "opencanary-http": opencanary_http, "opencanary-ports": opencanary_ports}
     if len(sys.argv) != 3 or sys.argv[1] not in cmds:
-        sys.exit("usage: patches.py {cowrie-free|cowrie-forward|cowrie-ping|cowrie-upload|opencanary-http|opencanary-ports} FILE")
+        sys.exit("usage: patches.py {cowrie-free|cowrie-forward|cowrie-ping|cowrie-upload|cowrie-wget|cowrie-exec|opencanary-http|opencanary-ports} FILE")
     sys.exit(cmds[sys.argv[1]](sys.argv[2]))

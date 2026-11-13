@@ -307,6 +307,10 @@ if [ -f "$C/src/cowrie/commands/ping.py" ]; then
   case $rc in 0|3) ok "ping accepts -c" ;; *) warn "ping not patched (Cowrie changed); harmless" ;; esac
   rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
   case $rc in 0|3) ok "uploaded files stay for the next command" ;; *) warn "upload not patched (Cowrie changed); harmless" ;; esac
+  rc=0; patch_as cowrie cowrie-wget "$C/src/cowrie/commands/wget.py" || rc=$?
+  case $rc in 0|3) ok "wget answers like the persona's own wget" ;; *) warn "wget not patched (Cowrie changed); harmless" ;; esac
+  rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
+  case $rc in 0|3) ok "uploaded programs run silently (simulated, logged)" ;; *) warn "exec not patched (Cowrie changed); harmless" ;; esac
 fi
 cat > /etc/systemd/system/cowrie.service <<EOF
 [Unit]

@@ -73,7 +73,7 @@ if [ "$UP_COWRIE" = 1 ]; then
   # Put Cowrie's own free.py back so git can update it, then patch the new version again.
   runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py src/cowrie/ssh/forwarding.py src/cowrie/commands/ping.py \
     src/cowrie/shell/server.py src/cowrie/shell/session.py src/cowrie/shell/filetransfer.py \
-    src/cowrie/commands/scp.py src/cowrie/shell/fs.py 2>/dev/null || true
+    src/cowrie/commands/scp.py src/cowrie/shell/fs.py src/cowrie/commands/wget.py src/cowrie/shell/protocol.py 2>/dev/null || true
   BEFORE=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
   runuser -u cowrie -- git -C "$C" pull -q --ff-only || die "git pull failed in $C (local changes?) — Cowrie was not updated."
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
@@ -87,6 +87,10 @@ if [ "$UP_COWRIE" = 1 ]; then
   case $rc in 0|3) ok "ping patch in place" ;; *) warn "ping patch no longer fits the new Cowrie (harmless: ping -c fails as upstream)" ;; esac
   rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
   case $rc in 0|3) ok "upload patch in place" ;; *) warn "upload patch no longer fits the new Cowrie (harmless: uploads vanish as upstream)" ;; esac
+  rc=0; patch_as cowrie cowrie-wget "$C/src/cowrie/commands/wget.py" || rc=$?
+  case $rc in 0|3) ok "wget patch in place" ;; *) warn "wget patch no longer fits the new Cowrie (harmless: GNU wget text everywhere)" ;; esac
+  rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
+  case $rc in 0|3) ok "exec patch in place" ;; *) warn "exec patch no longer fits the new Cowrie (harmless: Exec format error as upstream)" ;; esac
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
 
@@ -137,6 +141,18 @@ if [ "$UP_COWRIE" = 0 ] && [ -f "$FWD" ]; then
     0) ok "uploaded files stay for the next command now"; CHANGED=1 ;;
     3) ok "upload patch in place" ;;
     *) warn "upload patch did not fit this Cowrie; no files changed" ;;
+  esac
+  rc=0; patch_as cowrie cowrie-wget "$C/src/cowrie/commands/wget.py" || rc=$?
+  case $rc in
+    0) ok "wget answers like the persona's own wget now"; CHANGED=1 ;;
+    3) ok "wget patch in place" ;;
+    *) warn "wget patch did not fit this Cowrie; no files changed" ;;
+  esac
+  rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
+  case $rc in
+    0) ok "uploaded programs run silently now (simulated, logged)"; CHANGED=1 ;;
+    3) ok "exec patch in place" ;;
+    *) warn "exec patch did not fit this Cowrie; no files changed" ;;
   esac
   if [ "$CHANGED" = 1 ]; then
     for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done

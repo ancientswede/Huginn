@@ -19,6 +19,8 @@ echo "Cowrie $(git -C "$W/cowrie" log -1 --format='%h %cs')"
 check "Cowrie free.py" "$W/cowrie/src/cowrie/commands/free.py" cowrie-free
 check "Cowrie forwarding.py" "$W/cowrie/src/cowrie/ssh/forwarding.py" cowrie-forward
 check "Cowrie ping.py" "$W/cowrie/src/cowrie/commands/ping.py" cowrie-ping
+check "Cowrie wget.py" "$W/cowrie/src/cowrie/commands/wget.py" cowrie-wget
+check "Cowrie protocol.py (exec)" "$W/cowrie/src/cowrie/shell/protocol.py" cowrie-exec
 # The upload patch changes several files at once (all or none).
 rc=0
 python3 "$HERE/honeypot/patches.py" cowrie-upload "$W/cowrie/src/cowrie" || rc=$?
