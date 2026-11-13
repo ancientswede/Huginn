@@ -87,6 +87,31 @@ catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000 | keep
 if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
 if [ -r "$IDENTITY_HISTORY" ]; then echo "##IDENTITY"; tail -n 500 "$IDENTITY_HISTORY" | grep -E '^[0-9]{9,11} [a-z0-9-]{1,32} (nas|router) [A-Za-z0-9 !+._-]{1,48}$' || true; fi
 if [ -r "$BAIT_FILE" ]; then echo "##BAIT"; head -c 20000 "$BAIT_FILE" | tr -d '\n'; echo; fi
+# What protects the honeypot, as fixed words only: Huginn shows it and alerts when something is missing (a drop-in removed
+# because a service would not start with it, a patch that no longer fits after a Cowrie upgrade, a service that stopped).
+echo "##STATUS"
+for u in cowrie cowrie-camera opencanary; do
+  [ -f "/etc/systemd/system/$u.service" ] || continue
+  d="/etc/systemd/system/$u.service.d"
+  if [ -f "$d/huginn-sandbox.conf" ]; then echo "sandbox:$u ok"; else echo "sandbox:$u missing"; fi
+  if [ -f "$d/huginn-limits.conf" ]; then echo "limits:$u ok"; else echo "limits:$u missing"; fi
+  if systemctl is-active --quiet "$u"; then echo "running:$u ok"; else echo "running:$u missing"; fi
+done
+# Only regular files are read (no symlinks): the Cowrie user owns these and must not point root at another file.
+mark() { if [ -f "$2" ] && [ ! -L "$2" ] && grep -qsF "$3" "$2"; then echo "patch:$1 ok"; else echo "patch:$1 missing"; fi; }
+src="$FIRST_COWRIE/src/cowrie"
+if [ -d "$src" ]; then
+  mark free "$src/commands/free.py" "Huginn patch"
+  mark proxy "$src/ssh/forwarding.py" "Huginn proxyreply"
+  mark ping "$src/commands/ping.py" "Huginn ping v1"
+  mark upload "$src/shell/server.py" "Huginn upload v1"
+  mark wget "$src/commands/wget.py" "Huginn wget v1"
+  mark exec "$src/shell/protocol.py" "Huginn exec v1"
+fi
+for f in "$(dirname "$OPENCANARY_LOG")"/oc-env/lib/python3*/site-packages/opencanary/modules/http.py; do
+  [ -f "$f" ] && mark webreply "$f" "Huginn webreply"
+  break
+done
 echo "##FILES"
 # The captured files are attacker data: analyse them as the Cowrie user (who already owns them), never as root.
 FILEINFO_USER="${FILEINFO_USER:-cowrie}"

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.29.0"
+HUGINN_VERSION = "0.30.0"
 CHANGELOG = [
+    ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
     ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
     ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). One VNC brute forcer alone was nearly a fifth of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
     ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
@@ -781,7 +782,7 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
-    files, personas, bait, identities, mails = [], [], {}, [], []
+    files, personas, bait, identities, mails, status = [], [], {}, [], [], []
     seen = set()
     # Only "\n" ends a line. str.splitlines() also breaks on characters such as U+2028, which an attacker can send.
     for line in text.split("\n"):
@@ -802,6 +803,9 @@ def parse_export(text, skip):
             continue
         if section == "IDENTITY":
             identities.append(line)
+            continue
+        if section == "STATUS":
+            status.append(line)
             continue
         if section == "BAIT" and line.startswith("{"):
             try:
@@ -833,8 +837,17 @@ def parse_export(text, skip):
     parse_export.mails = mails
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
+                         "status": parse_status(status[:100]) if "STATUS" in seen else None,
                          "warnings": sorted(x[5:] for x in seen if x.startswith("WARN "))[:10]}
     return rows, hashes
+
+
+STATUS_LINE = re.compile(r"^(sandbox|limits|running|patch):([a-z0-9-]{1,20}) (ok|missing)$")
+
+
+def parse_status(lines):
+    # The honeypot's own report of its protection (hp-export ##STATUS). Untrusted: only the exact expected words get through.
+    return {m.group(1) + ":" + m.group(2): m.group(3) == "ok" for m in map(STATUS_LINE.match, lines) if m}
 
 
 IDENTITY_LINE = re.compile(r"^([0-9]{9,11}) ([a-z0-9-]{1,32}) (nas|router) ([A-Za-z0-9 !+._-]{1,48})$")
@@ -853,6 +866,8 @@ def apply_honeypot_meta(con, meta):
         with con:
             con.executemany("INSERT OR IGNORE INTO web_identities(ts,id,kind,label) VALUES(?,?,?,?)", [x for x in meta["identities"] if x[0] <= latest])
             con.execute("DELETE FROM web_identities WHERE ts NOT IN (SELECT ts FROM web_identities ORDER BY ts DESC LIMIT 2000)")
+    if meta.get("status") is not None:
+        set_meta(con, "hp_status", json.dumps({"at": time.time(), "items": meta["status"]}))
     if meta.get("has_personas"):
         set_meta(con, "hp_personas", json.dumps({str(k): v for k, v in meta["personas"].items()}))
     if meta.get("has_bait"):
@@ -1650,6 +1665,8 @@ def health_sources(con, now=None):
 def health_label(key):
     if key == "sync":
         return "Honeypot sync"
+    if key.startswith("prot:"):
+        return protection_label(key[5:])
     if key.startswith("cowrie:"):
         port = key.split(":", 1)[1]
         name = PERSONA.get(int(port)) if port.isdigit() else None
@@ -1694,6 +1711,8 @@ def health_check(con, now=None):
         for key, newest in health_sources(con, now).items():
             if key in lim and now - newest > lim[key]:
                 issues[key] = "%s quiet for %s (longer than any time last week)" % (health_label(key), dur(now - newest))
+    for k in protection_missing(con):                  # one key each: a second loss later alerts again
+        issues["prot:" + k] = "Missing on the honeypot: " + protection_label(k)
     try:
         alerted = json.loads(get_meta(con, "health_alerted", "{}"))
         alerted = alerted if isinstance(alerted, dict) else {}
@@ -1709,6 +1728,40 @@ def health_check(con, now=None):
     set_meta(con, "health_alerted", json.dumps({k: alerted.get(k, now) for k in issues}))
     set_meta(con, "health_now", json.dumps(issues))
     return issues
+
+
+def protection_status(con):
+    # (items, time) from the last export that had a ##STATUS section, or (None, 0) from an older honeypot.
+    try:
+        st = json.loads(get_meta(con, "hp_status", "{}"))
+        items = st.get("items")
+        return (items if isinstance(items, dict) else None), float(st.get("at") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return None, 0
+
+
+def protection_missing(con):
+    items, at = protection_status(con)
+    if not items or time.time() - at > 3600:          # nothing reported recently: the sync check covers that
+        return []
+    return sorted(k for k, ok in items.items() if not ok)
+
+
+def protection_label(key):
+    what, _, name = key.partition(":")
+    return {"sandbox": "%s sandbox", "limits": "%s memory/file limits", "running": "%s not running", "patch": "%s patch"}.get(what, "%s") % name
+
+
+def protection_note(con):
+    items, at = protection_status(con)
+    if items is None:
+        return "not reported (update the honeypot: update-honeypot.sh)"
+    missing = protection_missing(con)
+    kinds = lambda w: sum(1 for k in items if k.startswith(w + ":"))
+    ok = "sandbox and limits on %d services, %d patches" % (kinds("sandbox"), kinds("patch"))
+    if missing:
+        return '<span class="err">missing: %s</span> · reported %s' % (esc(", ".join(protection_label(k) for k in missing)), esc(ago(at)))
+    return "all in place: %s · reported %s" % (esc(ok), esc(ago(at)))
 
 
 def health_note(con):
@@ -3223,7 +3276,7 @@ def ip_story(con, r):
     return text[0].upper() + text[1:] + "."
 
 
-def v_ip(ip):
+def v_ip(ip, qs=None):
     con = db()
     try:
         ip = str(ipaddress.ip_address(ip))
@@ -3315,15 +3368,19 @@ def v_ip(ip):
     rel_html = '<div class="card"><h3>Related attackers</h3>%s</div>' % "".join(rel_row(*x) for x in rel) if rel else ""
 
     # Sessions
-    sess = con.execute("SELECT * FROM sessions WHERE ip=? ORDER BY start DESC LIMIT 150", (ip,)).fetchall()
+    # Session filter (?s=cmds|logins) and counts for its chips. Most IPs are bots with hundreds of identical sessions.
+    sf = (qs or {}).get("s")
+    sf = sf if sf in ("cmds", "logins") else "all"
+    where = {"all": "", "cmds": " AND cmds>0", "logins": " AND (logins_ok+logins_fail)>0"}[sf]
+    sc = con.execute("SELECT COUNT(*), COALESCE(SUM(cmds>0),0), COALESCE(SUM(logins_ok+logins_fail>0),0) FROM sessions WHERE ip=?", (ip,)).fetchone()
+    sess = con.execute("SELECT * FROM sessions WHERE ip=?" + where + " ORDER BY start DESC LIMIT 150", (ip,)).fetchall()
     sids = [s["session"] for s in sess]
     evs = {}
     if sids:
         ph = ",".join("?" * len(sids))
         for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','exec_sim','tcpip','proxy_reply','exploit') ORDER BY ts" % ph, sids):
             evs.setdefault(x["session"], []).append(x)
-    sblocks = []
-    for s in sess:
+    def sess_block(s, more=""):
         ev = evs.get(s["session"], [])
         cmd_ts = [x["ts"] for x in ev if x["kind"] == "cmd"]
         human = ""
@@ -3368,10 +3425,43 @@ def v_ip(ip):
             (' · script <a class=mono href="/campaign/script/%s">%s</a>' % (esc(s["cmdhash"]), esc(s["cmdhash"]))) if s["cmdhash"] else "") \
             + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] else "")
         meta_ += "</div>"
-        sblocks.append('<details class="sess" id="s-%s"><summary>%s</summary>%s<div class="term">%s</div></details>'
-                       % (esc(s["session"]), summary, meta_, "".join(lines) or '<div class="ln muted">No interaction recorded.</div>'))
-    sess_html = ('<div class="card span2"><h3>Sessions <span class=muted>%s total%s</span></h3><div class="scroll tall">%s</div></div>'
-                 % (num(r["sessions"]), ", latest 150 shown" if r["sessions"] > 150 else "", "".join(sblocks) or "<p class=muted>No SSH/Telnet sessions.</p>"))
+        return ('<details class="sess" id="s-%s"><summary>%s%s</summary>%s<div class="term">%s</div></details>'
+                % (esc(s["session"]), summary, more, meta_, "".join(lines) or '<div class="ln muted">No interaction recorded.</div>'))
+
+    # Sessions that did something come first, newest first; the same command script is shown once with its repeats folded
+    # under it. Sessions that only connected or only tried to log in are folded into two groups at the end.
+    busy = lambda s: s["cmds"] or s["files"] or s["tcpip"] or s["exploits"]
+    by_script = {}
+    for s in sess:
+        if busy(s) and s["cmdhash"]:
+            by_script.setdefault(s["cmdhash"], []).append(s)
+    sblocks, done = [], set()
+    for s in sess:
+        if not busy(s) or s["session"] in done:
+            continue
+        same = by_script.get(s["cmdhash"], [s]) if s["cmdhash"] else [s]
+        done.update(x["session"] for x in same)
+        rest = same[1:]
+        sblocks.append(sess_block(s, (' <span class="tag">×%s like this</span>' % num(len(same))) if rest else ""))
+        if rest:
+            sblocks.append('<details class="sess-more"><summary>Show %s more like this</summary>%s</details>' % (num(len(rest)), "".join(sess_block(x) for x in rest)))
+    for label, pick in (("tried to log in, nothing more", lambda s: not busy(s) and (s["logins_ok"] + s["logins_fail"])),
+                        ("only connected", lambda s: not busy(s) and not (s["logins_ok"] + s["logins_fail"]))):
+        grp = [s for s in sess if pick(s)]
+        if grp:
+            vers = sorted({clean(s["version"] or "", 40) for s in grp if s["version"]})
+            sblocks.append('<details class="sess-more"><summary>%s sessions %s <span class=muted>%s – %s%s</span></summary>%s</details>'
+                           % (num(len(grp)), label, esc(fmt_ts(grp[-1]["start"])), esc(fmt_ts(grp[0]["start"])),
+                              esc(" · " + ", ".join(vers[:3]) + (" +%d" % (len(vers) - 3) if len(vers) > 3 else "")) if vers else "",
+                              "".join(sess_block(x) for x in grp)))
+    chip = lambda key, label, n: '<a class="chip%s" href="/ip/%s%s#sessions">%s <span class=muted>%s</span></a>' % (
+        " on" if key == sf else "", esc(urllib.parse.quote(ip)), "" if key == "all" else "?s=" + key, esc(label), num(n))
+    chips = ('<div class="chips">%s%s%s</div>' % (chip("all", "All", sc[0]), chip("cmds", "With commands", sc[1]), chip("logins", "With logins", sc[2]))
+             if sc[0] > 1 else "")
+    shown = len(sess)
+    sess_html = ('<div class="card span2" id="sessions"><h3>Sessions <span class=muted>%s total%s</span></h3>%s<div class="scroll tall">%s</div></div>'
+                 % (num(r["sessions"]), (", latest %s shown" % num(shown)) if shown >= 150 else "", chips,
+                    "".join(sblocks) or ("<p class=muted>No SSH/Telnet sessions.</p>" if sf == "all" else none_yet("No sessions like that"))))
 
     # Other services (OpenCanary, hp-traps) + tarpit
     can = con.execute("SELECT ts,a,b FROM events WHERE ip=? AND kind='canary' ORDER BY ts DESC LIMIT 200", (ip,)).fetchall()
@@ -4351,6 +4441,7 @@ def v_account(cur, ok="", err=""):
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
                  ("Collection", health_note(con)),
+                 ("Honeypot protection", protection_note(con)),
                  ("Disk", esc(growth_note(con))),
                  ("Repeated decoy tries", esc(capped_note(con))),
                  ("Sync gaps", gap_summary(con)),
@@ -4860,6 +4951,9 @@ CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
 CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
         "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
         ".cgrid{grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-flow:dense}.cgrid .cs-wide{grid-column:span 2}}")
+# 0.30: folded sessions on the attacker page.
+CSS += (".sess-more{margin:2px 0 6px;border:1px dashed var(--line);border-radius:8px;padding:2px 8px}"
+        ".sess-more>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:6px 2px}.sess-more .sess{margin-left:6px}")
 # 0.28: a visible keyboard focus everywhere (the mouse never shows it).
 CSS += ("a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible"
         "{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}")
@@ -5073,7 +5167,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, export_csv(data), "text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})", path)
         if m:
-            out = v_ip(urllib.parse.unquote(m.group(1)))
+            out = v_ip(urllib.parse.unquote(m.group(1)), qs)
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1><p class=muted>No data for that IP.</p>"))
         if path == "/files":
             return self.send(200, v_files(qs))
