@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.27.3"
+HUGINN_VERSION = "0.28.0"
 CHANGELOG = [
+    ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). One VNC brute forcer alone was nearly a fifth of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
     ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
     ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
     ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; most telnet bots check the network that way and left (about 1,500 of 2,500 telnet sessions with commands ended there). And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
@@ -107,6 +108,12 @@ HP_KNOWN = os.environ.get("HUGINN_HP_KNOWN", os.path.join(BASE, ".ssh", "known_h
 POLL = max(30, int(os.environ.get("HUGINN_POLL", "120")))
 _ret = int(os.environ.get("HUGINN_RETENTION_DAYS", "180") or 0)
 RETENTION_DAYS = 0 if _ret <= 0 else max(7, _ret)       # 0 = keep everything forever
+# Decoy services (OpenCanary, hp-traps): keep at most this many events per IP, service and UTC day; the rest are only counted.
+# One VNC brute forcer sent ~16,000 tries a day, nearly a fifth of the whole database. 0 = keep everything.
+try:
+    DECOY_CAP = max(0, int(os.environ.get("HUGINN_DECOY_CAP", "2000")))
+except ValueError:
+    DECOY_CAP = 2000
 ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
 # Your own public IPs / domain names: replaced with "[self]" in everything stored (attackers often echo the target address).
@@ -227,6 +234,7 @@ CREATE TABLE IF NOT EXISTS events(h TEXT PRIMARY KEY, ts REAL, ip TEXT, src TEXT
 CREATE INDEX IF NOT EXISTS ev_ip ON events(ip, ts);
 CREATE INDEX IF NOT EXISTS ev_sess ON events(session);
 CREATE INDEX IF NOT EXISTS ev_kind ON events(kind, ts);
+CREATE TABLE IF NOT EXISTS capped(ip TEXT, svc TEXT, day TEXT, kept INTEGER, dropped INTEGER, upto REAL, PRIMARY KEY(ip, svc, day));
 CREATE TABLE IF NOT EXISTS sessions(session TEXT PRIMARY KEY, ip TEXT, start REAL, end REAL, proto TEXT, port INTEGER,
   version TEXT, hassh TEXT, duration REAL, logins_ok INTEGER, logins_fail INTEGER, cmds INTEGER, files INTEGER,
   tcpip INTEGER, exploits INTEGER, cmdhash TEXT);
@@ -309,6 +317,8 @@ def init_db():
     if not get_meta(con, "vnc_logins"):
         vnc_logins_backfill(con)
     # One time only, all or nothing: script campaigns are grouped by the shape of their commands since 0.19.
+    if DECOY_CAP > 0 and not get_meta(con, "decoy_cap_v1"):
+        trim_decoys(con)
     if not get_meta(con, "cmdhash_shapes"):
         with con:
             for (sid,) in con.execute("SELECT session FROM sessions WHERE cmdhash IS NOT NULL").fetchall():
@@ -1225,6 +1235,12 @@ def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=
     return [(k, v) for k, v in parts if v]
 
 
+# The same scoring in words, for the Blocklist page. tests/test_polish.py checks that every part of score_parts is named here.
+SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per command (max 10), +15 files, +10 proxy, +10 exploit, "
+              "+10 SSHole probe, +20 took bait, +5 read bait, +8 web exploit, +3 web probe, +5 robots.txt trap, "
+              "+3 per decoy service, +1 per 20 repeat visits (max 5).")
+
+
 def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web=""):
     s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web))
     tags = []
@@ -1266,8 +1282,9 @@ def recompute_ip(con, ip):
                     "FROM events WHERE ip=? AND kind='canary'", (ip,)).fetchone()
     t = con.execute("SELECT COUNT(*) n, MIN(ts) f, MAX(ts) l, COALESCE(SUM(CAST(a AS REAL)),0) secs "
                     "FROM events WHERE ip=? AND kind='tarpit'", (ip,)).fetchone()
+    cp = con.execute("SELECT COALESCE(SUM(dropped),0), MAX(CASE WHEN dropped>0 THEN upto END) FROM capped WHERE ip=?", (ip,)).fetchone()
     firsts = [v for v in (s["f"], c["f"], t["f"]) if v is not None]
-    lasts = [v for v in (s["l"], c["l"], t["l"]) if v is not None]
+    lasts = [v for v in (s["l"], c["l"], t["l"], cp[1]) if v is not None]
     if not firsts:
         con.execute("DELETE FROM ips WHERE ip=?", (ip,))
         return
@@ -1284,7 +1301,7 @@ def recompute_ip(con, ip):
     score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
-                 c["n"], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
+                 c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
 
 
 def retry_seen(con):
@@ -1318,6 +1335,7 @@ def store(con, rows):
         done = get_meta(con, "seen_rowid")
         if not done or not done.isdigit() or int(done) > top:
             con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seen_rowid',?)", (str(top),))
+        rows = cap_rows(con, rows)
         before = con.total_changes
         con.executemany("INSERT OR IGNORE INTO events(h,ts,ip,src,kind,session,a,b) VALUES(?,?,?,?,?,?,?,?)", rows)
         inserted = con.total_changes - before
@@ -1336,9 +1354,110 @@ def store(con, rows):
     return inserted
 
 
+def utc_day(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def cap_rows(con, rows):
+    # Decoy events beyond DECOY_CAP per IP, service and day are counted in `capped`, not stored. The export sends the newest
+    # lines again on every sync, so each (IP, service, day) remembers the last time it handled (`upto`): older or equal rows
+    # were stored then or counted then, and are skipped now. Inside store()'s transaction, so the count and the rows agree.
+    if DECOY_CAP <= 0:
+        return rows
+    out, state, dirty = [], {}, set()
+    for r in rows:
+        if r[4] != "canary":
+            out.append(r)
+            continue
+        key = (r[2], r[6] or "", utc_day(r[1]))
+        st = state.get(key)
+        if st is None:
+            got = con.execute("SELECT kept, dropped, upto FROM capped WHERE ip=? AND svc=? AND day=?", key).fetchone()
+            st = state[key] = [got[0], got[1], got[2]] if got else [0, 0, 0.0]
+        if r[1] <= st[2]:
+            continue
+        st[2] = r[1]
+        if st[0] < DECOY_CAP:
+            st[0] += 1
+            out.append(r)
+        else:
+            st[1] += 1
+        dirty.add(key)
+    con.executemany("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto) VALUES(?,?,?,?,?,?)",
+                    [key + tuple(state[key]) for key in dirty])
+    return out
+
+
+def trim_decoys(con):
+    # One time (0.28): bring the history under DECOY_CAP and set up `capped` for the days the export can still send again.
+    now = time.time()
+    touched = set()
+    with con:
+        con.execute("BEGIN IMMEDIATE")
+        groups = con.execute("SELECT ip, COALESCE(a,'') svc, CAST(ts / 86400 AS INTEGER) d, COUNT(*) n, MAX(ts) u FROM events "
+                             "WHERE kind='canary' GROUP BY ip, svc, d HAVING n > ? OR MAX(ts) >= ?", (DECOY_CAP, now - 14 * 86400)).fetchall()
+        for ip, svc, d, n, u in groups:
+            if n > DECOY_CAP:
+                con.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ip=? AND kind='canary' AND COALESCE(a,'')=? "
+                            "AND ts>=? AND ts<? ORDER BY ts LIMIT -1 OFFSET ?)", (ip, svc, d * 86400, (d + 1) * 86400, DECOY_CAP))
+                touched.add(ip)
+            con.execute("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto) VALUES(?,?,?,?,?,?)",
+                        (ip, svc, utc_day(d * 86400), min(n, DECOY_CAP), max(0, n - DECOY_CAP), u))
+        if touched:
+            con.execute("DELETE FROM webhits WHERE h NOT IN (SELECT h FROM events)")
+            con.execute("DELETE FROM mails WHERE h NOT IN (SELECT h FROM events)")
+        for ip in touched:
+            recompute_ip(con, ip)
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('decoy_cap_v1','1')")
+    return len(touched)
+
+
+def note_size(con):
+    # Once a day: how big the data folder is (database, WAL, backups, recordings), for the growth forecast on Account.
+    day = utc_day(time.time())
+    try:
+        hist = json.loads(get_meta(con, "data_sizes", "[]"))
+        hist = [h for h in hist if isinstance(h, list) and len(h) == 2 and isinstance(h[0], str) and isinstance(h[1], int)]
+    except ValueError:
+        hist = []
+    if hist and hist[-1][0] == day:
+        return
+    total = 0
+    for root, _dirs, files in os.walk(DATA):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    set_meta(con, "data_sizes", json.dumps((hist + [[day, total]])[-60:]))
+
+
+def growth_note(con):
+    # "X GB free · grows about Y MB a day · full in about Z days", from the daily sizes of the last two weeks.
+    try:
+        hist = json.loads(get_meta(con, "data_sizes", "[]"))[-15:]
+    except ValueError:
+        hist = []
+    st = os.statvfs(DATA)
+    free = st.f_bavail * st.f_frsize
+    out = "%.1f GB free on the data disk" % (free / 1073741824)
+    if len(hist) >= 3:
+        days = (time.mktime(time.strptime(hist[-1][0], "%Y-%m-%d")) - time.mktime(time.strptime(hist[0][0], "%Y-%m-%d"))) / 86400
+        per_day = (hist[-1][1] - hist[0][1]) / days if days > 0 else 0
+        if per_day > 0:
+            out += " · the data folder grows about %.1f MB a day · full in about %s days" % (per_day / 1048576, num(int(free / per_day)))
+        else:
+            out += " · the data folder has not grown in the last %d days" % int(days)
+    else:
+        out += " · growth is measured once a day; a forecast after three days"
+    return out
+
+
 def retention(con):
     with con:
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
+        # Cap state is only needed while the export can send a day again; the rows that dropped something stay as the count.
+        con.execute("DELETE FROM capped WHERE dropped=0 AND day < ?", (utc_day(time.time() - 14 * 86400),))
     if RETENTION_DAYS == 0:          # keep the whole history
         con.execute("PRAGMA optimize")
         return
@@ -1574,6 +1693,7 @@ def collector_loop():
         except Exception as e:
             set_meta(con, "last_tty_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
         try:
+            note_size(con)
             notify(con)
             weekly_digest(con)
             check_update(con)
@@ -1630,7 +1750,7 @@ def human_like(con, sid):
 
 
 def notify(con):
-    # At most one ntfy summary per hour, only if something notable happened since the last one: bait, new files, human-like sessions, exploits.
+    # At most one ntfy summary per hour, only if something notable happened since the last one: bait, new files, human-like sessions, exploits (also web exploits).
     st = settings(con)
     if not NTFY_URL or not st["notify"]:
         return
@@ -1667,6 +1787,12 @@ def notify(con):
     ex = con.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts>? AND kind='exploit'", (last,)).fetchone()[0]
     if ex and "exploit" in ev:
         lines.append("Exploit attempts from %d IP(s)" % ex)
+    # Web exploits recognised by the Krawl rules (webhits), not only Cowrie's own exploit events. Named by CVE when there is one.
+    wx = con.execute("SELECT COUNT(DISTINCT ip) FROM webhits WHERE ts>? AND level='exploit'", (last,)).fetchone()[0]
+    if wx and "exploit" in ev:
+        cves = sorted({r[0] for r in con.execute("SELECT DISTINCT cve FROM webhits WHERE ts>? AND level='exploit' AND cve!=''", (last,))
+                       if re.fullmatch(r"CVE-\d{4}-\d{3,7}", r[0] or "")})
+        lines.append("Web exploits from %d IP(s)%s" % (wx, (": " + ", ".join(cves[:4]) + (" +%d" % (len(cves) - 4) if len(cves) > 4 else "")) if cves else ""))
     sshole = con.execute("SELECT COUNT(DISTINCT e.ip) FROM events e WHERE e.ts>? AND %s" % SSHOLE_SQL, (last,)).fetchone()[0]
     if sshole and "exploit" in ev:
         lines.append("SSHole probes from %d IP(s)" % sshole)
@@ -2122,7 +2248,10 @@ def bars(values, labels, h=90, cls="bar", partial_last=False, gaps=None):
         return ""
     mx = max(values) or 1
     # No style="" attributes: the Content-Security-Policy (style-src 'self') blocks them. Heights are CSS classes.
-    out = ['<div class="bars bars-%d" role="img">' % (90 if h >= 90 else 60)]
+    # A short text for screen readers: the span and the highest bar (the numbers are only in tooltips otherwise).
+    top = max(range(len(values)), key=lambda i: values[i])
+    label = "Bar chart, %s to %s, highest %s on %s" % (labels[0], labels[-1], num(values[top]), labels[top]) if labels else "Bar chart"
+    out = ['<div class="bars bars-%d" role="img" aria-label="%s">' % (90 if h >= 90 else 60, esc(label))]
     for i, (v, lab) in enumerate(zip(values, labels)):
         pct = (v / mx * 100) if v else 0
         step = max(2, round(pct / 2) * 2) if v else 0          # 2 % steps: 51 classes cover every bar
@@ -2150,7 +2279,7 @@ IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "A
             ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
             ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
 CARDS = [("hero", "Banner (Huginn, what it has seen so far)"), ("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
-         ("shells", "Latest shell sessions"), ("creds", "Top credentials"), ("timewasted", "Time wasted")]
+         ("shells", "Latest shell sessions"), ("creds", "Top credentials (SSH/Telnet)"), ("timewasted", "Time wasted")]
 # accent: (light accent, light tint, dark accent, dark tint)
 ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d4fc7", "#f1ebfb", "#b394f0", "#2a2140"),
            "green": ("#2e8b57", "#e6f4ec", "#5fc28a", "#17302a"), "orange": ("#c46a12", "#fbefe3", "#f0a050", "#352616"),
@@ -2304,8 +2433,9 @@ def v_overview(qs=None):
     trows = "".join("<tr><td>%s</td><td>%s</td><td data-h class=trunc>%s</td><td class=num>%s</td><td class=num>%s</td><td data-h>%s</td>%s</tr>%s"
                     % (ip_link(r["ip"]), cc_html(r["cc"]), esc(r["org"] or ""), num(r["sessions"]), num(r["cmds"]),
                        tag_html(ip_tags(r)), score_html_cell(r), tags_row(ip_tags(r), 7)) for r in top)
-    top_html = ('<div class="card span2"><h3>Top attackers, 7 days <a class=more href="/ips?days=7">all →</a></h3>'
-                '<table class="top5"><thead><tr><th>IP</th><th>CC</th><th data-h>Network</th><th class=num>Sess.</th><th class=num>Cmds</th><th data-h>Tags</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table></div>' % trows)
+    top_html = ('<div class="card span2"><h3>Top attackers, 7 days <a class=more href="/ips?days=7">all →</a></h3>%s</div>'
+                % (('<table class="top5"><thead><tr><th>IP</th><th>CC</th><th data-h>Network</th><th class=num>Sess.</th><th class=num>Cmds</th><th data-h>Tags</th><th class=num>Score</th></tr></thead><tbody>%s</tbody></table>' % trows)
+                   if trows else none_yet("No attackers in the last 7 days")))
 
     shells = con.execute("SELECT s.*, e.cc FROM sessions s LEFT JOIN enrich e USING(ip) WHERE s.cmds>0" + hs + " ORDER BY s.start DESC LIMIT 10", ha).fetchall()
     srows = ""
@@ -2314,12 +2444,16 @@ def v_overview(qs=None):
         srows += "<tr><td>%s</td><td>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td><td>%s</td></tr>" % (
             esc(ago(s["start"])), ip_link(s["ip"], "#s-" + s["session"]), cc_html(s["cc"]), s["cmds"], esc(clean(first[0] if first else "", 140)),
             ('<a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(s["ip"])))) if s["tty"] else "")
-    shells_html = ('<div class="card span2"><h3>Latest shell sessions</h3><table><thead><tr><th>When</th><th>IP</th><th>CC</th>'
-                   '<th class=num>Cmds</th><th>First command</th><th></th></tr></thead><tbody>%s</tbody></table></div>' % srows)
+    shells_html = ('<div class="card span2"><h3>Latest shell sessions</h3>%s</div>'
+                   % (('<table><thead><tr><th>When</th><th>IP</th><th>CC</th><th class=num>Cmds</th><th>First command</th><th></th></tr></thead><tbody>%s</tbody></table>' % srows)
+                      if srows else none_yet("No shell sessions yet")))
 
     creds = con.execute("SELECT a,b,COUNT(*) n FROM events WHERE kind IN ('login_ok','login_fail') AND ts>=? GROUP BY a,b ORDER BY n DESC LIMIT 10", (d7,)).fetchall()
     crows = "".join("<tr><td class=mono>%s</td><td class=mono>%s</td><td class=num>%s</td></tr>" % (esc(clean(r["a"], 60)), esc(clean(r["b"], 60)), num(r["n"])) for r in creds)
-    creds_html = '<div class="card"><h3>Top credentials, 7 days <a class=more href="/creds">all →</a></h3><table><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th></tr></thead><tbody>%s</tbody></table></div>' % crows
+    # SSH/Telnet only, like the "Pairs (SSH/Telnet)" card on Credentials; decoy-service logins are there too.
+    creds_html = ('<div class="card"><h3>Top credentials, SSH/Telnet, 7 days <a class=more href="/creds">all →</a></h3>%s</div>'
+                  % (('<table><thead><tr><th>User</th><th>Password</th><th class=num>Tries</th></tr></thead><tbody>%s</tbody></table>' % crows)
+                     if crows else none_yet("No SSH/Telnet logins in the last 7 days")))
 
     ccs = con.execute("SELECT COALESCE(e.cc,'??') cc, MAX(e.country) country, COUNT(*) n FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=?" + hs + " GROUP BY cc ORDER BY n DESC LIMIT 10", [d7] + ha).fetchall()
     ccrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td></tr>" % (cc_html(r["cc"]), esc(r["country"] or ""), num(r["n"])) for r in ccs)
@@ -2343,7 +2477,7 @@ def v_overview(qs=None):
              "heatmap": ('<div class="card"><h3>When they attack <span class=muted>30 days</span></h3>%s</div>'
                          % heat_html(heatmap(con))) if "heatmap" in st["cards"] else ""}
     body = ((hero_card(con, st) if "hero" in st["cards"] else "") + overview_switch("cards") + kp
-            + '<div class="grid">%s</div>' % "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero"))
+            + '<div class="grid ov">%s</div>' % "".join(parts[k] for k, _ in CARDS if k in st["cards"] and k != "hero"))
     return page("Overview", body, "/")
 
 
@@ -2827,7 +2961,9 @@ def v_ips(qs, mobile=False):
 
     cols = [c for c in IPS_COLS if c[0] in st["ips_cols"]]
     dh = lambda k: " data-h" if k in IPS_PHONE_HIDE else ""
-    hdr = '<th>IP</th>' + "".join(('<th class="%s"%s><a href="%s">%s</a></th>' % (cls, dh(k), esc(link(sort=key, p=0)), esc(lab))) if key
+    # The active sort column says so (all sorts are descending): an arrow you can see and aria-sort for screen readers.
+    act = lambda key: ' aria-sort="descending"' if key == sort else ""
+    hdr = '<th>IP</th>' + "".join(('<th class="%s"%s%s><a href="%s">%s%s</a></th>' % (cls, dh(k), act(key), esc(link(sort=key, p=0)), esc(lab), " ↓" if key == sort else "")) if key
                                   else '<th class="%s"%s>%s</th>' % (cls, dh(k), esc(lab)) for k, lab, key, cls in cols)
     cell = {
         "cc": lambda r: "<td>%s</td>" % cc_html(r["cc"]),
@@ -3130,8 +3266,10 @@ def v_ip(ip):
     can = con.execute("SELECT ts,a,b FROM events WHERE ip=? AND kind='canary' ORDER BY ts DESC LIMIT 200", (ip,)).fetchall()
     can_html = ""
     if can:
-        can_html = ('<div class="card span2"><h3>Other services (decoys)</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
-                    % "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can))
+        dropped = con.execute("SELECT COALESCE(SUM(dropped),0) FROM capped WHERE ip=?", (ip,)).fetchone()[0]
+        can_html = ('<div class="card span2"><h3>Other services (decoys)%s</h3><div class="scroll"><table><thead><tr><th>Time</th><th>Service</th><th>Data</th></tr></thead><tbody>%s</tbody></table></div></div>'
+                    % ((' <span class=muted>+%s repeated tries counted, not stored</span>' % num(dropped)) if dropped else "",
+                       "".join("<tr><td>%s</td><td>%s</td><td class='mono trunc'>%s</td></tr>" % (esc(fmt_tss(x["ts"])), esc(x["a"]), esc(clean(x["b"], 300))) for x in can)))
 
     # Web attacks: what the rules recognised in this IP's web requests, worst first.
     wh = con.execute("SELECT " + WEB_LEVEL_SQL + " level, type, MAX(cve) cve, MAX(sev) sev, COUNT(*) n, MAX(ts) l, MAX(robots) rb, GROUP_CONCAT(DISTINCT reply) rp "
@@ -3516,17 +3654,33 @@ def v_search(qs):
     return page("Search", form + '<div class="stack-w">%s</div>%s' % (found_any or '<div class="card muted">Nothing found.</div>', also), "/search")
 
 
-def v_files():
+def v_files(qs=None):
     con = db()
+    want = ((qs or {}).get("fam") or "")[:80]
     ev = {r["sha"]: r for r in con.execute("SELECT b sha, MIN(ts) f, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip, GROUP_CONCAT(DISTINCT a) names "
                                             "FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b")}
     fi = {r["sha"]: r for r in con.execute("SELECT * FROM files")}
-    shas = sorted(set(ev) | set(fi), key=lambda x: -((ev[x]["l"] if x in ev else 0) or (fi[x]["mtime"] if x in fi else 0)))[:300]
+    shas = sorted(set(ev) | set(fi), key=lambda x: -((ev[x]["l"] if x in ev else 0) or (fi[x]["mtime"] if x in fi else 0)))
+    fams = {sha: file_family(fi.get(sha), ev[sha]["names"] if sha in ev else "") for sha in shas}
+    # Chips per family (with counts) filter the list; "Unknown" are files no rule recognised yet.
+    counts = {}
+    for fam, _how in fams.values():
+        counts[fam or ""] = counts.get(fam or "", 0) + 1
+    if want and want != "unknown" and want not in counts:
+        want = ""
+    chip = lambda key, label, n: '<a class="chip%s" href="/files%s">%s <span class=muted>%s</span></a>' % (
+        " on" if key == want else "", ("?fam=" + esc(urllib.parse.quote(key))) if key else "", esc(label), num(n))
+    chips = ('<div class="chips">' + chip("", "All", len(shas))
+             + "".join(chip(k, k, n) for k, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])) if k)
+             + (chip("unknown", "Unknown", counts[""]) if counts.get("") else "") + "</div>") if len(counts) > 1 or counts.get("") else ""
+    if want:
+        shas = [x for x in shas if (fams[x][0] or "unknown") == want or (want == "unknown" and not fams[x][0])]
+    shas = shas[:300]
     trs = ""
     for sha in shas:
         e, f = ev.get(sha), fi.get(sha)
         iocs = json.loads(f["iocs"]) if f and f["iocs"] else []
-        fam, how = file_family(f, e["names"] if e else "")
+        fam, how = fams[sha]
         kind = (family_tag(fam, how) if fam else "") + ('<div class="ft">%s</div>' % (esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
                 + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>')
         trs += ("<tr><td class=mono>%s</td><td>%s</td><td class='num nw'>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td class=nw>%s</td><td class=num>%s</td><td class=nw>%s · %s</td></tr>"
@@ -3539,8 +3693,8 @@ def v_files():
     urs = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                   % (esc(clean(u["a"], 200)), esc(ago(u["l"])), num(u["n"]), num(u["nip"]), ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(u["a"]), "URLhaus")) for u in urls)
     body = ('<h1>Files</h1><p class=muted>Captured by the honeypot (uploads and downloads). Never executed here — look them up by hash only.</p>'
-            '<div class="card">%s</div><h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
-            % ('<input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
+            '<div class="card">%s%s</div><h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
+            % (chips, '<input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
                '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % trs if trs else none_yet("No files captured yet"),
                '<table class="wide"><thead><tr><th>URL</th><th>Last</th><th class=num>Tries</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % urs if urs else none_yet("No blocked downloads recorded")))
     return page("Files", body, "/files")
@@ -3736,14 +3890,22 @@ def size_fmt(n):
     return "%d bytes" % n if n < 1024 else "%.1f KB" % (n / 1024.0) if n < 1048576 else "%.1f MB" % (n / 1048576.0)
 
 
-def v_campaigns():
+def v_campaigns(qs=None):
     con = db()
-    scripts = con.execute("SELECT cmdhash, COUNT(*) n, COUNT(DISTINCT ip) nip, MIN(start) f, MAX(start) l, MAX(cmds) c, MIN(session) sid "
-                          "FROM sessions WHERE cmdhash IS NOT NULL GROUP BY cmdhash ORDER BY nip DESC, n DESC LIMIT 60").fetchall()
+    # "Active" = scripts run in the last 7 days, busiest first; otherwise all time, as before. IPs 7d shows which are still going.
+    active = (qs or {}).get("active") == "1"
+    d7 = time.time() - 7 * 86400
+    scripts = con.execute("SELECT cmdhash, COUNT(*) n, COUNT(DISTINCT ip) nip, COUNT(DISTINCT CASE WHEN start>=? THEN ip END) nip7, "
+                          "MIN(start) f, MAX(start) l, MAX(cmds) c, MIN(session) sid FROM sessions WHERE cmdhash IS NOT NULL GROUP BY cmdhash "
+                          + ("HAVING MAX(start)>=? ORDER BY nip7 DESC, nip DESC LIMIT 60" if active else "ORDER BY nip DESC, n DESC LIMIT 60"),
+                          (d7, d7) if active else (d7,)).fetchall()
     srows = ""
     for s in scripts:
-        srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
-            script_cell(s["cmdhash"], first_cmds(con, s["sid"])), num(s["c"]), num(s["nip"]), num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
+        srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
+            script_cell(s["cmdhash"], first_cmds(con, s["sid"])), num(s["c"]), num(s["nip"]), (num(s["nip7"]) if s["nip7"] else '<span class=muted>–</span>'),
+            num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
+    stabs = ('<div class="chips"><a class="chip%s" href="/campaigns">All time</a><a class="chip%s" href="/campaigns?active=1">Active, 7 days</a></div>'
+             % ("" if active else " on", " on" if active else ""))
     hs = con.execute("SELECT hassh, COUNT(*) n, COUNT(DISTINCT ip) nip, MAX(version) v, MAX(start) l FROM sessions WHERE hassh IS NOT NULL "
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
@@ -3787,10 +3949,11 @@ def v_campaigns():
                num(len(mt)), num(len(mip)), sum(x[1] for x in mt) / float(len(mt) or 1),
                sum(x[0] for x in mt) / float(len(mt) or 1), sum(x[2] for x in mt) / float(len(mt) or 1)))
     body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
-            '<h2>Command scripts</h2><div class="card">%s</div><h2>SSH clients (HASSH)</h2><div class="card">%s</div>'
-            '<h2>Web attacks</h2><div class="card">%s</div><h2>Mail clients (HELO)</h2><div class="card">%s</div>'
-            '<h2>Proxy use</h2><div class="card">%s%s</div><h2>Slow replies</h2><div class="card">%s</div>'
-            % ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows if srows else none_yet("No command scripts yet"),
+            '<div class="cgrid"><section class="cs-wide"><h2>Command scripts</h2><div class="card">%s</div></section><section><h2>SSH clients (HASSH)</h2><div class="card">%s</div></section>'
+            '<section class="cs-wide"><h2>Web attacks</h2><div class="card">%s</div></section><section><h2>Mail clients (HELO)</h2><div class="card">%s</div></section>'
+            '<section><h2>Proxy use</h2><div class="card">%s%s</div></section><section><h2>Slow replies</h2><div class="card">%s</div></section></div>'
+            % (stabs + ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>IPs 7d</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows
+                        if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet")),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
                '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
                '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
@@ -4011,18 +4174,26 @@ def v_blocklist(h, qs):
     preview = " ".join('<span class=mono>%s</span>' % esc(i) for i in ips[:300])
     body = ('<h1>Blocklist <span class=muted>%s IPs</span></h1>%s'
             '<div class="grid"><div class="card span2"><h3>Feeds</h3><p class="muted small">Feed URLs contain a secret token and need no login — keep them on the LAN. '
-            'Score: 1 connect, +2 login attempts, +2 brute force, +½ per command (max 10), +15 files, +10 proxy, +10 exploit, +3 per other decoy service.</p>%s'
+            'Score: %s</p>%s'
             '<form method=post action="/blocklist/rotate" class="inline"><button class="btn-s danger">Rotate token</button> <span class="muted small">Old feed URLs stop working.</span></form></div>'
             '<div class="card span2"><h3>C2 and malware hosts <span class=muted>%s IPs</span></h3><p class="muted small">Addresses found inside captured malware and in its download URLs, seen from at least %d attackers. Attackers can choose these addresses, so treat this as advice and do not block from it automatically.</p>'
             '<div class="feed"><div class="feed-h"><b>Plain list</b><button class="btn-s" data-copy="%s">Copy URL</button></div><div class="mono url">%s</div></div>'
             '<div class="preview">%s</div></div>'
             '<div class="card span2"><h3>Manual overrides</h3>%s</div>'
             '<div class="card span2"><h3>Preview%s</h3><div class="preview">%s</div></div></div>'
-            % (num(len(ips)), form, feeds, num(len(c2)), C2_MIN_SOURCES, esc("%s/feed/%s/c2" % (base_url(h), token)), esc("%s/feed/••••/c2" % base_url(h)),
+            % (num(len(ips)), form, esc(SCORE_HELP), feeds, num(len(c2)), C2_MIN_SOURCES, esc("%s/feed/%s/c2" % (base_url(h), token)), esc("%s/feed/••••/c2" % base_url(h)),
                " ".join('<span class=mono title="%s">%s</span>' % (esc("; ".join(sorted(w))), esc(i)) for i, w in sorted(c2.items())) or "<span class=muted>None yet</span>",
                '<table><thead><tr><th>IP</th><th>CC</th><th>Rule</th><th>Note</th><th>Updated</th></tr></thead><tbody>%s</tbody></table>' % frows if frows else none_yet("None. Set them on an attacker page."),
                " (first 300)" if len(ips) > 300 else "", preview or "<span class=muted>Empty</span>"))
     return page("Blocklist", body, "/blocklist")
+
+
+def capped_note(con):
+    n, ips = con.execute("SELECT COALESCE(SUM(dropped),0), COUNT(DISTINCT CASE WHEN dropped>0 THEN ip END) FROM capped").fetchone()
+    if DECOY_CAP <= 0:
+        return "all are stored (HUGINN_DECOY_CAP=0)"
+    return ("%s counted but not stored, from %s IPs (the first %s per IP, service and day are stored)" % (num(n), num(ips), num(DECOY_CAP))
+            if n else "none so far (the first %s per IP, service and day are stored)" % num(DECOY_CAP))
 
 
 def disk_note():
@@ -4068,6 +4239,8 @@ def v_account(cur, ok="", err=""):
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
+                 ("Disk", esc(growth_note(con))),
+                 ("Repeated decoy tries", esc(capped_note(con))),
                  ("Sync gaps", gap_summary(con)),
                  ("Database backups", esc(backup_note(con))),
                  ("Backup error", '<span class="err">%s</span>' % esc(get_meta(con, "backup_error", "")) if get_meta(con, "backup_error", "") else "none"),
@@ -4341,7 +4514,7 @@ details.sess:target,details.sess.hl{border-color:var(--accent)}
 .term{background:var(--term);color:var(--termtext);border-radius:0 0 8px 8px;padding:10px 12px;overflow-x:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .ln{display:flex;gap:10px;white-space:pre-wrap;word-break:break-all;padding:1px 0}.ln .t{color:#6d7886;flex:none;width:62px;text-align:right}
 .ln .pr{color:#7aa2f7;flex:none;min-width:42px}.ln code{color:inherit;font-size:inherit}.ln.ok .pr{color:#5fc28a}.ln.fail .pr{color:#8b95a3}.ln.warn .pr{color:#f0a050}
-.chips{display:flex;gap:6px;margin-bottom:14px}.chip{padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--muted)}
 .chip.on{background:var(--accent2);color:var(--accent);border-color:transparent}
 .feed{padding:10px 0;border-bottom:1px solid var(--line)}.feed-h{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .url{margin:4px 0;color:var(--muted);overflow-wrap:anywhere}.inline{margin-top:12px}
@@ -4571,6 +4744,13 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".ptab td.pb{grid-column:1/-1;grid-row:2;min-width:0;width:auto}.ptab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}.ptab td[data-l='Payload share']{grid-column:1/-1;grid-row:3;text-align:left}"
         ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
 CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
+# 0.28: wide screens (2K) get three columns on the Overview (dense, so a wide card never leaves a hole) and two on Campaigns.
+CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
+        "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
+        ".cgrid{grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-flow:dense}.cgrid .cs-wide{grid-column:span 2}}")
+# 0.28: a visible keyboard focus everywhere (the mouse never shows it).
+CSS += ("a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible"
+        "{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}")
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1b212a"/>'
         '<path d="M6 21c4-1 6-4 8-8 2-3 5-5 9-5l3 2-3 1c-1 4-3 8-7 10-3 2-7 2-10 0z" fill="#7aa2f7"/></svg>')
 
@@ -4779,7 +4959,7 @@ class Handler(BaseHTTPRequestHandler):
             out = v_ip(urllib.parse.unquote(m.group(1)))
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1><p class=muted>No data for that IP.</p>"))
         if path == "/files":
-            return self.send(200, v_files())
+            return self.send(200, v_files(qs))
         if path == "/new":
             return self.send(200, v_new(qs))
         if path == "/personas":
@@ -4801,7 +4981,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             return self.send(200, json.dumps(cred_check(db(), m.group(1))), "application/json")
         if path == "/campaigns":
-            return self.send(200, v_campaigns())
+            return self.send(200, v_campaigns(qs))
         m = re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path) or re.fullmatch(r"/campaign/(web)/([a-z0-9_]{1,60})", path)
         if m:
             out = v_campaign(m.group(1), m.group(2))
