@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.30.0"
+HUGINN_VERSION = "0.31.0"
 CHANGELOG = [
+    ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
     ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
     ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
     ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). One VNC brute forcer alone was nearly a fifth of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
@@ -3276,6 +3277,148 @@ def ip_story(con, r):
     return text[0].upper() + text[1:] + "."
 
 
+# MITRE ATT&CK techniques recognised in commands (0.31). Simple patterns on one command line each, so no regex can
+# backtrack badly on attacker text (tests/test_v031.py checks that). A match says what the command tried, not that it worked.
+ATTACK = [
+    ("T1082", "System Information Discovery", r"\b(?:uname|lscpu|nproc|lsb_release|hostnamectl)\b|/proc/(?:cpuinfo|meminfo|version)\b|/etc/(?:os-release|issue)\b"),
+    ("T1033", "System Owner/User Discovery", r"(?:^|[;&|]\s*)(?:whoami|id|who|w)(?:\s|;|$)"),
+    ("T1057", "Process Discovery", r"(?:^|[;&|]\s*)(?:ps|top|pgrep)(?:\s|;|$)"),
+    ("T1016", "System Network Configuration Discovery", r"\b(?:ifconfig|netstat|arp -a)\b|\bip (?:a|addr|r|route)\b"),
+    ("T1552.001", "Credentials In Files", r"\.my\.cnf\b|\.aws/credentials\b|\.git-credentials\b|wp-config\.php\b|/\.env\b"),
+    ("T1105", "Ingress Tool Transfer", r"\b(?:wget|curl|tftp|ftpget)\b"),
+    ("T1059.004", "Unix Shell", r"\|\s*(?:ba)?sh\b|\b(?:ba)?sh\s+-c\b"),
+    ("T1222.002", "Linux File Permissions Modification", r"\bchmod\s+(?:[ugoa]*\+x|[0-7]*[1357][0-7]*)\b"),
+    ("T1098.004", "SSH Authorized Keys", r"authorized_keys"),
+    ("T1053.003", "Cron", r"\bcrontab\b|/etc/cron"),
+    ("T1543.002", "Systemd Service", r"\bsystemctl\s+enable\b|/etc/systemd/system/"),
+    ("T1136.001", "Create Local Account", r"\b(?:useradd|adduser)\b"),
+    ("T1098", "Account Manipulation", r"\bchpasswd\b|(?:^|[;&|]\s*)passwd(?:\s|;|$)"),
+    ("T1070.003", "Clear Command History", r"\bhistory\s+-c\b|unset\s+HISTFILE\b|HISTSIZE=0\b|rm\s[^;|&]{0,80}\.bash_history"),
+    ("T1562.004", "Disable or Modify System Firewall", r"\biptables\s+-F\b|\bufw\s+disable\b|\bsetenforce\s+0\b"),
+    ("T1496", "Resource Hijacking", r"xmrig|minerd|cpuminer|stratum\+tcp|--donate-level|nicehash"),
+]
+ATTACK_RE = [(t, n, re.compile(p, re.I)) for t, n, p in ATTACK]
+ATTACK_NAME = dict((t, n) for t, n, _p in ATTACK)
+ATTACK_NAME.update({"T1110": "Brute Force", "T1090": "Proxy"})
+
+
+def attack_ids(cmds, logins_fail=0, proxy=0, files=0):
+    # Techniques in ATTACK order, plus what a session shows without commands (brute force, proxy, transferred files).
+    found = []
+    for t, _n, rx in ATTACK_RE:
+        if any(rx.search(c or "") for c in cmds):
+            found.append(t)
+    if files and "T1105" not in found:
+        found.append("T1105")
+    if logins_fail >= 3:
+        found.append("T1110")
+    if proxy:
+        found.append("T1090")
+    return found
+
+
+def attack_chips(ids, limit=6):
+    def chip(t):
+        base, _, sub = t.partition(".")
+        url = "https://attack.mitre.org/techniques/%s/%s" % (base, (sub + "/") if sub else "")
+        return '<a class="tag t-att" href="%s" target="_blank" rel="noopener noreferrer" title="%s">%s</a>' % (esc(url), esc(ATTACK_NAME.get(t, t)), esc(t))
+    out = "".join(chip(t) for t in ids[:limit])
+    if len(ids) > limit:
+        out += '<span class="tag" title="%s">+%d</span>' % (esc(", ".join(ids[limit:])), len(ids) - limit)
+    return out
+
+
+TL_PHASE = {"recon": ("Recon", "t-grey"), "access": ("Access", "t-yellow"), "exec": ("Commands", "t-orange"),
+            "payload": ("Payload", "t-red"), "exploit": ("Exploit", "t-red")}
+
+
+def ip_timeline(con, ip, days=30, steps_max=40):
+    # One attacker's visits in order, across every service: the same kind of activity within 30 minutes is one step.
+    since = time.time() - days * 86400
+    items = []
+    cmds_by, runs = {}, set()
+    for sid, a, kind in con.execute("SELECT session, a, kind FROM events WHERE ip=? AND kind IN ('cmd','exec_sim') AND ts>=? LIMIT 20000", (ip, since)):
+        if kind == "cmd":
+            cmds_by.setdefault(sid, []).append(a)
+        else:
+            runs.add(sid)
+    for s in con.execute("SELECT session, start, end, proto, logins_ok lo, logins_fail lf, cmds, files, tcpip FROM sessions "
+                         "WHERE ip=? AND start>=? ORDER BY start LIMIT 5000", (ip, since)):
+        k = "shell" if (s["cmds"] or s["files"]) else ("login" if s["lo"] + s["lf"] else "connect")
+        items.append([s["start"], s["end"] or s["start"], (k, (s["proto"] or "?").upper()),
+                      {"n": 1, "lo": s["lo"], "lf": s["lf"], "cmds": s["cmds"], "files": s["files"], "proxy": s["tcpip"],
+                       "run": s["session"] in runs, "c": cmds_by.get(s["session"], [])}])
+    for ts, svc in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='canary' AND ts>=? ORDER BY ts LIMIT 20000", (ip, since)):
+        key = ("web", "Web") if svc in ("http", "https") else ("decoy", (svc or "?").upper())
+        items.append([ts, ts, key, {"n": 1}])
+    for ts, secs in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='tarpit' AND ts>=? LIMIT 5000", (ip, since)):
+        try:
+            secs = max(0.0, float(secs))
+        except (TypeError, ValueError):
+            secs = 0.0
+        items.append([ts - secs, ts, ("tarpit", "Tarpit"), {"n": 1, "secs": secs}])
+    hits = con.execute("SELECT ts, level, cve FROM webhits WHERE ip=? AND ts>=? AND level IN ('exploit','probe')", (ip, since)).fetchall()
+    items.sort(key=lambda x: x[0])
+    steps = []
+    for it in items:
+        last = steps[-1] if steps else None
+        if last and last[2] == it[2] and it[0] - last[1] <= 1800:
+            last[1] = max(last[1], it[1])
+            for k, v in it[3].items():
+                if k == "c":
+                    last[3]["c"] = last[3].get("c", []) + v
+                elif k == "run":
+                    last[3]["run"] = last[3].get("run") or v
+                else:
+                    last[3][k] = last[3].get(k, 0) + v
+        else:
+            steps.append([it[0], it[1], it[2], dict(it[3])])
+    if len(steps) < 2:
+        return ""
+    more = max(0, len(steps) - steps_max)
+    lis = []
+    for start, end, (kind, label), d in steps[-steps_max:]:
+        chips, phase = "", "recon"
+        n = d["n"]
+        if kind == "connect":
+            text = "%s: %s connection%s, nothing more" % (label, num(n), "" if n == 1 else "s")
+        elif kind == "login":
+            phase = "access"
+            text = "%s: %s session%s, %s login attempt%s (%s accepted)" % (label, num(n), "" if n == 1 else "s", num(d["lo"] + d["lf"]),
+                                                                       "" if d["lo"] + d["lf"] == 1 else "s", num(d["lo"]))
+            chips = attack_chips(attack_ids([], d["lf"]))
+        elif kind == "shell":
+            phase = "payload" if d["files"] or d.get("run") else "exec"
+            text = "%s: %s session%s with %s command%s" % (label, num(n), "" if n == 1 else "s", num(d["cmds"]), "" if d["cmds"] == 1 else "s")
+            text += (", %s file%s" % (num(d["files"]), "" if d["files"] == 1 else "s")) if d["files"] else ""
+            text += ", ran an uploaded program (simulated)" if d.get("run") else ""
+            text += ", used it as a proxy" if d["proxy"] else ""
+            chips = attack_chips(attack_ids(d.get("c", []), d["lf"], d["proxy"], d["files"]))
+        elif kind == "web":
+            mine = [h for h in hits if start - 1 <= h[0] <= end + 1]
+            ex = [h for h in mine if h[1] == "exploit"]
+            cves = sorted({h[2] for h in ex if h[2] and re.fullmatch(r"CVE-\d{4}-\d{3,7}", h[2])})
+            phase = "exploit" if ex else "recon"
+            text = "Web: %s request%s" % (num(n), "" if n == 1 else "s")
+            if ex:
+                text += ", %s exploit%s%s" % (num(len(ex)), "" if len(ex) == 1 else "s", (" (" + ", ".join(cves[:3]) + ")") if cves else "")
+            probes = len(mine) - len(ex)
+            if probes:
+                text += ", %s probe%s" % (num(probes), "" if probes == 1 else "s")
+        elif kind == "decoy":
+            phase = "access"
+            text = "%s: %s tr%s" % (label, num(n), "y" if n == 1 else "ies")
+        else:
+            text = "Tarpit: held for %s over %s connection%s" % (dur(d.get("secs", 0)), num(n), "" if n == 1 else "s")
+        same_day = time.strftime("%Y%m%d", time.localtime(start)) == time.strftime("%Y%m%d", time.localtime(end))
+        when = fmt_tss(start) + ((" – " + (datetime.fromtimestamp(end, TZ).strftime("%H:%M") if same_day else fmt_tss(end))) if end - start >= 60 else "")
+        plabel, pcls = TL_PHASE[phase]
+        lis.append('<li><span class="tl-t mono">%s</span><span class="tag %s">%s</span><span class="tl-x">%s</span>%s</li>'
+                   % (esc(when), pcls, plabel, esc(text), (' <span class="tl-c">%s</span>' % chips) if chips else ""))
+    return ('<div class="card span2"><h3>Timeline <span class=muted>last %d days%s</span></h3><ol class="tl">%s</ol></div>'
+            % (days, (", latest %d steps (%s earlier)" % (steps_max, num(more))) if more else "", "".join(lis)))
+
+
 def v_ip(ip, qs=None):
     con = db()
     try:
@@ -3389,6 +3532,7 @@ def v_ip(ip, qs=None):
             if gaps[len(gaps) // 2] > 2.0:
                 human = '<span class="tag t-orange">human-like</span>'
         lines = []
+        tech = attack_ids([x["a"] for x in ev if x["kind"] == "cmd"], s["logins_fail"], s["tcpip"], s["files"])
         fmap = session_files(ev)
         for x in ev:
             rel_t = "+%.1fs" % (x["ts"] - s["start"])
@@ -3418,7 +3562,7 @@ def v_ip(ip, qs=None):
                       esc(" · ".join(x for x in ["%d logins" % (s["logins_ok"] + s["logins_fail"]) if (s["logins_ok"] + s["logins_fail"]) else "",
                                                   "%d cmds" % s["cmds"] if s["cmds"] else "", "%d files" % s["files"] if s["files"] else "",
                                                   "%d proxy" % s["tcpip"] if s["tcpip"] else ""] if x) or "connect only"),
-                      esc(clean(s["version"] or "", 60)), human)
+                      esc(clean(s["version"] or "", 60)), human + (attack_chips(tech, 4) if tech else ""))
                    + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] and s["cmds"] else ""))
         meta_ = '<div class="smeta">Session <span class=mono>%s</span>%s%s' % (
             esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (esc(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
@@ -3493,10 +3637,10 @@ def v_ip(ip, qs=None):
     # Sessions come first in the page itself, so reading and keyboard order match what a phone shows.
     body = ('<div class="iphead ip-h"><h1 class="ip-title mono">%s</h1><div class="ip-tags">%s</div><div class="score">Score <b>%s</b></div></div>%s<p class="story">%s</p>'
             '<div class="links">%s</div>'
-            '<div class="ip-w"><div class="ip-main">%s%s%s%s</div><div class="ip-side"><div class="card"><h3>Activity</h3>%s</div>'
+            '<div class="ip-w"><div class="ip-main">%s%s%s%s%s</div><div class="ip-side"><div class="card"><h3>Activity</h3>%s</div>'
             '<div class="card"><h3>Network</h3>%s</div><div class="card flagcard">%s</div>%s%s</div></div>'
             % (esc(ip), tag_html(tags.strip(",")), r["score"], score_html(r), esc(ip_story(con, r)), links,
-               sess_html, files_html, can_html, rel_html, left, right, flag_form, act, creds_html))
+               ip_timeline(con, ip), sess_html, files_html, can_html, rel_html, left, right, flag_form, act, creds_html))
     return page(ip, body, "/ips")
 
 
@@ -4954,6 +5098,12 @@ CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgr
 # 0.30: folded sessions on the attacker page.
 CSS += (".sess-more{margin:2px 0 6px;border:1px dashed var(--line);border-radius:8px;padding:2px 8px}"
         ".sess-more>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:6px 2px}.sess-more .sess{margin-left:6px}")
+# 0.31: the attacker timeline and ATT&CK chips.
+CSS += (".tl{list-style:none;margin:0;padding:0;border-left:2px solid var(--line);margin-left:6px}"
+        ".tl li{position:relative;padding:5px 0 5px 14px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline}"
+        ".tl li::before{content:'';position:absolute;left:-5px;top:11px;width:8px;height:8px;border-radius:50%;background:var(--accent)}"
+        ".tl-t{color:var(--muted);font-size:12px;min-width:150px}.tl-x{flex:1 1 300px}.tl-c{display:inline-flex;gap:4px;flex-wrap:wrap}"
+        ".tag.t-att{font-family:var(--mono,monospace);font-size:11px}")
 # 0.28: a visible keyboard focus everywhere (the mouse never shows it).
 CSS += ("a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible"
         "{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}")
