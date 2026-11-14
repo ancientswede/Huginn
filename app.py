@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.36.0"
+HUGINN_VERSION = "0.37.0"
 CHANGELOG = [
+    ("0.37.0", "2026-11-14", "A GreyNoise key can be saved on the Settings page, like the VirusTotal and MalwareBazaar keys. It is tested without using a lookup and never shown again. Without a key Huginn now asks at most 20 addresses a day, under the free allowance; with one, 40."),
     ("0.36.0", "2026-11-14", "Fixes from a deep security and bug review. The decoy cap never drops a web attack, a bait hit or a login with a new kind of password, and knows rows by their content, so two hits at the same second both count and a resent line is never counted twice. A pasted chmod line can no longer make the attacker page slow. Lookups never follow redirects, so a key only ever goes to its own service. A changed GreyNoise answer takes the research mark off again, and web exploits or bait use always keep an attacker on the blocklist. A collection source that stopped stays alerted for 30 days instead of two. MalwareBazaar copes with odd answers and pauses on a refused key. Engagement counts late commands of long sessions and uses a true median; the timeline always shows the newest activity; Files is faster."),
     ("0.35.0", "2026-11-14", "New Help page (link in the header, or g h): what every attacker tag, session badge, file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it."),
     ("0.34.0", "2026-11-14", "The MalwareBazaar key can be pasted on the Settings page too (Lookups), like the VirusTotal key: it is tested before it is saved and never shown again. The page shows how many files were checked and how many abuse.ch knows, and the last error if a lookup failed."),
@@ -160,9 +161,10 @@ MB_KEY = os.environ.get("HUGINN_MALWAREBAZAAR_KEY", "")
 VT_KEY = os.environ.get("HUGINN_VIRUSTOTAL_KEY", "")
 VT_DAILY = max(0, min(500, int(os.environ.get("HUGINN_VIRUSTOTAL_DAILY", "400") or 0)))
 # GreyNoise community API: is an address a known mass scanner, and is it a benign one (Censys, Shodan, a university)?
-# Works without a key, with a small daily allowance; a free key raises it. Only the attacker's address is sent.
+# Works without a key, with a small daily allowance (about 25); a free key raises it. Only the attacker's address is sent.
+# HUGINN_GREYNOISE_DAILY unset: 20 a day without a key, 40 with one (a key can also be saved on the Settings page).
 GN_KEY = os.environ.get("HUGINN_GREYNOISE_KEY", "")
-GN_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_GREYNOISE_DAILY", "40") or 0)))
+GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if os.environ.get("HUGINN_GREYNOISE_DAILY", "").strip() else -1
 
 
 def ntfy_post(body, title, prio=3):
@@ -1230,6 +1232,31 @@ def vt_lookup(con, limit=3, pause=16):
 
 
 GN_CLASSES = {"benign", "malicious", "suspicious", "unknown"}
+GN_KEY_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
+
+
+def gn_key(con=None):
+    # A key saved on the Settings page wins over HUGINN_GREYNOISE_KEY. It is never shown again once saved.
+    k = get_meta(con or db(), "gn_key", "") or ""
+    return k if GN_KEY_RE.fullmatch(k) else GN_KEY
+
+
+def gn_daily(con=None):
+    # Lookups a day: HUGINN_GREYNOISE_DAILY if set, otherwise a little under the community allowance with or without a key.
+    return GN_DAILY if GN_DAILY >= 0 else (40 if gn_key(con) else 20)
+
+
+def gn_test(key):
+    # GreyNoise's ping checks a key without using a lookup: "ok", "bad" (key refused), "busy" (rate limited) or "error".
+    req = urllib.request.Request("https://api.greynoise.io/ping", headers={"key": key, "User-Agent": UA, "Accept": "application/json"})
+    try:
+        with api_urlopen(req, timeout=15) as r:
+            r.read(64 * 1024)
+        return "ok"
+    except urllib.error.HTTPError as e:
+        return "busy" if e.code == 429 else "bad" if e.code in (401, 403) else "error"
+    except Exception:
+        return "error"
 
 
 def gn_parse(d, ip=None):
@@ -1279,7 +1306,7 @@ def gn_get(con, ip):
 
 def gn_html(g):
     if g is None:
-        return '<span class=muted>not checked yet</span>' if GN_DAILY else "–"
+        return '<span class=muted>not checked yet</span>' if gn_daily() else "–"
     if not g.get("seen"):
         return "not seen scanning the internet"
     what = ("benign service" if g.get("riot") and not g.get("noise") else "%s scanner" % g.get("class", "unknown"))
@@ -1298,9 +1325,10 @@ def sendable_ip(ip):
 
 def gn_lookup(con, limit=5):
     # Top attackers first (highest score, active in 30 days), each again after 14 days. Stays under the daily allowance.
-    if not GN_DAILY or float(get_meta(con, "gn_wait_until", "0") or 0) > time.time():
+    daily, key = gn_daily(con), gn_key(con)
+    if not daily or float(get_meta(con, "gn_wait_until", "0") or 0) > time.time():
         return 0
-    left, _t, _u = day_budget(con, "gn_day", GN_DAILY)
+    left, _t, _u = day_budget(con, "gn_day", daily)
     now = time.time()
     ips = [r[0] for r in con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN greynoise g USING(ip) WHERE i.last>=? AND (g.ip IS NULL OR g.checked<?) "
@@ -1310,8 +1338,8 @@ def gn_lookup(con, limit=5):
         if not sendable_ip(ip):
             continue
         h = {"User-Agent": UA, "Accept": "application/json"}
-        if GN_KEY:
-            h["key"] = GN_KEY
+        if key:
+            h["key"] = key
         day_spend(con, "gn_day")
         try:
             with api_urlopen(urllib.request.Request("https://api.greynoise.io/v3/community/" + urllib.parse.quote(ip), headers=h), timeout=15) as r:
@@ -5426,7 +5454,9 @@ def v_settings(ok="", err=""):
            "vtbusy": "VirusTotal key saved. It is valid, but over its allowance right now: lookups start when it resets.",
            "vtdel": "VirusTotal key removed.", "mb": "MalwareBazaar key saved. It works.",
            "mbbusy": "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own.",
-           "mbdel": "MalwareBazaar key removed."}.get(ok, "")
+           "mbdel": "MalwareBazaar key removed.", "gn": "GreyNoise key saved. It works.",
+           "gnbusy": "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own.",
+           "gndel": "GreyNoise key removed."}.get(ok, "")
     note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
     note += ('<p class="err">%s</p>' % esc(err)) if err else ""
     accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
@@ -5476,8 +5506,6 @@ def lookups_card():
     src = "a key saved here" if saved else ("HUGINN_VIRUSTOTAL_KEY in .env" if VT_KEY else "")
     vleft, _t, vused = day_budget(con, "vt_day", VT_DAILY)
     vn = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"found\": false%'),0) FROM vt").fetchone()
-    gleft, _t, gused = day_budget(con, "gn_day", GN_DAILY)
-    gn = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"class\": \"benign\"%'),0) FROM greynoise").fetchone()
     err = lambda k: ('<p class="err small">Last error: %s</p>' % esc(get_meta(con, k, ""))) if get_meta(con, k, "") else ""
     vt_state = ("On, using %s. %s of %s lookups used today; %s files checked, %s never seen by VirusTotal."
                 % (src, num(vused), num(VT_DAILY), num(vn[0]), num(vn[1]))) if src else "Off: no key."
@@ -5487,11 +5515,7 @@ def lookups_card():
                '<form method=post action="/settings/virustotal" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
                'placeholder="%s" aria-label="VirusTotal API key"><button>Save and test</button></form>%s'
                % (num(VT_DAILY), esc(vt_state), err("vt_error"), "Paste a new key to replace the saved one" if saved else "Paste your VirusTotal API key", remove))
-    gn_part = ('<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? No key needed. Only the address is sent, '
-               'top attackers first, at most %s a day. Benign scanners count as research unless they logged in or ran something.</p>'
-               '<p class="muted small">%s of %s used today; %s addresses checked, %s benign scanners.</p>%s'
-               % (num(GN_DAILY), num(gused), num(GN_DAILY), num(gn[0]), num(gn[1]), err("gn_error")))
-    return '<div class="card"><h3>Lookups</h3>%s%s%s</div>' % (vt_part, mb_section(con, err), gn_part)
+    return '<div class="card"><h3>Lookups</h3>%s%s%s</div>' % (vt_part, mb_section(con, err), gn_section(con, err))
 
 
 def mb_section(con, err):
@@ -5506,6 +5530,24 @@ def mb_section(con, err):
             '<form method=post action="/settings/malwarebazaar" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
             'placeholder="%s" aria-label="MalwareBazaar Auth-Key"><button>Save and test</button></form>%s'
             % (esc(state), err("mb_error"), "Paste a new key to replace the saved one" if saved else "Paste your abuse.ch Auth-Key", remove))
+
+
+def gn_section(con, err):
+    # GreyNoise: works without a key; a free key raises the allowance. Same key handling as VirusTotal.
+    saved = GN_KEY_RE.fullmatch(get_meta(con, "gn_key", "") or "") is not None
+    src = "a key saved here" if saved else ("HUGINN_GREYNOISE_KEY in .env" if GN_KEY else "")
+    daily = gn_daily(con)
+    _left, _t, used = day_budget(con, "gn_day", daily)
+    n = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"class\": \"benign\"%'),0) FROM greynoise").fetchone()
+    state = ("%s. %s of %s lookups used today; %s addresses checked, %s benign scanners."
+             % ("Using %s" % src if src else "No key: the small free allowance", num(used), num(daily), num(n[0]), num(n[1]))) if daily else "Off."
+    remove = ('<form method=post action="/settings/greynoise/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
+    return ('<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? Only the address is sent, top attackers first. '
+            'Works without a key; a free key from viz.greynoise.io allows more. Benign scanners count as research unless they logged in or ran something.</p>'
+            '<p class="muted small">%s</p>%s'
+            '<form method=post action="/settings/greynoise" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
+            'placeholder="%s" aria-label="GreyNoise API key"><button>Save and test</button></form>%s'
+            % (esc(state), err("gn_error"), "Paste a new key to replace the saved one" if saved else "Paste your GreyNoise API key", remove))
 
 
 def save_settings(f, lists):
@@ -6232,6 +6274,22 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "mb_key", key)
             set_meta(con, "mb_error", "")
             return self.redirect("/settings?ok=" + ("mb" if res == "ok" else "mbbusy"))
+        if path == "/settings/greynoise":
+            key = (self.form().get("key") or "").strip()
+            if not GN_KEY_RE.fullmatch(key):
+                return self.send(400, v_settings(err="That does not look like a GreyNoise API key (letters, digits, - and _)."))
+            res = gn_test(key)
+            if res == "bad":
+                return self.send(400, v_settings(err="GreyNoise refused that key. Nothing was saved."))
+            if res == "error":
+                return self.send(502, v_settings(err="Could not reach GreyNoise to test the key. Nothing was saved, try again."))
+            set_meta(con, "gn_key", key)
+            set_meta(con, "gn_wait_until", "0")      # a new key gets a fresh allowance
+            set_meta(con, "gn_error", "")
+            return self.redirect("/settings?ok=" + ("gn" if res == "ok" else "gnbusy"))
+        if path == "/settings/greynoise/remove":
+            set_meta(con, "gn_key", "")
+            return self.redirect("/settings?ok=gndel")
         if path == "/settings/malwarebazaar/remove":
             set_meta(con, "mb_key", "")
             return self.redirect("/settings?ok=mbdel")
