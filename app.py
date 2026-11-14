@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.40.0"
+HUGINN_VERSION = "0.41.0"
 CHANGELOG = [
+    ("0.41.0", "2026-11-14", "The goodbye on logout can be turned on and off in Settings (card Goodbye on logout), no need to log in to the honeypot. It is the only thing Huginn can change there: the locked export key accepts exactly \"goodbye on\" or \"goodbye off\" and nothing else. Update the honeypot once (update-honeypot.sh) for the button to work. Settings is rebuilt: a menu of sections, one Save button per part that only saves that part, status badges (On, Off, Not configured, Update required) and shorter texts that state the free and keyed lookup limits instead of guessing your traffic. The footer and Settings › About link to Buy me a coffee."),
     ("0.40.0", "2026-11-14", "An optional goodbye: when someone who really logged in types exit or logout, the honeypot can answer with a short note: how long they stayed, how many lines they typed, and that all of it is logged along with their address. Off by default; turn it on with update-honeypot.sh --goodbye-on (and off with --goodbye-off), no restart. It never shows for sh -c, scripts, nested shells or bots that just disconnect, and only at the very end, so it does not change what is collected. The session log shows who got it, and Account says whether it is on. Update the honeypot (update-honeypot.sh) for the patch. Also from a review before release: Campaigns compares long scripts quickly (a crafted script with thousands of repeated commands made the page slow), groups rows by the shape of their first commands, no longer says \"ends after\" for two rows that read the same, and a failed Cowrie upgrade puts Huginn's patches back on the old version."),
     ("0.39.0", "2026-11-14", "Campaigns: scripts that start with the same commands no longer look identical. Each such row shows the first command where it differs from the others (or that it is the same script cut short), and every script has a Preview with all its commands numbered, the differing one marked, so you can choose what to open without opening it. The JSON log setting now says it is for log tools such as Grafana Loki, Graylog or Elasticsearch."),
     ("0.38.0", "2026-11-14", "Metrics for Prometheus and Grafana, off until you turn them on in Settings: events per decoy service, attackers, sessions, blocklist size, sync health and lookup allowances, read with a token. Counts only, never addresses or anything an attacker typed. A ready Grafana dashboard is in examples/grafana. Logs can be JSON for Loki (HUGINN_LOG_FORMAT=json): syncs, collection problems, logins, failed backups and every new error."),
@@ -19,12 +20,12 @@ CHANGELOG = [
     ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
     ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
     ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
-    ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). One VNC brute forcer alone was nearly a fifth of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
+    ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). A single brute forcer can otherwise fill much of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
     ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
     ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
-    ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; most telnet bots check the network that way and left (about 1,500 of 2,500 telnet sessions with commands ended there). And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
+    ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; a bot that checks the network that way left when it failed. And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
     ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
-    ("0.26.0", "2026-11-11", "Proxy that seems to work: most bots that log in to the SSH honeypot only want to use it as a proxy, test it with a plain web request and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
+    ("0.26.0", "2026-11-11", "Proxy that seems to work: bots that log in to the SSH honeypot to use it as a proxy test it with a plain web request first, and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
     ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
     ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
     ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
@@ -92,6 +93,7 @@ import math
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import statistics
@@ -122,7 +124,7 @@ POLL = max(30, int(os.environ.get("HUGINN_POLL", "120")))
 _ret = int(os.environ.get("HUGINN_RETENTION_DAYS", "180") or 0)
 RETENTION_DAYS = 0 if _ret <= 0 else max(7, _ret)       # 0 = keep everything forever
 # Decoy services (OpenCanary, hp-traps): keep at most this many events per IP, service and UTC day; the rest are only counted.
-# One VNC brute forcer sent ~16,000 tries a day, nearly a fifth of the whole database. 0 = keep everything.
+# Repeated decoy tries from one address can otherwise fill much of the database. 0 = keep everything.
 try:
     DECOY_CAP = max(0, int(os.environ.get("HUGINN_DECOY_CAP", "2000")))
 except ValueError:
@@ -1452,6 +1454,42 @@ def hp_ssh(command):
     return ["ssh", "-T", "-i", HP_KEY, "-p", str(HP_PORT), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
             "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + HP_KNOWN,
             "root@" + HP_HOST, command]
+
+
+def hp_goodbye_set(on):
+    # 0.41: ask the honeypot to turn the logout note on or off ("goodbye on|off" to the locked hp-export key). Returns
+    # (state, error). An honeypot older than 0.41 ignores the command and starts the whole export instead: only the first
+    # line is read, then the connection is closed, so that never costs more than a moment.
+    try:
+        p = subprocess.Popen(hp_ssh("goodbye on" if on else "goodbye off"), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        return None, "could not start ssh: %s" % str(e)[:100]
+    try:
+        first = b""
+        deadline = time.time() + 30
+        while time.time() < deadline and b"\n" not in first and len(first) < 64:
+            r, _w, _x = select.select([p.stdout], [], [], max(0.0, deadline - time.time()))
+            if not r:
+                break
+            chunk = os.read(p.stdout.fileno(), 64 - len(first))
+            if not chunk:
+                break
+            first += chunk
+    finally:
+        if p.poll() is None:
+            p.kill()
+        try:
+            err = p.communicate(timeout=5)[1] or b""
+        except subprocess.TimeoutExpired:
+            err = b""
+    line = first.split(b"\n", 1)[0].decode("ascii", "replace").strip()
+    if line in ("goodbye on", "goodbye off"):
+        state = line.split()[1] == "on"
+        return (state, None) if state == bool(on) else (None, "the honeypot reports it is still %s" % ("on" if state else "off"))
+    if line.startswith("##") or len(first) >= 64:
+        return None, "the honeypot does not know this yet: run update-honeypot.sh there once (Huginn 0.41 or later)"
+    return None, (err.decode("utf-8", "replace").strip()[:150] or "no answer from the honeypot")
 
 
 def tty_decode(b64):
@@ -3106,7 +3144,8 @@ def footer():
     # Modified versions may add their own notice here, but must keep this one.
     return ("<footer class='site-foot'>Huginn %s · © 2026 Ancientswede · "
             "<a href='https://www.gnu.org/licenses/agpl-3.0.html' target='_blank' rel='noopener noreferrer'>AGPL-3.0</a>, no warranty · "
-            "<a href='https://github.com/%s' target='_blank' rel='noopener noreferrer'>Source on GitHub</a></footer>" % (HUGINN_VERSION, esc(REPO)))
+            "<a href='https://github.com/%s' target='_blank' rel='noopener noreferrer'>Source on GitHub</a> · "
+            "<a href='%s' target='_blank' rel='noopener noreferrer'>Buy me a coffee</a></footer>" % (HUGINN_VERSION, esc(REPO), COFFEE_URL))
 
 
 def html_attrs(st):
@@ -5524,35 +5563,43 @@ def metrics_text(con, now=None):
         return _metrics_cache["text"]
 
 
+def metrics_job(base, tok):
+    u = urllib.parse.urlsplit(base)
+    return ("- job_name: huginn\n  scheme: %s\n  metrics_path: /metrics\n  authorization:\n    credentials: %s\n  static_configs:\n    - targets: ['%s']"
+            % (u.scheme or "http", tok, u.netloc or "huginn:8095"))
+
+
 def metrics_card():
     # Settings: Prometheus metrics on or off, the address and token, and an example job.
     con = db()
     tok = metrics_token(con)
     base = getattr(_local, "base", "") or "http://huginn:8095"
     if METRICS_TOKEN:
-        state, buttons = "On, with the token from HUGINN_METRICS_TOKEN in .env.", ""
+        badge = sp_status("On · Managed in .env", "on")
+        state, buttons = "The token comes from HUGINN_METRICS_TOKEN in .env.", ""
     elif tok:
-        state = "On."
-        buttons = ('<form method=post action="/settings/metrics" class="inline"><input type=hidden name=on value=0><button class="btn-s">Turn off</button></form> '
-                   '<form method=post action="/settings/metrics/token" class="inline"><button class="btn-s">New token</button></form>')
+        badge, state = sp_status("On", "on"), ""
+        buttons = ('<div class="sp-act"><form method=post action="/settings/metrics"><input type=hidden name=on value=0><button class="btn-s">Turn off metrics</button></form>'
+                   '<form method=post action="/settings/metrics/token"><button class="btn-s">New token</button></form></div>')
     else:
-        state = "Off. Nothing is served on /metrics."
-        buttons = '<form method=post action="/settings/metrics" class="inline"><input type=hidden name=on value=1><button>Turn on</button></form>'
+        badge, state = sp_status("Off"), "Nothing is served at /metrics while off."
+        buttons = '<div class="sp-act"><form method=post action="/settings/metrics"><input type=hidden name=on value=1><button>Turn on metrics</button></form></div>'
     detail = ""
     if tok and not METRICS_TOKEN:
-        u = urllib.parse.urlsplit(base)
-        job = ("- job_name: huginn\n  scheme: %s\n  metrics_path: /metrics\n  authorization:\n    credentials: %s\n  static_configs:\n    - targets: ['%s']"
-               % (u.scheme or "http", tok, u.netloc or "huginn:8095"))
+        job = metrics_job(base, tok)
         detail = ('<div class="feed"><div class="feed-h"><b>Address</b><button class="btn-s" data-copy="%s/metrics">Copy</button></div><div class="mono url">%s/metrics</div></div>'
-                  '<div class="feed"><div class="feed-h"><b>Token</b> <span class="muted small">sent as Authorization: Bearer</span><button class="btn-s" data-copy="%s">Copy token</button></div>'
+                  '<div class="feed"><div class="feed-h"><b>Token</b> <span class="muted small">Send as Authorization: Bearer</span><button class="btn-s" data-copy-url="/settings/metrics/copy?what=token">Copy token</button></div>'
                   '<div class="mono url">••••%s</div></div>'
-                  '<div class="feed"><div class="feed-h"><b>Prometheus job</b><button class="btn-s" data-copy="%s">Copy</button></div>'
+                  '<div class="feed"><div class="feed-h"><b>Prometheus job</b><button class="btn-s" data-copy-url="/settings/metrics/copy?what=job">Copy</button></div>'
                   '<div class="mono url small">%s</div></div>'
-                  % (esc(base), esc(base), esc(tok), esc(tok[-4:]), esc(job), esc(job.replace(tok, "••••")).replace("\n", "<br>")))
-    return ('<div class="card"><h3>Metrics</h3><p>Counts for Prometheus and Grafana: events per decoy, attackers, sessions, blocklist size, '
-            'sync health and lookup allowances. No addresses or anything attackers typed. A ready dashboard is in '
-            '<span class=mono>examples/grafana</span> in the source.</p><p class="muted small">%s Logs: HUGINN_LOG_FORMAT=json gives one JSON object per line '
-            'for log tools such as Grafana Loki, Graylog or Elasticsearch (now: %s).</p>%s%s</div>' % (esc(state), esc(LOG_FORMAT), detail, buttons))
+                  % (esc(base), esc(base), esc(tok[-4:]), esc(job.replace(tok, "••••")).replace("\n", "<br>")))
+    return ('<div class="sp-panel" id="prometheus"><div class="sp-ph"><h3>Prometheus</h3>%s</div>'
+            '<p>Counts for Prometheus and Grafana: events per decoy, attackers, sessions, blocklist size, sync health and lookup allowances.</p>'
+            '<p class="sp-help">No IP addresses or attacker input.%s</p>%s%s'
+            '<details><summary>Dashboard &amp; logs</summary><p class="sp-help">Grafana dashboard: <span class=mono>examples/grafana</span> in the source.</p>'
+            '<p class="sp-help">For JSON logs, set <span class=mono>HUGINN_LOG_FORMAT=json</span>. Works with Grafana Loki, Graylog and Elasticsearch. '
+            'Current format: %s.</p></details></div>'
+            % (badge, (" " + esc(state)) if state else "", detail, buttons, esc(LOG_FORMAT)))
 
 
 def base_url(h):
@@ -5734,145 +5781,283 @@ def v_replay(sha, ip):
     return page("Replay", body, "/ips")
 
 
-def v_settings(ok="", err=""):
+SETTINGS_SECTIONS = [("appearance", "Appearance", "Make Huginn feel familiar."),
+                     ("views", "Views & defaults", "Choose what appears and which ranges to use."),
+                     ("notifications", "Notifications", "Pick the events you want to hear about."),
+                     ("honeypot", "Honeypot", "Control the message shown at logout."),
+                     ("lookups", "Lookups", "Enrich captured files and attacker addresses."),
+                     ("metrics", "Metrics", "Connect your monitoring tools."),
+                     ("about", "About", "Version, source and support.")]
+# Confirmation per ?ok= code: (section it belongs to, text). Unknown codes show nothing.
+SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appearance saved."),
+               "views": ("views", "Views & defaults saved."), "notifications": ("notifications", "Notifications saved."),
+               "test": ("notifications", "Test notification sent."),
+               "vt": ("virustotal", "VirusTotal key saved. It works."),
+               "vtbusy": ("virustotal", "VirusTotal key saved. It is valid, but over its allowance right now: lookups start when it resets."),
+               "vtdel": ("virustotal", "VirusTotal key removed."), "mb": ("malwarebazaar", "MalwareBazaar key saved. It works."),
+               "mbbusy": ("malwarebazaar", "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own."),
+               "mbdel": ("malwarebazaar", "MalwareBazaar key removed."), "gn": ("greynoise", "GreyNoise key saved. It works."),
+               "gnbusy": ("greynoise", "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own."),
+               "gndel": ("greynoise", "GreyNoise key removed."), "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
+               "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
+               "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off.")}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "metrics", "about"}
+# Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
+CARD_LABELS = {"hero": "Summary banner"}
+COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
+EVENT_LABELS = {"bait": "Bait accessed"}
+COFFEE_URL = "https://buymeacoffee.com/ancientswede"
+
+
+def settings_url(code):
+    # Where a settings form goes back to: the confirmation code and the part of the page it belongs to.
+    sec = SETTINGS_OK.get(code, ("", ""))[0]
+    return "/settings?ok=%s%s" % (urllib.parse.quote(code), ("#" + sec) if sec in SETTINGS_ANCHORS else "")
+
+
+def sp_status(text, kind=""):
+    # A status badge: words first, colour only as a hint.
+    return '<span class="sp-status%s">%s</span>' % ((" " + kind) if kind else "", esc(text))
+
+
+def v_settings(ok="", err="", at=""):
+    # 0.41: one page with a section menu; every button applies only to its own form (Codex review, huginn-settings-ui).
     st = settings()
-    def radio(name, val, label):
-        return '<label class="opt"><input type=radio name=%s value="%s"%s> %s</label>' % (name, val, " checked" if str(st[name]) == str(val) else "", esc(label))
+    at = at if at in SETTINGS_ANCHORS else ""
+    okp = SETTINGS_OK.get(ok)
+
+    def flash(sec):
+        out = ""
+        if okp and okp[0] == sec:
+            out += '<p class="sp-ok" role="status">%s</p>' % esc(okp[1])
+        if err and at == sec:
+            out += '<p class="sp-err" role="alert" id="err-%s">%s</p>' % (sec, esc(err))
+        return out
+    top = ""
+    if okp and not okp[0]:
+        top += '<p class="sp-ok" role="status">%s</p>' % esc(okp[1])
+    if err and not at:
+        top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
+    elif err:
+        # The error itself stands at its form further down; up here only where to find it.
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "honeypot": "Logout message",
+                 "notifications": "Notifications"}
+        top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
+
+    def choice(name, val, label, extra=""):
+        return ('<label class="sp-choice"><input type=radio name=%s value="%s"%s>%s %s</label>'
+                % (name, esc(val), " checked" if str(st[name]) == str(val) else "", extra, esc(label)))
+
     def check(name, val, label, on):
-        return '<label class="opt"><input type=checkbox name=%s value="%s"%s> %s</label>' % (name, val, " checked" if on else "", esc(label))
-    def sel(name, vals):
-        return '<select name=%s>%s</select>' % (name, "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(st[name]) == str(v) else "", esc(l)) for v, l in vals))
-    msg = {"1": "Saved.", "test": "Test notification sent.", "vt": "VirusTotal key saved. It works.",
-           "vtbusy": "VirusTotal key saved. It is valid, but over its allowance right now: lookups start when it resets.",
-           "vtdel": "VirusTotal key removed.", "mb": "MalwareBazaar key saved. It works.",
-           "mbbusy": "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own.",
-           "mbdel": "MalwareBazaar key removed.", "gn": "GreyNoise key saved. It works.",
-           "gnbusy": "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own.",
-           "gndel": "GreyNoise key removed.", "mon": "Metrics are on. Add the job below to Prometheus.",
-           "moff": "Metrics are off.", "mtok": "New metrics token. Update it in Prometheus."}.get(ok, "")
-    note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
-    note += ('<p class="err">%s</p>' % esc(err)) if err else ""
-    accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
-                      % (a, " checked" if st["accent"] == a else "", a, a.capitalize()) for a in ACCENTS)
-    ntfy_host = urllib.parse.urlsplit(NTFY_URL).netloc if NTFY_URL else ""
-    ntfy_line = ("Sends to <span class=mono>%s</span> (HUGINN_NTFY_URL%s)." % (esc(ntfy_host), ", with access token" if NTFY_TOKEN else "")) if NTFY_URL else "HUGINN_NTFY_URL is not set in .env, so nothing is sent."
-    body = ('<h1>Settings</h1>%s<form method=post action="/settings" class="settings"><div class="grid">'
-            '<div class="card"><h3>Appearance</h3>'
-            '<div class="row"><div class="rl">Theme</div><div>%s%s%s</div></div>'
-            '<div class="row"><div class="rl">Accent</div><div class="sws">%s</div></div>'
-            '<div class="row"><div class="rl">Layout</div><div>%s%s</div></div>'
-            '<div class="row"><div class="rl">Page title</div><div><input name=title maxlength=40 value="%s"></div></div>'
-            '<div class="row"><div class="rl">Clock</div><div>%s%s</div></div></div>'
-            '<div class="card"><h3>Overview cards</h3><div class="col">%s</div></div>'
-            '<div class="card"><h3>Defaults</h3>'
-            '<div class="row"><div class="rl">Attackers list</div><div>%s</div></div>'
-            '<div class="row"><div class="rl">Blocklist min score</div><div>%s</div></div>'
-            '<div class="row"><div class="rl">Blocklist window</div><div>%s</div></div>'
-            '<p class="muted small">Used by the Overview count, the Blocklist page and feed URLs without parameters.</p></div>'
-            '<div class="card"><h3>Attackers list columns</h3><div class="cols2">%s</div></div>'
-            '<div class="card"><h3>Hide from views</h3><p class="muted small">Countries (two letters) and networks (AS numbers) to leave out of the '
-            'Overview and the Attackers list, for example your own VPS provider. They are still recorded and still blocklisted.</p>'
-            '<input name=hidden_nets class="wide-input" maxlength=500 placeholder="e.g. CN, RU, AS14061" value="%s"></div>'
-            '<div class="card"><h3>Notifications</h3><p class="muted small">%s At most one summary per hour.</p>'
-            '<div class="col">%s<div class="sub">%s</div></div></div>'
-            '</div><div class="actions"><button>Save</button></div></form>'
-            '<form method=post action="/settings/test-ntfy" class="actions"><button class="btn-s"%s>Send a test notification</button></form>'
-            % (note, radio("theme", "auto", "Auto (follow the system)"), radio("theme", "light", "Light"), radio("theme", "dark", "Dark"),
-               accents, radio("density", "comfortable", "Comfortable"), radio("density", "compact", "Compact"), esc(st["title"]),
-               radio("clock", "24", "24-hour"), radio("clock", "12", "12-hour (AM/PM)"),
-               "".join(check("cards", k, l, k in st["cards"]) for k, l in CARDS),
-               sel("ips_days", [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               sel("bl_min", [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
-               sel("bl_days", [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
-               "".join(check("ips_cols", k, lab, k in st["ips_cols"]) for k, lab, _s, _c in IPS_COLS),
-               esc(", ".join(st["hide_cc"] + ["AS" + a for a in st["hide_asn"]])),
-               ntfy_line, check("notify", "1", "Send ntfy notifications", st["notify"]),
-               "".join(check("notify_events", k, l, k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
-               "" if NTFY_URL else " disabled"))
-    return page("Settings", body + lookups_card() + metrics_card(), "/settings")
+        return '<label class="sp-check"><input type=checkbox name=%s value="%s"%s> %s</label>' % (name, esc(val), " checked" if on else "", esc(label))
+
+    def radios(legend, inner):
+        return '<fieldset class="sp-row"><legend>%s</legend><div class="sp-fields"><div class="sp-choices">%s</div></div></fieldset>' % (esc(legend), inner)
+
+    def select(id_, label, name, vals):
+        opts = "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(st[name]) == str(v) else "", esc(l)) for v, l in vals)
+        return '<div class="sp-row sp-inrow"><label for="%s">%s</label><div class="sp-fields"><select id="%s" name=%s>%s</select></div></div>' % (id_, esc(label), id_, name, opts)
+
+    def save(scope, label):
+        return '<div class="sp-foot"><button>%s</button></div>' % esc(label)
+
+    def section(sid, inner):
+        title, desc = next((t, d) for k, t, d in SETTINGS_SECTIONS if k == sid)
+        n = [k for k, _t, _d in SETTINGS_SECTIONS].index(sid) + 1
+        return ('<section id="%s" class="sp-sec" aria-labelledby="%s-h"><div class="sp-sh"><span class="sp-num">%02d</span>'
+                '<div><h2 id="%s-h">%s</h2><p>%s</p></div></div>%s</section>' % (sid, sid, n, sid, esc(title), esc(desc), inner))
+
+    appearance = section("appearance", flash("appearance") + (
+        '<form method=post action="/settings" class="sp-panel"><input type=hidden name=scope value=appearance>'
+        '<div class="sp-ph"><h3>Display</h3></div>%s%s%s'
+        '<div class="sp-row sp-inrow"><label for="sp-title">Page title</label><div class="sp-fields"><input id="sp-title" name=title maxlength=40 value="%s"></div></div>'
+        '%s%s</form>'
+        % (radios("Theme", choice("theme", "auto", "System") + choice("theme", "light", "Light") + choice("theme", "dark", "Dark")),
+           radios("Accent", "".join(choice("accent", a, a.capitalize(), '<span class="dot dot-%s"></span>' % a) for a in ACCENTS)),
+           radios("Layout", choice("density", "comfortable", "Comfortable") + choice("density", "compact", "Compact")),
+           esc(st["title"]), radios("Clock", choice("clock", "24", "24-hour") + choice("clock", "12", "12-hour (AM/PM)")),
+           save("appearance", "Save appearance"))))
+
+    hidden = esc(", ".join(st["hide_cc"] + ["AS" + a for a in st["hide_asn"]]))
+    views = section("views", flash("views") + (
+        '<form method=post action="/settings" class="sp-panel"><input type=hidden name=scope value=views>'
+        '<div class="sp-sub"><h3>Overview cards</h3><div class="sp-grid">%s</div></div>'
+        '<div class="sp-sub"><h3>Attacker columns</h3><div class="sp-grid">%s</div></div>'
+        '<div class="sp-sub"><h3>Default ranges</h3>%s%s%s'
+        '<p class="sp-help">Blocklist defaults apply to the Overview count, Blocklist page and feeds without parameters.</p></div>'
+        '<div class="sp-sub"><h3>Hidden countries &amp; networks</h3><label class="sp-label" for="sp-hidden">Country codes and AS numbers</label>'
+        '<input id="sp-hidden" name=hidden_nets class="sp-wide" maxlength=500 placeholder="e.g. CN, RU, AS14061" value="%s">'
+        '<p class="sp-help">Hidden from Overview and Attackers. Still recorded and blocklisted.</p></div>%s</form>'
+        % ("".join(check("cards", k, CARD_LABELS.get(k, l), k in st["cards"]) for k, l in CARDS),
+           "".join(check("ips_cols", k, COL_LABELS.get(k, lab), k in st["ips_cols"]) for k, lab, _s, _c in IPS_COLS),
+           select("sp-ipsdays", "Attackers time range", "ips_days", [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
+           select("sp-blmin", "Minimum blocklist score", "bl_min", [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
+           select("sp-bldays", "Blocklist time range", "bl_days", [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
+           hidden, save("views", "Save views & defaults"))))
+
+    if not NTFY_URL:
+        nstate, ndest = sp_status("Not configured", "warn"), '<div class="sp-notice">Set <span class=mono>HUGINN_NTFY_URL</span> in <span class=mono>.env</span> to send notifications.</div>'
+    else:
+        u = urllib.parse.urlsplit(NTFY_URL)
+        host = (u.hostname or "") + ((":%d" % u.port) if u.port else "")      # never user:password@ from the URL
+        nstate = sp_status("Ready", "on") if st["notify"] else sp_status("Off")
+        ndest = '<p class="sp-help">Destination: <span class=mono>%s</span> (HUGINN_NTFY_URL)%s.</p>' % (esc(host), " · Access token configured" if NTFY_TOKEN else "")
+    notifications = section("notifications", flash("notifications") + (
+        '<div class="sp-panel"><div class="sp-ph"><h3>ntfy</h3>%s</div>%s'
+        '<form method=post action="/settings"><input type=hidden name=scope value=notifications>%s'
+        '<fieldset class="sp-events"><legend>Notify me about</legend><div class="sp-grid">%s</div></fieldset>'
+        '<p class="sp-help">At most one summary per hour.</p>%s</form>'
+        '<form method=post action="/settings/test-ntfy" class="sp-test"><div><b>Test delivery</b><p class="sp-help">%s</p></div>'
+        '<button class="btn-s"%s>Send test notification</button></form></div>'
+        % (nstate, ndest, check("notify", "1", "Enable ntfy notifications", st["notify"]),
+           "".join(check("notify_events", k, EVENT_LABELS.get(k, l), k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
+           save("notifications", "Save notifications"),
+           "Uses saved settings." if NTFY_URL else "Available when the ntfy URL is configured. Uses saved settings.",
+           "" if NTFY_URL else " disabled")))
+
+    honeypot = section("honeypot", flash("honeypot") + honeypot_card())
+    lookups = section("lookups", lookups_card(flash, at, err))
+    metrics = section("metrics", flash("metrics") + metrics_card())
+    about = section("about", (
+        '<div class="sp-panel"><div class="sp-ph"><h3>Huginn %s</h3></div>'
+        '<p>Free and open source (AGPL-3.0). Source, issues and releases are on '
+        '<a href="https://github.com/%s" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>'
+        '<p>If Huginn is useful to you, you can <a href="%s" target="_blank" rel="noopener noreferrer">buy me a coffee</a>.</p></div>'
+        % (esc(HUGINN_VERSION), esc(REPO), COFFEE_URL)))
+
+    nav = "".join('<a href="#%s"><span>%02d</span>%s</a>' % (k, i, esc(t)) for i, (k, t, _d) in enumerate(SETTINGS_SECTIONS, 1))
+    body = ('<div class="sp"><div class="sp-head"><div><h1>Settings</h1><p>Your workspace, notifications and integrations.</p></div>'
+            '<p class="sp-rule">Each button applies only to its own form.</p></div>%s'
+            '<div class="sp-layout"><nav class="sp-nav" aria-label="Settings sections"><div class="sp-cap">On this page</div>'
+            '<div class="sp-items">%s</div></nav><div class="sp-main">%s%s%s%s%s%s%s</div></div></div>'
+            % (top, nav, appearance, views, notifications, honeypot, lookups, metrics, about))
+    return page("Settings", body, "/settings")
 
 
-def lookups_card():
-    # Outside lookups by hash or address. The VirusTotal key can be pasted here; it is never shown again, only whether one is set.
+def honeypot_card():
+    # The optional logout note, turned on and off from here (hp-export "goodbye on|off" on the honeypot).
     con = db()
+    items, at = protection_status(con)
+    items = items or {}
+    patched, on = items.get("patch:goodbye"), items.get("option:goodbye")
+    if not items:
+        badge, help_, button = sp_status("Not reported"), "Waiting for the honeypot's first report.", ""
+    elif not patched:
+        badge, help_, button = sp_status("Update required", "warn"), "Run update-honeypot.sh on the honeypot.", ""
+    else:
+        badge = sp_status("On", "on") if on else sp_status("Off")
+        help_ = "Reported %s." % ago(at)
+        button = ('<form method=post action="/settings/goodbye"><input type=hidden name=on value=%s><button%s>%s</button></form>'
+                  % ("0" if on else "1", ' class="btn-s"' if on else "", "Turn off logout message" if on else "Turn on logout message"))
+    return ('<div class="sp-panel"><div class="sp-ph"><h3>Logout message</h3>%s</div>'
+            '<p>Show a short note when a logged-in session ends with <span class=mono>exit</span> or <span class=mono>logout</span>.</p>'
+            '<div class="sp-notice"><b>Reveals this is a honeypot.</b><p>A bot that types exit may learn to recognise it. Off by default.</p></div>'
+            '<details><summary>Message preview</summary><pre class="bye-ex">  Thanks for the 4 min 12 s, 203.0.113.7.\n'
+            '  You typed 9 lines. All of it is logged, along with your address.\n  Say hi to the rest of the botnet.</pre>'
+            '<p class="sp-help">Sent after the session is logged. Not sent on a plain disconnect.</p></details>'
+            '<div class="sp-act">%s<span class="sp-help">%s</span></div></div>' % (badge, button, esc(help_)))
+
+
+def key_form(provider, label, saved, ph_new, invalid=False):
+    # One key form: a visible label, an empty password field (a saved key is never shown again).
+    bad = (' aria-invalid=true aria-describedby="err-%s"' % provider) if invalid else ""
+    return ('<form method=post action="/settings/%s" class="sp-key"><label for="sp-%s-key">%s</label>'
+            '<div class="sp-keyrow"><input type=password id="sp-%s-key" name=key autocomplete=off spellcheck=false maxlength=128 placeholder="%s"%s>'
+            '<button>Save and test</button></div></form>' % (provider, provider, esc(label), provider, "Paste replacement key" if saved else ph_new, bad))
+
+
+def remove_form(provider, saved):
+    return ('<form method=post action="/settings/%s/remove" class="sp-remove"><button class="btn-s">Remove saved key</button></form>' % provider) if saved else ""
+
+
+def lookups_card(flash=lambda s: "", at="", err=""):
+    # Outside lookups by hash or address. Keys are pasted here and never shown again, only whether one is set and where from.
+    con = db()
+    lasterr = lambda k: ('<p class="sp-err small">Last error: %s</p>' % esc(get_meta(con, k, ""))) if get_meta(con, k, "") else ""
+
     saved = VT_KEY_RE.fullmatch(get_meta(con, "vt_key", "") or "") is not None
-    src = "a key saved here" if saved else ("HUGINN_VIRUSTOTAL_KEY in .env" if VT_KEY else "")
-    vleft, _t, vused = day_budget(con, "vt_day", VT_DAILY)
+    src = "Saved key" if saved else ("Environment key (HUGINN_VIRUSTOTAL_KEY)" if VT_KEY else "")
+    _left, _t, vused = day_budget(con, "vt_day", VT_DAILY)
     vn = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"found\": false%'),0) FROM vt").fetchone()
-    err = lambda k: ('<p class="err small">Last error: %s</p>' % esc(get_meta(con, k, ""))) if get_meta(con, k, "") else ""
-    vt_state = ("On, using %s. %s of %s lookups used today; %s files checked, %s never seen by VirusTotal."
-                % (src, num(vused), num(VT_DAILY), num(vn[0]), num(vn[1]))) if src else "Off: no key."
-    remove = ('<form method=post action="/settings/virustotal/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
-    vt_part = ('<p><b>VirusTotal</b> · verdicts for captured files. Only the SHA-256 is sent, never the file. A free key allows 500 lookups a day; '
-               'Huginn uses at most %s.</p><p class="muted small">%s</p>%s'
-               '<form method=post action="/settings/virustotal" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
-               'placeholder="%s" aria-label="VirusTotal API key"><button>Save and test</button></form>%s'
-               % (num(VT_DAILY), esc(vt_state), err("vt_error"), "Paste a new key to replace the saved one" if saved else "Paste your VirusTotal API key", remove))
-    return '<div class="card"><h3>Lookups</h3>%s%s%s</div>' % (vt_part, mb_section(con, err), gn_section(con, err))
+    vt = ('<div class="sp-panel" id="virustotal"><div class="sp-ph"><h3>VirusTotal</h3>%s</div>%s'
+          '<p>File verdicts. Sends SHA-256 hashes only; never uploads files.</p>%s%s%s%s'
+          '<p class="sp-help">Free key: 500 lookups a day, 4 a minute. Daily cap here: %s (HUGINN_VIRUSTOTAL_DAILY).</p>%s</div>'
+          % (sp_status("On", "on") if src else sp_status("Off · No key"), flash("virustotal"),
+             ('<p class="sp-usage">%s · %s / %s lookups today · %s files checked · %s unknown hashes</p>'
+              % (esc(src), num(vused), num(VT_DAILY), num(vn[0]), num(vn[1]))) if src else "",
+             lasterr("vt_error"), key_form("virustotal", "API key", saved, "Paste key", bool(err) and at == "virustotal"), remove_form("virustotal", saved), num(VT_DAILY), ""))
 
-
-def mb_section(con, err):
-    # MalwareBazaar (abuse.ch): family names and tags for captured files, by hash. Same key handling as VirusTotal.
     saved = MB_KEY_RE.fullmatch(get_meta(con, "mb_key", "") or "") is not None
-    src = "a key saved here" if saved else ("HUGINN_MALWAREBAZAAR_KEY in .env" if MB_KEY else "")
+    src = "Saved key" if saved else ("Environment key (HUGINN_MALWAREBAZAAR_KEY)" if MB_KEY else "")
     n = con.execute("SELECT COUNT(*), COALESCE(SUM(mb LIKE '%\"found\": true%'),0) FROM files WHERE mb_checked IS NOT NULL").fetchone()
-    state = ("On, using %s. %s files checked, %s known to MalwareBazaar." % (src, num(n[0]), num(n[1]))) if src else "Off: no key."
-    remove = ('<form method=post action="/settings/malwarebazaar/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
-    return ('<p class="note"><b>MalwareBazaar</b> · family names and tags for captured files from abuse.ch. Only the SHA-256 is sent. '
-            'A free key is at auth.abuse.ch.</p><p class="muted small">%s</p>%s'
-            '<form method=post action="/settings/malwarebazaar" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
-            'placeholder="%s" aria-label="MalwareBazaar Auth-Key"><button>Save and test</button></form>%s'
-            % (esc(state), err("mb_error"), "Paste a new key to replace the saved one" if saved else "Paste your abuse.ch Auth-Key", remove))
+    mb = ('<div class="sp-panel" id="malwarebazaar"><div class="sp-ph"><h3>MalwareBazaar</h3>%s</div>%s'
+          '<p>File families and tags from abuse.ch. Sends SHA-256 hashes only.</p>%s%s%s%s'
+          '<p class="sp-help">Needs a free key from auth.abuse.ch.</p></div>'
+          % (sp_status("On", "on") if src else sp_status("Off · No key"), flash("malwarebazaar"),
+             ('<p class="sp-usage">%s · %s files checked · %s known files</p>' % (esc(src), num(n[0]), num(n[1]))) if src else "",
+             lasterr("mb_error"), key_form("malwarebazaar", "Auth-Key", saved, "Paste key", bool(err) and at == "malwarebazaar"), remove_form("malwarebazaar", saved)))
 
-
-def gn_section(con, err):
-    # GreyNoise: works without a key; a free key raises the allowance. Same key handling as VirusTotal.
     saved = GN_KEY_RE.fullmatch(get_meta(con, "gn_key", "") or "") is not None
-    src = "a key saved here" if saved else ("HUGINN_GREYNOISE_KEY in .env" if GN_KEY else "")
+    src = "Saved key" if saved else ("Environment key (HUGINN_GREYNOISE_KEY)" if GN_KEY else "")
     daily = gn_daily(con)
     _left, _t, used = day_budget(con, "gn_day", daily)
-    n = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"class\": \"benign\"%'),0) FROM greynoise").fetchone()
-    state = ("%s. %s of %s lookups used today; %s addresses checked, %s benign scanners."
-             % ("Using %s" % src if src else "No key: the small free allowance", num(used), num(daily), num(n[0]), num(n[1]))) if daily else "Off."
-    remove = ('<form method=post action="/settings/greynoise/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
-    return ('<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? Only the address is sent, top attackers first. '
-            'Works without a key; a free key from viz.greynoise.io allows more. Benign scanners count as research unless they logged in or ran something.</p>'
-            '<p class="muted small">%s</p>%s'
-            '<form method=post action="/settings/greynoise" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
-            'placeholder="%s" aria-label="GreyNoise API key"><button>Save and test</button></form>%s'
-            % (esc(state), err("gn_error"), "Paste a new key to replace the saved one" if saved else "Paste your GreyNoise API key", remove))
+    g = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"class\": \"benign\"%'),0) FROM greynoise").fetchone()
+    badge = sp_status("Off") if not daily else (sp_status("On", "on") if src else sp_status("On · Free allowance", "on"))
+    gn = ('<div class="sp-panel" id="greynoise"><div class="sp-ph"><h3>GreyNoise</h3>%s</div>%s'
+          '<p>Identify known mass scanners. Sends IP addresses, top attackers first.</p>%s%s%s%s'
+          '<p class="sp-help">No key: %s lookups a day. Free key from viz.greynoise.io: %s a day (HUGINN_GREYNOISE_DAILY changes both). '
+          'Benign scanners count as research unless they logged in or ran commands.</p></div>'
+          % (badge, flash("greynoise"),
+             ('<p class="sp-usage">%s%s / %s lookups today · %s addresses checked · %s benign scanners</p>'
+              % ((esc(src) + " · ") if src else "", num(used), num(daily), num(g[0]), num(g[1]))) if daily else "",
+             lasterr("gn_error"), key_form("greynoise", "API key (optional)", saved, "Paste key", bool(err) and at == "greynoise"), remove_form("greynoise", saved),
+             num(GN_DAILY if GN_DAILY >= 0 else 20), num(GN_DAILY if GN_DAILY >= 0 else 40)))
+    return vt + mb + gn
+
+
+SETTINGS_SCOPES = ("appearance", "views", "notifications")
 
 
 def save_settings(f, lists):
+    # 0.41: each form on Settings sends a scope and only that part changes; the rest stays as saved. Without a scope (an
+    # older form) everything is read as before. An unknown scope changes nothing and returns False.
+    scope = f.get("scope", "")
+    if scope and scope not in SETTINGS_SCOPES:
+        return False
+    every = not scope
     st = settings()
-    if f.get("theme") in THEMES:
-        st["theme"] = f["theme"]
-    if f.get("accent") in ACCENTS:
-        st["accent"] = f["accent"]
-    if f.get("density") in ("comfortable", "compact"):
-        st["density"] = f["density"]
-    title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
-    st["title"] = title or "Huginn"
-    st["cards"] = [k for k, _ in CARDS if k in lists.get("cards", [])]
-    if f.get("ips_days") in ("1", "7", "30", "90", "all"):
-        st["ips_days"] = f["ips_days"]
-    if f.get("bl_min") in ("1", "3", "5", "10", "15", "25"):
-        st["bl_min"] = int(f["bl_min"])
-    if f.get("bl_days") in ("1", "7", "30", "90", "365"):
-        st["bl_days"] = int(f["bl_days"])
-    if f.get("clock") in ("24", "12"):
-        st["clock"] = f["clock"]
-    st["ips_cols"] = [k for k, *_ in IPS_COLS if k in lists.get("ips_cols", [])]
-    cc, asn = [], []
-    for tok in re.split(r"[\s,;]+", (f.get("hidden_nets") or "").upper())[:100]:
-        if re.fullmatch(r"[A-Z]{2}", tok):
-            cc.append(tok)
-        elif re.fullmatch(r"(AS)?\d{1,10}", tok):
-            asn.append(tok.lstrip("AS"))
-    st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
-    st["notify"] = f.get("notify") == "1"
-    st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
+    if every or scope == "appearance":
+        if f.get("theme") in THEMES:
+            st["theme"] = f["theme"]
+        if f.get("accent") in ACCENTS:
+            st["accent"] = f["accent"]
+        if f.get("density") in ("comfortable", "compact"):
+            st["density"] = f["density"]
+        title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
+        st["title"] = title or "Huginn"
+        if f.get("clock") in ("24", "12"):
+            st["clock"] = f["clock"]
+    if every or scope == "views":
+        st["cards"] = [k for k, _ in CARDS if k in lists.get("cards", [])]
+        if f.get("ips_days") in ("1", "7", "30", "90", "all"):
+            st["ips_days"] = f["ips_days"]
+        if f.get("bl_min") in ("1", "3", "5", "10", "15", "25"):
+            st["bl_min"] = int(f["bl_min"])
+        if f.get("bl_days") in ("1", "7", "30", "90", "365"):
+            st["bl_days"] = int(f["bl_days"])
+        st["ips_cols"] = [k for k, *_ in IPS_COLS if k in lists.get("ips_cols", [])]
+        cc, asn = [], []
+        for tok in re.split(r"[\s,;]+", (f.get("hidden_nets") or "").upper())[:100]:
+            if re.fullmatch(r"[A-Z]{2}", tok):
+                cc.append(tok)
+            elif re.fullmatch(r"(AS)?\d{1,10}", tok):
+                asn.append(tok.lstrip("AS"))
+        st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
+    if every or scope == "notifications":
+        st["notify"] = f.get("notify") == "1"
+        st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
     set_meta(db(), "settings", json.dumps(st))
+    return True
 
 
 def v_login(err=""):
@@ -6026,8 +6211,8 @@ inp.addEventListener('input',function(){out.textContent=''})})();
 function copyText(t){if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(t);
 var a=document.createElement('textarea');a.value=t;a.setAttribute('readonly','');a.className='offscreen';document.body.appendChild(a);a.select();
 try{document.execCommand('copy')}finally{a.remove()}return Promise.resolve()}
-document.addEventListener('click',function(e){var b=e.target.closest('[data-copy]');if(!b)return;e.preventDefault();
-copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=t},1200)})});
+document.addEventListener('click',function(e){var b=e.target.closest('[data-copy],[data-copy-url]');if(!b)return;e.preventDefault();
+(b.dataset.copyUrl?fetch(b.dataset.copyUrl,{credentials:'same-origin',cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.text()}).then(copyText):copyText(b.dataset.copy)).then(function(){var t=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=t},1200)})});
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
 (function(){
@@ -6195,6 +6380,7 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".scr-pv .pv{margin-top:4px;max-width:640px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--panel2)}"
         ".pv-l{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}.pv-n{display:inline-block;min-width:2.6em;color:var(--muted);user-select:none}"
         ".pv-d{background:var(--accent2);border-radius:3px}"
+        ".bye-ex{margin:8px 0;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);font-size:12px;white-space:pre-wrap}"
         ".pager.top{margin:0 0 10px}.sizes{margin-left:14px}.sizes a,.sizes b{margin-left:6px;font-weight:500}.sizes b{color:var(--text)}"
         ".replay-card{max-width:1240px}.twin{border:1px solid var(--line);border-radius:8px;overflow:hidden}"
         ".twin-bar{display:flex;align-items:center;gap:6px;padding:7px 12px;background:var(--panel2);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}"
@@ -6223,6 +6409,57 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
 CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
 CSS += ".key-input{flex:1 1 360px;max-width:560px;font-family:var(--mono,monospace)}.help td:first-child{width:220px;vertical-align:top}.help td{line-height:1.5}@media (max-width:800px){.help tr{display:block;padding:8px 0;border-bottom:1px solid var(--line)}.help tr:last-child{border:0}.help td,.help td:first-child{display:block;border:0;padding:2px 0;width:auto;white-space:normal}}"
+# 0.41 Settings page (Codex proposal huginn-settings-ui): section menu, one form per part, status badges. All under .sp.
+CSS += (".sp{--sp-pad:24px;--sp-row:16px;max-width:1360px;margin:0 auto}html[data-density=compact] .sp{--sp-pad:16px;--sp-row:10px}"
+        ".sp .sp-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:8px 0 28px}.sp .sp-head h1{margin:0 0 6px}.sp .sp-head p{margin:0;color:var(--muted)}"
+        ".sp .sp-rule{font-size:12px;padding:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:6px}"
+        ".sp .sp-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:60px;align-items:start}"
+        ".sp .sp-nav{position:sticky;top:72px}.sp .sp-cap{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700;padding:0 12px;margin-bottom:10px}"
+        ".sp .sp-nav a{display:flex;align-items:center;gap:13px;color:var(--muted);padding:10px 12px;border-radius:6px;text-decoration:none}"
+        ".sp .sp-nav a:hover,.sp .sp-nav a:focus-visible{background:var(--accent2);color:var(--accent)}.sp .sp-nav a span{font-size:11px;font-variant-numeric:tabular-nums;opacity:.8}"
+        ".sp .sp-main{min-width:0;max-width:1060px}.sp .sp-sec{margin-bottom:40px;scroll-margin-top:72px}.sp .sp-sec .sp-panel{scroll-margin-top:72px}"
+        ".sp .sp-sh{display:flex;gap:14px;margin-bottom:16px;align-items:flex-start}.sp .sp-sh h2{font-size:20px;margin:0 0 2px}.sp .sp-sh p{margin:0;color:var(--muted);font-size:13px}"
+        ".sp .sp-num{font-size:11px;font-weight:650;color:var(--accent);background:var(--accent2);border:1px solid var(--line);border-radius:7px;display:grid;place-items:center;min-width:32px;height:32px}"
+        ".sp .sp-panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:var(--sp-pad);margin-bottom:12px}"
+        ".sp .sp-panel>p{max-width:80ch}.sp .sp-ph{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.sp .sp-ph h3{font-size:16px;margin:0}"
+        ".sp .sp-status{border:1px solid var(--line);border-radius:5px;padding:3px 8px;font-size:12px;font-weight:600;background:var(--panel2);white-space:nowrap}"
+        ".sp .sp-status.on{color:var(--green)}.sp .sp-status.warn{color:var(--orange)}"
+        ".sp .sp-row{display:grid;grid-template-columns:190px minmax(0,1fr);margin:0;padding:var(--sp-row) 0;border:0;border-bottom:1px solid var(--line);min-width:0}"
+        ".sp fieldset.sp-row{display:flow-root}.sp fieldset.sp-row legend{float:left;width:190px;padding:8px 12px 0 0;font-weight:500}.sp fieldset.sp-row .sp-fields{margin-left:190px}"
+        ".sp .sp-row:last-of-type{border-bottom:0}.sp .sp-inrow label{padding-top:8px;font-weight:500}.sp .sp-fields{min-width:0}.sp .sp-inrow input{width:280px;max-width:100%}"
+        ".sp .sp-choices{display:flex;flex-wrap:wrap;gap:8px}.sp .sp-choice{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:6px;padding:7px 10px;min-height:38px;cursor:pointer}"
+        ".sp .sp-choice:has(input:checked){border-color:var(--accent);background:var(--accent2)}.sp .sp-choice .dot{width:10px;height:10px}"
+        ".sp .sp-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:24px}.sp .sp-check{display:flex;gap:10px;align-items:center;min-height:36px;cursor:pointer}"
+        ".sp .sp-sub{padding:0 0 22px;margin-bottom:22px;border-bottom:1px solid var(--line)}.sp .sp-sub h3{margin:0 0 10px;font-size:15px}.sp .sp-sub:last-of-type{border:0;margin-bottom:0;padding-bottom:0}"
+        ".sp .sp-label{display:block;font-size:13px;margin-bottom:8px}.sp .sp-wide{width:100%}.sp .sp-help{font-size:13px;color:var(--muted);margin:10px 0 0;overflow-wrap:anywhere}"
+        ".sp .sp-foot{border-top:1px solid var(--line);padding-top:16px;margin-top:18px;display:flex;justify-content:flex-end}"
+        ".sp .sp-notice{padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--orange);background:var(--panel2);border-radius:5px;margin:0 0 14px;font-size:13px}.sp .sp-notice p{margin:3px 0 0}"
+        ".sp .sp-events{border:0;border-top:1px solid var(--line);margin:14px 0 0;padding:14px 0 0;min-width:0}.sp .sp-events legend{padding:0 10px 0 0;font-weight:600;font-size:13px}"
+        ".sp .sp-test{border-top:1px solid var(--line);margin-top:18px;padding-top:18px;display:flex;align-items:center;justify-content:space-between;gap:16px}.sp .sp-test .sp-help{margin-top:4px}"
+        ".sp .sp-act{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}.sp .sp-act .sp-help{margin:0}.sp .sp-act form{margin:0}"
+        ".sp .sp-key{margin-top:16px}.sp .sp-key label{display:block;font-weight:500;font-size:13px;margin-bottom:7px}.sp .sp-keyrow{display:flex;gap:10px}.sp .sp-keyrow input{flex:1;width:0;font-family:var(--mono,monospace)}"
+        ".sp .sp-remove{margin-top:10px}.sp .sp-usage{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}"
+        ".sp details{margin-top:14px}.sp summary{cursor:pointer;color:var(--accent);font-size:13px;padding:6px 0}"
+        ".sp .sp-ok{color:var(--green);margin:0 0 12px}.sp .sp-err{color:var(--red);margin:0 0 12px}"
+        "@media (max-width:1050px){.sp .sp-layout{grid-template-columns:170px minmax(0,1fr);gap:28px}.sp .sp-row{grid-template-columns:150px minmax(0,1fr)}"
+        ".sp fieldset.sp-row legend{width:150px}.sp fieldset.sp-row .sp-fields{margin-left:150px}}"
+        "@media (max-width:1000px){.sp .sp-nav{top:16px}.sp .sp-sec,.sp .sp-sec .sp-panel{scroll-margin-top:16px}}"
+        "@media (max-width:760px){.sp .sp-head{display:block;margin-bottom:20px}.sp .sp-rule{display:inline-block;margin-top:12px}.sp .sp-layout{display:block}"
+        ".sp .sp-nav{position:static;margin-bottom:24px}.sp .sp-cap{display:none}.sp .sp-items{display:grid;grid-template-columns:1fr 1fr;gap:4px}"
+        ".sp .sp-nav a{border:1px solid var(--line);background:var(--panel);padding:10px;font-size:13px}.sp .sp-nav a span{color:var(--accent)}"
+        ".sp{--sp-pad:18px}html[data-density=compact] .sp{--sp-pad:16px}.sp .sp-row,.sp fieldset.sp-row{display:block}.sp fieldset.sp-row legend{float:none;width:auto;padding:0 0 8px}"
+        ".sp fieldset.sp-row .sp-fields{margin-left:0}.sp .sp-inrow label{display:block;padding:0 0 8px}.sp .sp-inrow input{width:100%}"
+        ".sp .sp-grid{grid-template-columns:1fr}.sp .sp-keyrow{flex-direction:column}.sp .sp-keyrow input{width:100%}.sp .sp-test{display:block}.sp .sp-test button{margin-top:10px}"
+        ".sp .sp-foot button{width:100%}}")
+# Huginn's global nav (header) and h3 (small caps card titles) must not reach the Settings menu and panel titles.
+CSS += (".sp nav.sp-nav{display:block;overflow:visible;gap:0}.sp nav.sp-nav a{white-space:normal;padding:10px 12px}"
+        ".sp nav.sp-nav a:hover{background:var(--accent2);color:var(--accent)}"
+        ".sp h3{font-size:15px;font-weight:650;color:var(--text);text-transform:none;letter-spacing:0;display:block}.sp .sp-ph h3{font-size:16px;margin:0}"
+        ".sp .sp-sub:has(+ .sp-foot){border-bottom:0;margin-bottom:0;padding-bottom:4px}"
+        # Dark theme: the accents are light, so primary buttons get dark text (white on them was about 2-3:1).
+        "html[data-theme=dark] .sp button:not(.btn-s):not(:disabled){color:#0b0f14}"
+        "@media (prefers-color-scheme:dark){html:not([data-theme=light]) .sp button:not(.btn-s):not(:disabled){color:#0b0f14}}"
+        "@media (max-width:760px){.sp nav.sp-nav a{padding:10px}}")
 # 0.28: wide screens (2K) get three columns on the Overview (dense, so a wide card never leaves a hole) and two on Campaigns.
 CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
         "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
@@ -6512,6 +6749,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_account(self.authed(), qs.get("ok", "")))
         if path == "/settings":
             return self.send(200, v_settings(qs.get("ok", "")))
+        if path == "/settings/metrics/copy":
+            # 0.41: the metrics token is only handed out on a Copy click, never written into the page itself.
+            con = db()
+            tok = metrics_token(con)
+            if not tok or METRICS_TOKEN:
+                return self.send(404, "Not found", "text/plain")
+            if qs.get("what") == "token":
+                return self.send(200, tok, "text/plain")
+            base = getattr(_local, "base", "") or "http://huginn:8095"
+            return self.send(200, metrics_job(base, tok), "text/plain")
         return self.send(404, page("Not found", "<h1>Not found</h1>"))
 
     def route_post(self):
@@ -6547,8 +6794,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings":
             lists = {}
             f = self.form(lists)
-            save_settings(f, lists)
-            return self.redirect("/settings?ok=1")
+            if not save_settings(f, lists):
+                return self.send(400, v_settings(err="Unknown settings form. Nothing was saved."))
+            scope = f.get("scope", "")
+            return self.redirect(settings_url(scope if scope in SETTINGS_SCOPES else "1"))
         if path == "/settings/theme":
             st = settings(con)
             st["theme"] = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
@@ -6564,70 +6813,83 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings/virustotal":
             key = (self.form().get("key") or "").strip().lower()
             if not VT_KEY_RE.fullmatch(key):
-                return self.send(400, v_settings(err="That does not look like a VirusTotal API key (64 characters, 0-9 and a-f)."))
+                return self.send(400, v_settings(at="virustotal", err="That does not look like a VirusTotal API key (64 characters, 0-9 and a-f)."))
             res = vt_test(key)
             if res == "bad":
-                return self.send(400, v_settings(err="VirusTotal refused that key. Nothing was saved."))
+                return self.send(400, v_settings(at="virustotal", err="VirusTotal refused that key. Nothing was saved."))
             if res == "error":
-                return self.send(502, v_settings(err="Could not reach VirusTotal to test the key. Nothing was saved, try again."))
+                return self.send(502, v_settings(at="virustotal", err="Could not reach VirusTotal to test the key. Nothing was saved, try again."))
             day_spend(con, "vt_day")
             set_meta(con, "vt_key", key)
             set_meta(con, "vt_wait_until", "0")
             set_meta(con, "vt_error", "")
-            return self.redirect("/settings?ok=" + ("vt" if res == "ok" else "vtbusy"))
+            return self.redirect(settings_url(("vt" if res == "ok" else "vtbusy")))
         if path == "/settings/malwarebazaar":
             key = (self.form().get("key") or "").strip()
             if not MB_KEY_RE.fullmatch(key):
-                return self.send(400, v_settings(err="That does not look like an abuse.ch Auth-Key (letters and digits only)."))
+                return self.send(400, v_settings(at="malwarebazaar", err="That does not look like an abuse.ch Auth-Key (letters and digits only)."))
             res = mb_test(key)
             if res == "bad":
-                return self.send(400, v_settings(err="abuse.ch refused that key. Nothing was saved."))
+                return self.send(400, v_settings(at="malwarebazaar", err="abuse.ch refused that key. Nothing was saved."))
             if res == "error":
-                return self.send(502, v_settings(err="Could not reach MalwareBazaar to test the key. Nothing was saved, try again."))
+                return self.send(502, v_settings(at="malwarebazaar", err="Could not reach MalwareBazaar to test the key. Nothing was saved, try again."))
             set_meta(con, "mb_key", key)
             set_meta(con, "mb_error", "")
-            return self.redirect("/settings?ok=" + ("mb" if res == "ok" else "mbbusy"))
+            return self.redirect(settings_url(("mb" if res == "ok" else "mbbusy")))
         if path == "/settings/greynoise":
             key = (self.form().get("key") or "").strip()
             if not GN_KEY_RE.fullmatch(key):
-                return self.send(400, v_settings(err="That does not look like a GreyNoise API key (letters, digits, - and _)."))
+                return self.send(400, v_settings(at="greynoise", err="That does not look like a GreyNoise API key (letters, digits, - and _)."))
             res = gn_test(key)
             if res == "bad":
-                return self.send(400, v_settings(err="GreyNoise refused that key. Nothing was saved."))
+                return self.send(400, v_settings(at="greynoise", err="GreyNoise refused that key. Nothing was saved."))
             if res == "error":
-                return self.send(502, v_settings(err="Could not reach GreyNoise to test the key. Nothing was saved, try again."))
+                return self.send(502, v_settings(at="greynoise", err="Could not reach GreyNoise to test the key. Nothing was saved, try again."))
             set_meta(con, "gn_key", key)
             set_meta(con, "gn_wait_until", "0")      # a new key gets a fresh allowance
             set_meta(con, "gn_error", "")
-            return self.redirect("/settings?ok=" + ("gn" if res == "ok" else "gnbusy"))
+            return self.redirect(settings_url(("gn" if res == "ok" else "gnbusy")))
         if path == "/settings/metrics":
             on = self.form().get("on") == "1"
             if on and not get_meta(con, "metrics_token"):
                 set_meta(con, "metrics_token", secrets.token_urlsafe(32))
             set_meta(con, "metrics_on", "1" if on else "0")
             log("info", "metrics_on" if on else "metrics_off")
-            return self.redirect("/settings?ok=" + ("mon" if on else "moff"))
+            return self.redirect(settings_url(("mon" if on else "moff")))
+        if path == "/settings/goodbye":
+            want = self.form().get("on") == "1"
+            state, err = hp_goodbye_set(want)
+            if err:
+                log("warning", "goodbye_set_failed", error=err)
+                return self.send(502, v_settings(at="honeypot", err="Could not change it: %s" % err))
+            # Show the new state at once instead of waiting for the next sync.
+            items, _at = protection_status(con)
+            if items is not None:
+                items["option:goodbye"] = bool(state)
+                set_meta(con, "hp_status", json.dumps({"at": time.time(), "items": items}))
+            log("info", "goodbye_on" if state else "goodbye_off")
+            return self.redirect(settings_url(("byeon" if state else "byeoff")))
         if path == "/settings/metrics/token":
             set_meta(con, "metrics_token", secrets.token_urlsafe(32))
             log("info", "metrics_token_new")
-            return self.redirect("/settings?ok=mtok")
+            return self.redirect(settings_url("mtok"))
         if path == "/settings/greynoise/remove":
             set_meta(con, "gn_key", "")
-            return self.redirect("/settings?ok=gndel")
+            return self.redirect(settings_url("gndel"))
         if path == "/settings/malwarebazaar/remove":
             set_meta(con, "mb_key", "")
-            return self.redirect("/settings?ok=mbdel")
+            return self.redirect(settings_url("mbdel"))
         if path == "/settings/virustotal/remove":
             set_meta(con, "vt_key", "")
-            return self.redirect("/settings?ok=vtdel")
+            return self.redirect(settings_url("vtdel"))
         if path == "/settings/test-ntfy":
             if not NTFY_URL:
-                return self.send(400, v_settings(err="HUGINN_NTFY_URL is not set."))
+                return self.send(400, v_settings(at="notifications", err="HUGINN_NTFY_URL is not set."))
             try:
                 ntfy_post("Test from Huginn. Notifications work.", "Huginn: test")
             except Exception as e:
-                return self.send(502, v_settings(err="Sending failed: %s" % str(e)[:150]))
-            return self.redirect("/settings?ok=test")
+                return self.send(502, v_settings(at="notifications", err="Sending failed: %s" % str(e)[:150]))
+            return self.redirect(settings_url("test"))
         if path == "/account/password":
             ip = self.client_ip()
             f = self.form()

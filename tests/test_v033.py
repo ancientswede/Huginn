@@ -208,15 +208,15 @@ class SettingsKey(unittest.TestCase):
     def test_save_test_and_never_show(self):
         con = app.connect()
         r, _ = self.post_key(KEY.upper(), {"data": {}})
-        self.assertEqual((r.status, r.getheader("Location")), (303, "/settings?ok=vt"))
+        self.assertEqual((r.status, r.getheader("Location")), (303, "/settings?ok=vt#virustotal"))
         self.assertEqual(app.get_meta(con, "vt_key"), KEY)
-        r, html = self.req("GET", "/settings?ok=vt", headers={"Cookie": self.cookie})
+        r, html = self.req("GET", "/settings?ok=vt#virustotal", headers={"Cookie": self.cookie})
         self.assertIn("It works", html)
-        self.assertIn("a key saved here", html)
+        self.assertIn("Saved key", html)
         self.assertNotIn(KEY, html)
         self.assertNotIn(KEY[-8:], html)
         r, _ = self.req("POST", "/settings/virustotal/remove", "", self.hdr({"Cookie": self.cookie}))
-        self.assertEqual(r.getheader("Location"), "/settings?ok=vtdel")
+        self.assertEqual(r.getheader("Location"), "/settings?ok=vtdel#virustotal")
         self.assertEqual(app.get_meta(con, "vt_key"), "")
 
     def test_refused_and_malformed_keys_not_saved(self):
@@ -233,7 +233,7 @@ class SettingsKey(unittest.TestCase):
         app.set_meta(app.connect(), "vt_key", "")
         r, _ = self.req("POST", "/settings/virustotal", "key=" + KEY, self.hdr())          # no login
         self.assertIn(r.status, (303, 401, 403))
-        self.assertNotEqual(r.getheader("Location"), "/settings?ok=vt")
+        self.assertNotEqual(r.getheader("Location"), "/settings?ok=vt#virustotal")
         self.assertEqual(app.get_meta(app.connect(), "vt_key", ""), "")
         r, _ = self.req("POST", "/settings/virustotal", "key=" + KEY, {"Cookie": self.cookie, "Origin": "http://evil.example",
                                                                        "Content-Type": "application/x-www-form-urlencoded"})

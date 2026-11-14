@@ -371,7 +371,7 @@ Many routers and firewalls inspect incoming traffic and silently drop what looks
 
 **Exclude the honeypot's network (VLAN) or address from the IPS**, or set it to detect only, never block. Leave the IPS on for the rest of your network.
 
-- **UniFi:** Settings → Security → Threat Management: add the honeypot's network or IP as an exclusion. Found out the hard way: with prevention on, the honeypot saw almost no SSH or web attacks.
+- **UniFi:** Settings → Security → Threat Management: add the honeypot's network or IP as an exclusion. With prevention on, the router can block SSH and web probes before they ever reach the honeypot.
 - **OPNsense / pfSense with Suricata or Snort in blocking mode:** add the honeypot's address to a pass list, or don't run blocking mode on that interface.
 - **Others** (Firewalla, consumer routers with "security" or "threat protection" add-ons): look for an exclusion per device or network.
 
@@ -450,7 +450,7 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 - took bait: +20
 
 **Before you block anything:**
-- Most attackers are infected home routers and cheap VPSs whose addresses change hands. That is why the feeds only include IPs seen in the last N days.
+- Attacking addresses are often infected home routers or short-lived servers whose addresses change hands. That is why the feeds only include IPs seen in the last N days.
 - Research scanners (Censys, Shadowserver, BinaryEdge and others) are detected from reverse DNS and network names and left out by default. Anyone who logged in, ran commands, dropped files or tried an exploit is always blocklisted, research network or not.
 - "Never block" always wins.
 
@@ -473,7 +473,7 @@ Attackers stay longer, and show more of what they want, on a machine that looks 
 - **Protection report.** The export lists the honeypot's own protection (sandbox and memory/file limits per service, running services, every Huginn patch). Account shows it, and Huginn alerts when something goes missing.
 - **Collection health.** Huginn alerts (ntfy) when no sync has worked for 30 minutes or a source is quiet for longer than its own longest silence last week, and again when it is back. Account lists every source with its newest data; `/healthz` adds `collection_problems`.
 - **Repeated tries are counted, not all stored.** Decoy services keep the first 2,000 events per IP, service and day (`HUGINN_DECOY_CAP`, 0 keeps everything); the rest are only counted, so scores and totals stay right. Account shows how fast the data folder grows and when the disk would be full.
-- **Two Cowrie fixes.** Cowrie's `ping` never accepted `-c N`, so the usual network check `ping -c 1 8.8.8.8` failed and most telnet bots left there. And a file uploaded over SFTP or `scp` vanished before the next command, so the bot's `chmod +x` failed and it never ran the file. Huginn patches both (`patches.py cowrie-ping`, `cowrie-upload`); an uploaded file now stays for the whole connection. Uploads are capped at 10 MB, and `setup-sandbox.sh` gives Cowrie and OpenCanary a memory cap and a 128 MB limit per file, so one huge upload cannot fill the disk or take the honeypot down.
+- **Two Cowrie fixes.** Cowrie's `ping` never accepted `-c N`, so the usual network check `ping -c 1 8.8.8.8` failed, and a bot that checks the network that way left there. And a file uploaded over SFTP or `scp` vanished before the next command, so the bot's `chmod +x` failed and it never ran the file. Huginn patches both (`patches.py cowrie-ping`, `cowrie-upload`); an uploaded file now stays for the whole connection. Uploads are capped at 10 MB, and `setup-sandbox.sh` gives Cowrie and OpenCanary a memory cap and a 128 MB limit per file, so one huge upload cannot fill the disk or take the honeypot down.
 - **Slow replies.** The fake mail server waits 1 to 2.5 s before it says a message is queued. The message is already logged by then, so nothing is lost. A session takes at most 50 messages and 10 minutes, and mail may use at most half of hp-traps' connections. The web trap sends the robots-only backup file in small parts over about 5 s (at most 32 at a time, 2 per IP). The `.env` file and other first replies stay fast. Both log how the visit ended, and Campaigns › Slow replies sums up the last 7 days.
 - **An optional goodbye (off by default).** Turn it on with `update-honeypot.sh --goodbye-on`: when someone who really logged in types `exit` or `logout`, they get a short note with how long they stayed, how many lines they typed, and that all of it is logged along with their address. Only at the very end, and never for `sh -c`, scripts, nested shells or bots that just disconnect, so the session is fully logged before it shows. It does tell whoever reads it that this is a honeypot, and a bot that logs in and types `exit` can learn to recognise yours and skip it next time. That is why it is off unless you choose it (`patches.py cowrie-goodbye`, flag file `/etc/huginn-goodbye`, no restart needed). The session log shows who got it.
 - **Bait detection works by itself.** The honeypot tells Huginn its personas and bait values through the export. Huginn tags anyone who reads a bait file (`read-bait`) and anyone who later uses one of the values anywhere, on any service (`took-bait`).
@@ -584,7 +584,7 @@ The honeypot only needs a short history; Huginn keeps the long one.
 
 `hp-logclean -n` shows what it would do. Huginn syncs every two minutes, so it has everything long before the honeypot deletes it.
 
-**In Huginn**, everything lives in one SQLite database (`/opt/huginn/data/huginn.db`): events, sessions, credentials, files, enrichment. Session recordings are copied over in the background and kept compressed in `/opt/huginn/data/tty`, so replays keep working after the honeypot has deleted its copy. History older than `HUGINN_RETENTION_DAYS` (180 by default) is deleted; set it to `0` to keep everything. The Account page shows the database size, the recordings and the free disk space. Expect roughly 5–20 MB of database per day on a busy honeypot, most of it SSH password guessing; repeated decoy tries above `HUGINN_DECOY_CAP` are counted, not stored. Account also shows how fast the data folder grows and when the disk would be full.
+**In Huginn**, everything lives in one SQLite database (`/opt/huginn/data/huginn.db`): events, sessions, credentials, files, enrichment. Session recordings are copied over in the background and kept compressed in `/opt/huginn/data/tty`, so replays keep working after the honeypot has deleted its copy. History older than `HUGINN_RETENTION_DAYS` (180 by default) is deleted; set it to `0` to keep everything. The Account page shows the database size, the recordings and the free disk space. How fast it grows depends on your traffic and retention; repeated decoy tries above `HUGINN_DECOY_CAP` are counted, not stored. Account also shows how fast the data folder grows and when the disk would be full.
 
 `update-huginn.sh` keeps the last three versions of the code but only one database copy (the newest), so updates do not eat the disk as the database grows.
 

@@ -115,15 +115,15 @@ class SettingsKey(unittest.TestCase):
     def test_save_show_remove(self):
         con = app.connect()
         r, _ = self.post_key(KEY, {"message": "pong"})
-        self.assertEqual(r.getheader("Location"), "/settings?ok=gn")
+        self.assertEqual(r.getheader("Location"), "/settings?ok=gn#greynoise")
         self.assertEqual(app.get_meta(con, "gn_key"), KEY)
-        _r, html = self.req("GET", "/settings?ok=gn", headers={"Cookie": self.cookie})
+        _r, html = self.req("GET", "/settings?ok=gn#greynoise", headers={"Cookie": self.cookie})
         self.assertIn("GreyNoise key saved. It works.", html)
-        self.assertIn("<b>GreyNoise</b>", html)
+        self.assertIn("<h3>GreyNoise</h3>", html)
         self.assertNotIn(KEY, html)
         self.assertNotIn(KEY[-6:], html)
         r, _ = self.req("POST", "/settings/greynoise/remove", "", self.hdr({"Cookie": self.cookie}))
-        self.assertEqual(r.getheader("Location"), "/settings?ok=gndel")
+        self.assertEqual(r.getheader("Location"), "/settings?ok=gndel#greynoise")
         self.assertEqual(app.get_meta(con, "gn_key"), "")
 
     def test_refused_and_malformed(self):

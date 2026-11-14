@@ -3,6 +3,7 @@
 # Runs as a forced command in /root/.ssh/authorized_keys on the honeypot:
 #   restrict,command="/usr/local/bin/hp-export" ssh-ed25519 AAAA... huginn
 # No command: prints all logs in sections. "tty <sha256>": one Cowrie session recording as base64.
+# "goodbye on" / "goodbye off": the only change Huginn can make here, the optional logout note (Settings in Huginn).
 # "tty <sha256> <sha256> ...": up to 50 recordings, one line each: "<sha256> <base64>" or "<sha256> -" if gone.
 # Settings (optional) in /etc/default/hp-export:
 COWRIE_DIRS="/home/cowrie/cowrie"            # one or more Cowrie install dirs (several = several personas)
@@ -35,6 +36,23 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         if [ -f "$f" ] && [ ! -L "$f" ]; then printf "%s " "$sha"; base64 -w0 "$f"; echo; else echo "$sha -"; fi
       done
     ' tty "$FIRST_COWRIE/var/lib/cowrie/tty" "${shas[@]}" ;;
+  "goodbye on"|"goodbye off")
+    # 0.41: turn the logout note on or off (the same flag file as update-honeypot.sh --goodbye-on). Exactly these two
+    # commands, nothing taken from them but on/off; the answer is one line with the state now.
+    f=/etc/huginn-goodbye
+    if [ "$SSH_ORIGINAL_COMMAND" = "goodbye on" ]; then
+      [ ! -L "$f" ] || { echo "refused: $f is a symlink" >&2; exit 2; }
+      [ -f "$f" ] || install -m 644 -o root -g root /dev/null "$f" || { echo "could not create $f" >&2; exit 2; }
+      want=on
+    else
+      rm -f "$f" || { echo "could not remove $f" >&2; exit 2; }
+      want=off
+    fi
+    # Only report success when the flag really is in the state asked for.
+    if [ -f "$f" ] && [ ! -L "$f" ]; then now=on; else now=off; fi
+    [ "$now" = "$want" ] || { echo "goodbye is still $now" >&2; exit 2; }
+    echo "goodbye $now"
+    exit 0 ;;
   *) ;;  # any other command gets the normal export
 esac
 # Print the files matching a pattern, oldest first, skipping old compressed ones (Huginn has had those for days).

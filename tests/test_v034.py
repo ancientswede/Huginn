@@ -102,15 +102,15 @@ class SettingsKey(unittest.TestCase):
     def test_save_show_remove(self):
         con = app.connect()
         r, _ = self.post_key(KEY, {"query_status": "hash_not_found"})
-        self.assertEqual(r.getheader("Location"), "/settings?ok=mb")
+        self.assertEqual(r.getheader("Location"), "/settings?ok=mb#malwarebazaar")
         self.assertEqual(app.get_meta(con, "mb_key"), KEY)
-        _r, html = self.req("GET", "/settings?ok=mb", headers={"Cookie": self.cookie})
+        _r, html = self.req("GET", "/settings?ok=mb#malwarebazaar", headers={"Cookie": self.cookie})
         self.assertIn("MalwareBazaar key saved. It works.", html)
-        self.assertIn("<b>MalwareBazaar</b>", html)
+        self.assertIn("<h3>MalwareBazaar</h3>", html)
         self.assertNotIn(KEY, html)
         self.assertNotIn(KEY[-6:], html)
         r, _ = self.req("POST", "/settings/malwarebazaar/remove", "", self.hdr({"Cookie": self.cookie}))
-        self.assertEqual(r.getheader("Location"), "/settings?ok=mbdel")
+        self.assertEqual(r.getheader("Location"), "/settings?ok=mbdel#malwarebazaar")
         self.assertEqual(app.get_meta(con, "mb_key"), "")
 
     def test_refused_and_malformed(self):
