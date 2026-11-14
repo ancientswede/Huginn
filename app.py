@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.33.0"
+HUGINN_VERSION = "0.34.0"
 CHANGELOG = [
+    ("0.34.0", "2026-11-14", "The MalwareBazaar key can be pasted on the Settings page too (Lookups), like the VirusTotal key: it is tested before it is saved and never shown again. The page shows how many files were checked and how many abuse.ch knows, and the last error if a lookup failed."),
     ("0.33.0", "2026-11-14", "VirusTotal verdicts for captured files: only the SHA-256 is sent, never the file. Each file shows how many engines flag it, or \"novel\" when VirusTotal has never seen it, and VirusTotal's label names the family when nothing better is known. Paste the key on the Settings page (it is tested, then never shown again) or set HUGINN_VIRUSTOTAL_KEY. GreyNoise (no key needed) says whether an attacker is a known mass scanner: benign ones count as research unless they logged in or ran something. Both keep to a daily allowance."),
     ("0.32.0", "2026-11-14", "New Engagement page: sessions that got in, day by day, with what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it. Huginn now also stores the terminal size a client asks for: it shows on each session and in a table on the Engagement page."),
     ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
@@ -1000,20 +1001,47 @@ def family_tag(fam, how=""):
     return '<span class="tag t-red" title="Looks like %s%s">%s</span>' % (esc(fam), (" (from %s)" % esc(how)) if how else "", esc(fam))
 
 
+MB_KEY_RE = re.compile(r"[A-Za-z0-9]{20,128}")
+
+
+def mb_key(con=None):
+    # A key saved on the Settings page wins over HUGINN_MALWAREBAZAAR_KEY. It is never shown again once saved.
+    k = get_meta(con or db(), "mb_key", "") or ""
+    return k if MB_KEY_RE.fullmatch(k) else MB_KEY
+
+
+def mb_test(key):
+    # One lookup of a well-known hash: "ok", "bad" (key refused), "busy" (rate limited) or "error" (no answer).
+    req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=urllib.parse.urlencode({"query": "get_info", "hash": VT_TEST_SHA}).encode(),
+                                 headers={"Auth-Key": key, "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            st = str(json.loads(r.read(2 * 1024 * 1024)).get("query_status") or "")
+    except urllib.error.HTTPError as e:
+        return "busy" if e.code == 429 else "bad" if e.code in (401, 403) else "error"
+    except Exception:
+        return "error"
+    if st in ("ok", "hash_not_found", "no_results"):
+        return "ok"
+    return "bad" if "auth" in st else "error"
+
+
 def mb_lookup(con, limit=4):
     # Ask MalwareBazaar about files we have not asked about yet (or not found a week ago). Only the hash leaves Huginn.
-    if not MB_KEY:
+    key = mb_key(con)
+    if not key:
         return 0
     rows = con.execute("SELECT sha FROM files WHERE mb_checked IS NULL OR (mb LIKE '%\"found\": false%' AND mb_checked < ?) "
                        "ORDER BY mtime DESC LIMIT ?", (time.time() - 7 * 86400, limit)).fetchall()
     done = 0
     for (sha,) in rows:
         req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=urllib.parse.urlencode({"query": "get_info", "hash": sha}).encode(),
-                                     headers={"Auth-Key": MB_KEY, "User-Agent": UA})
+                                     headers={"Auth-Key": key, "User-Agent": UA})
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 d = json.loads(r.read(2 * 1024 * 1024))
-        except Exception:
+        except Exception as e:
+            set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
             break
         if d.get("query_status") == "ok" and d.get("data"):
             x = d["data"][0]
@@ -1022,9 +1050,11 @@ def mb_lookup(con, limit=4):
         elif d.get("query_status") in ("hash_not_found", "no_results"):
             mb = {"found": False}
         else:
+            set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), clean(str(d.get("query_status") or "no answer"), 60)))
             break                                    # bad key, rate limit, ...: try again later
         with con:
             con.execute("UPDATE files SET mb=?, mb_checked=? WHERE sha=?", (json.dumps(mb), time.time(), sha))
+        set_meta(con, "mb_error", "")
         done += 1
     return done
 
@@ -5142,7 +5172,9 @@ def v_settings(ok="", err=""):
         return '<select name=%s>%s</select>' % (name, "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(st[name]) == str(v) else "", esc(l)) for v, l in vals))
     msg = {"1": "Saved.", "test": "Test notification sent.", "vt": "VirusTotal key saved. It works.",
            "vtbusy": "VirusTotal key saved. It is valid, but over its allowance right now: lookups start when it resets.",
-           "vtdel": "VirusTotal key removed."}.get(ok, "")
+           "vtdel": "VirusTotal key removed.", "mb": "MalwareBazaar key saved. It works.",
+           "mbbusy": "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own.",
+           "mbdel": "MalwareBazaar key removed."}.get(ok, "")
     note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
     note += ('<p class="err">%s</p>' % esc(err)) if err else ""
     accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
@@ -5198,16 +5230,30 @@ def lookups_card():
     vt_state = ("On, using %s. %s of %s lookups used today; %s files checked, %s never seen by VirusTotal."
                 % (src, num(vused), num(VT_DAILY), num(vn[0]), num(vn[1]))) if src else "Off: no key."
     remove = ('<form method=post action="/settings/virustotal/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
-    return ('<div class="card"><h3>Lookups</h3>'
-            '<p><b>VirusTotal</b> · verdicts for captured files. Only the SHA-256 is sent, never the file. A free key allows 500 lookups a day; '
-            'Huginn uses at most %s.</p><p class="muted small">%s</p>%s'
-            '<form method=post action="/settings/virustotal" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
-            'placeholder="%s" aria-label="VirusTotal API key"><button>Save and test</button></form>%s'
-            '<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? No key needed. Only the address is sent, '
-            'top attackers first, at most %s a day. Benign scanners count as research unless they logged in or ran something.</p>'
-            '<p class="muted small">%s of %s used today; %s addresses checked, %s benign scanners.</p>%s</div>'
-            % (num(VT_DAILY), esc(vt_state), err("vt_error"), "Paste a new key to replace the saved one" if saved else "Paste your VirusTotal API key",
-               remove, num(GN_DAILY), num(gused), num(GN_DAILY), num(gn[0]), num(gn[1]), err("gn_error")))
+    vt_part = ('<p><b>VirusTotal</b> · verdicts for captured files. Only the SHA-256 is sent, never the file. A free key allows 500 lookups a day; '
+               'Huginn uses at most %s.</p><p class="muted small">%s</p>%s'
+               '<form method=post action="/settings/virustotal" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
+               'placeholder="%s" aria-label="VirusTotal API key"><button>Save and test</button></form>%s'
+               % (num(VT_DAILY), esc(vt_state), err("vt_error"), "Paste a new key to replace the saved one" if saved else "Paste your VirusTotal API key", remove))
+    gn_part = ('<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? No key needed. Only the address is sent, '
+               'top attackers first, at most %s a day. Benign scanners count as research unless they logged in or ran something.</p>'
+               '<p class="muted small">%s of %s used today; %s addresses checked, %s benign scanners.</p>%s'
+               % (num(GN_DAILY), num(gused), num(GN_DAILY), num(gn[0]), num(gn[1]), err("gn_error")))
+    return '<div class="card"><h3>Lookups</h3>%s%s%s</div>' % (vt_part, mb_section(con, err), gn_part)
+
+
+def mb_section(con, err):
+    # MalwareBazaar (abuse.ch): family names and tags for captured files, by hash. Same key handling as VirusTotal.
+    saved = MB_KEY_RE.fullmatch(get_meta(con, "mb_key", "") or "") is not None
+    src = "a key saved here" if saved else ("HUGINN_MALWAREBAZAAR_KEY in .env" if MB_KEY else "")
+    n = con.execute("SELECT COUNT(*), COALESCE(SUM(mb LIKE '%\"found\": true%'),0) FROM files WHERE mb_checked IS NOT NULL").fetchone()
+    state = ("On, using %s. %s files checked, %s known to MalwareBazaar." % (src, num(n[0]), num(n[1]))) if src else "Off: no key."
+    remove = ('<form method=post action="/settings/malwarebazaar/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
+    return ('<p class="note"><b>MalwareBazaar</b> · family names and tags for captured files from abuse.ch. Only the SHA-256 is sent. '
+            'A free key is at auth.abuse.ch.</p><p class="muted small">%s</p>%s'
+            '<form method=post action="/settings/malwarebazaar" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
+            'placeholder="%s" aria-label="MalwareBazaar Auth-Key"><button>Save and test</button></form>%s'
+            % (esc(state), err("mb_error"), "Paste a new key to replace the saved one" if saved else "Paste your abuse.ch Auth-Key", remove))
 
 
 def save_settings(f, lists):
@@ -5920,6 +5966,21 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "vt_wait_until", "0")
             set_meta(con, "vt_error", "")
             return self.redirect("/settings?ok=" + ("vt" if res == "ok" else "vtbusy"))
+        if path == "/settings/malwarebazaar":
+            key = (self.form().get("key") or "").strip()
+            if not MB_KEY_RE.fullmatch(key):
+                return self.send(400, v_settings(err="That does not look like an abuse.ch Auth-Key (letters and digits only)."))
+            res = mb_test(key)
+            if res == "bad":
+                return self.send(400, v_settings(err="abuse.ch refused that key. Nothing was saved."))
+            if res == "error":
+                return self.send(502, v_settings(err="Could not reach MalwareBazaar to test the key. Nothing was saved, try again."))
+            set_meta(con, "mb_key", key)
+            set_meta(con, "mb_error", "")
+            return self.redirect("/settings?ok=" + ("mb" if res == "ok" else "mbbusy"))
+        if path == "/settings/malwarebazaar/remove":
+            set_meta(con, "mb_key", "")
+            return self.redirect("/settings?ok=mbdel")
         if path == "/settings/virustotal/remove":
             set_meta(con, "vt_key", "")
             return self.redirect("/settings?ok=vtdel")
