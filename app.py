@@ -5,8 +5,10 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.41.0"
+HUGINN_VERSION = "0.42.0"
 CHANGELOG = [
+    ("0.42.0", "2026-11-14", "Every number at the top of the Overview is a link to the list behind it: Took the bait opens the attackers who took the bait in the last 7 days, Sessions the attackers with the most sessions, Files captured the Files page, Time wasted the receipt, On blocklist the Blocklist. New this week links its attackers, new attackers, each new country, each malware family and the bait count too."),
+    ("0.41.1", "2026-11-14", "Account: the changelog is as tall as the System card next to it and scrolls, instead of making the page very long. Settings, Logout message shows how often the note was shown, to how many addresses, in the last 7 days and when last (also in /metrics as events of kind goodbye)."),
     ("0.41.0", "2026-11-14", "The goodbye on logout can be turned on and off in Settings (card Goodbye on logout), no need to log in to the honeypot. It is the only thing Huginn can change there: the locked export key accepts exactly \"goodbye on\" or \"goodbye off\" and nothing else. Update the honeypot once (update-honeypot.sh) for the button to work. Settings is rebuilt: a menu of sections, one Save button per part that only saves that part, status badges (On, Off, Not configured, Update required) and shorter texts that state the free and keyed lookup limits instead of guessing your traffic. The footer and Settings › About link to Buy me a coffee."),
     ("0.40.0", "2026-11-14", "An optional goodbye: when someone who really logged in types exit or logout, the honeypot can answer with a short note: how long they stayed, how many lines they typed, and that all of it is logged along with their address. Off by default; turn it on with update-honeypot.sh --goodbye-on (and off with --goodbye-off), no restart. It never shows for sh -c, scripts, nested shells or bots that just disconnect, and only at the very end, so it does not change what is collected. The session log shows who got it, and Account says whether it is on. Update the honeypot (update-honeypot.sh) for the patch. Also from a review before release: Campaigns compares long scripts quickly (a crafted script with thousands of repeated commands made the page slow), groups rows by the shape of their first commands, no longer says \"ends after\" for two rows that read the same, and a failed Cowrie upgrade puts Huginn's patches back on the old version."),
     ("0.39.0", "2026-11-14", "Campaigns: scripts that start with the same commands no longer look identical. Each such row shows the first command where it differs from the others (or that it is the same script cut short), and every script has a Preview with all its commands numbered, the differing one marked, so you can choose what to open without opening it. The JSON log setting now says it is for log tools such as Grafana Loki, Graylog or Elasticsearch."),
@@ -3210,14 +3212,17 @@ def overview_kpis(con, st):
                               "HAVING MIN(ts)>=? AND MIN(ts)<?)", (now - 14 * 86400, d7)).fetchone()[0]
     delta = "%+d%% vs prior 7d" % round((w["active"] - w["before"]) * 100.0 / w["before"]) if w["before"] else ""
     # The three without "kpi-x" are what a phone shows first. "hot": something rare happened, make it stand out.
-    kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"]), ""),
-            ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24), ""),
-            ("Took the bait 7d", num(bait7[0] or 0), ("%s read bait files" % num(bait7[1] or 0)) if BAIT else "no bait values known yet", " hot" if bait7[0] else ""),
-            ("Attackers 7d", num(w["active"]), " · ".join(x for x in ("%s total" % num(k["c"]), delta) if x), " kpi-x"),
-            ("Files captured", num(files), "%s new 7d · %s prior" % (num(files_new), num(files_prior)), " kpi-x hot" if files_new else " kpi-x"),
-            ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else ""), " kpi-x"),
-            ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]), " kpi-x")]
-    kp = "".join('<div class="kpi%s"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>' % (d, esc(a), b, esc(c)) for a, b, c, d in kpis)
+    # 0.42: every tile is a link to the list behind its number.
+    kpis = [("Attackers 24h", num(k["a"]), "%s new" % num(k["d"]), "", "/ips?days=1"),
+            ("Sessions 24h", num(s24), "%s with shell commands" % num(sh24), "", "/ips?days=1&sort=sessions"),
+            ("Took the bait 7d", num(bait7[0] or 0), ("%s read bait files" % num(bait7[1] or 0)) if BAIT else "no bait values known yet", " hot" if bait7[0] else "",
+             "/ips?days=7&tag=took-bait"),
+            ("Attackers 7d", num(w["active"]), " · ".join(x for x in ("%s total" % num(k["c"]), delta) if x), " kpi-x", "/ips?days=7"),
+            ("Files captured", num(files), "%s new 7d · %s prior" % (num(files_new), num(files_prior)), " kpi-x hot" if files_new else " kpi-x", "/files"),
+            ("Time wasted 7d", esc(dur(tw["total"])) if tw["total"] else "0", "%s tarpit · %s fake shells%s" % (dur(tw["tarpit"]), dur(tw["shell"]), " · %d stuck now" % tw["stuck"] if tw["stuck"] else ""), " kpi-x", "/receipt"),
+            ("On blocklist", num(bl), "score ≥%s, %s days" % (st["bl_min"], st["bl_days"]), " kpi-x", "/blocklist")]
+    kp = "".join('<a class="kpi%s" href="%s"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></a>' % (d, esc(href), esc(a), b, esc(c))
+                 for a, b, c, d, href in kpis)
     html_ = ('<input class="kpi-sw" type="checkbox" id="kpiMore" aria-label="More metrics"><div class="kpis">%s</div>'
              '<label class="kpi-more" for="kpiMore"><span class="a">More metrics</span><span class="b">Fewer metrics</span></label>' % kp)
     return html_, w, tw
@@ -3676,13 +3681,14 @@ def week_card(con, w=None):
     if w is None:
         end = time.time()
         w = week_summary(con, end - 7 * 86400, end)
-    rows = [("Attackers", "%s <span class=muted>%s</span>" % (num(w["active"]), esc(trend(w["active"], w["before"])))),
-            ("New attackers", num(w["new_ips"])),
-            ("New countries", " ".join(cc_html(c) for c in w["new_cc"][:12]) or "–"),
+    rows = [("Attackers", '<a href="/ips?days=7">%s</a> <span class=muted>%s</span>' % (num(w["active"]), esc(trend(w["active"], w["before"])))),
+            ("New attackers", ('<a href="/ips?days=7&amp;sort=first">%s</a>' % num(w["new_ips"])) if w["new_ips"] else "0"),
+            ("New countries", " ".join('<a href="/ips?days=7&amp;cc=%s">%s</a>' % (esc(urllib.parse.quote(c)), cc_html(c)) for c in w["new_cc"][:12]) or "–"),
             ("New campaigns", ('<a href="/campaigns">%d</a> <span class=muted>(%d IPs)</span>' % (w["campaigns"], w["campaign_ips"])) if w["campaigns"] else "–"),
-            ("New malware", " ".join("%s ×%d" % (family_tag(k) if k != "Unknown" else '<span class="tag">unknown</span>', v)
+            ("New malware", " ".join(('<a href="/files?fam=%s">%s</a> ×%d' % (esc(urllib.parse.quote(k)), family_tag(k), v)) if k != "Unknown"
+                                     else '<span class="tag">unknown</span> ×%d' % v
                                      for k, v in sorted(w["families"].items(), key=lambda x: -x[1])[:6]) or "–"),
-            ("Took the bait", num(w["took"]) if w["took"] else "–")]
+            ("Took the bait", ('<a href="/ips?days=7&amp;tag=took-bait">%s</a>' % num(w["took"])) if w["took"] else "–")]
     return '<div class="card"><h3>New this week <span class=muted>last 7 days</span></h3>%s</div>' % kv(rows)
 
 
@@ -5716,7 +5722,7 @@ def v_account(cur, ok="", err=""):
             '<button>Change password</button></form><p class="muted small">Changing it logs out every other browser.</p></div>'
             '<div class="card"><h3>Sessions</h3>%s<p>%s other active %s.</p>'
             '<form method=post action="/account/logout-others"><button class="btn-s"%s>Log out other sessions</button></form></div>'
-            '<div class="card"><h3>System</h3>%s</div><div class="card"><h3>Changelog</h3>%s</div></div>'
+            '<div class="card"><h3>System</h3>%s</div><div class="card cl-card"><h3>Changelog</h3><div class="cl-scroll">%s</div></div></div>'
             % (note, kv([("This browser", "logged in until %s" % esc(fmt_ts(mine[0])) if mine else "–")]), num(others),
                "session" if others == 1 else "sessions", "" if others else " disabled", status, log))
     return page("Account", body, "/account")
@@ -5934,6 +5940,16 @@ def v_settings(ok="", err="", at=""):
     return page("Settings", body, "/settings")
 
 
+def goodbye_stats(con):
+    # 0.41.1: how often the logout note was shown (event kind goodbye, one per session). Also in /metrics as kind="goodbye".
+    n, ips, last, week = con.execute("SELECT COUNT(*), COUNT(DISTINCT ip), MAX(ts), COALESCE(SUM(ts>=?),0) FROM events WHERE kind='goodbye'",
+                                     (time.time() - 7 * 86400,)).fetchone()
+    if not n:
+        return '<p class="sp-usage">Not shown to anyone yet.</p>'
+    return ('<p class="sp-usage">Shown %s time%s to %s address%s · %s in the last 7 days · last %s</p>'
+            % (num(n), "" if n == 1 else "s", num(ips), "" if ips == 1 else "es", num(week), esc(ago(last))))
+
+
 def honeypot_card():
     # The optional logout note, turned on and off from here (hp-export "goodbye on|off" on the honeypot).
     con = db()
@@ -5955,7 +5971,7 @@ def honeypot_card():
             '<details><summary>Message preview</summary><pre class="bye-ex">  Thanks for the 4 min 12 s, 203.0.113.7.\n'
             '  You typed 9 lines. All of it is logged, along with your address.\n  Say hi to the rest of the botnet.</pre>'
             '<p class="sp-help">Sent after the session is logged. Not sent on a plain disconnect.</p></details>'
-            '<div class="sp-act">%s<span class="sp-help">%s</span></div></div>' % (badge, button, esc(help_)))
+            '%s<div class="sp-act">%s<span class="sp-help">%s</span></div></div>' % (badge, goodbye_stats(con), button, esc(help_)))
 
 
 def key_form(provider, label, saved, ph_new, invalid=False):
@@ -6130,6 +6146,7 @@ h3 .muted{text-transform:none;letter-spacing:0;font-weight:400}h3 .more{margin-l
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;box-shadow:var(--shadow);min-width:0}
 .kpis{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:14px;margin-bottom:14px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;box-shadow:var(--shadow)}
+a.kpi{display:block;color:inherit;text-decoration:none;transition:border-color .15s}a.kpi:hover{border-color:var(--accent);text-decoration:none}a.kpi:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .kpi-l{font-size:12px;color:var(--muted)}.kpi-v{font-size:26px;font-weight:620;margin:2px 0}.kpi-s{font-size:12px;color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.span2{grid-column:span 2}
 .grid3{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
@@ -6343,6 +6360,8 @@ CSS += (".hdr-link{color:var(--muted)}.hdr-link:hover,.hdr-link.on{color:var(--t
         ".stack{display:flex;flex-direction:column;gap:12px;max-width:420px}.stack label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:13px}"
         ".stack button{align-self:flex-start}.okmsg{color:var(--green);margin:0 0 14px}.err{margin:0 0 14px}"
         ".cl{display:grid;grid-template-columns:60px 90px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)}.cl:last-child{border:0}"
+        # 0.41.1: the changelog takes the height of the System card next to it and scrolls (it does not stretch the row).
+        ".cl-card{display:flex;flex-direction:column;min-height:320px}.cl-scroll{flex:1 1 0;min-height:0;overflow-y:auto;padding-right:6px}"
         "button[disabled]{opacity:.5;cursor:default}")
 CSS += "".join(".sbar .g%d{flex-grow:%d}" % (n, n) for n in range(1, 61))
 CSS += (".sbar{display:flex;gap:2px;height:8px;margin:12px 0 4px}.sbar i{display:block;flex-basis:0;min-width:3px;background:var(--accent)}"

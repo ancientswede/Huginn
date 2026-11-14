@@ -182,3 +182,26 @@ class ReviewFixes(unittest.TestCase):
         bad = [p.strip() for sel in re.findall(r'(?:^|})\s*([^{}@]+)\{', css) for p in sel.split(",")
                if p.strip() and not re.match(r"(\.sp( |\{|$)|html\[data-density=compact\] \.sp|html\[data-theme=dark\] \.sp |html:not\(\[data-theme=light\]\) \.sp )", p.strip())]
         self.assertEqual(bad, [])
+
+
+class GoodbyeStats(unittest.TestCase):
+    def setUp(self):
+        self.con = app.connect()
+        self.clean()
+
+    def tearDown(self):
+        self.clean()
+
+    def clean(self):
+        with self.con:
+            self.con.execute("DELETE FROM events WHERE kind='goodbye'")
+
+    def test_counts(self):
+        self.assertIn("Not shown to anyone yet.", app.goodbye_stats(self.con))
+        now = time.time()
+        with self.con:
+            for i, (ip, age) in enumerate((("203.0.113.1", 60), ("203.0.113.1", 3600), ("203.0.113.2", 10 * 86400))):
+                self.con.execute("INSERT INTO events(h, ts, ip, src, kind, session, a) VALUES(?,?,?,?,?,?,?)",
+                                 ("gb%d" % i, now - age, ip, "cowrie", "goodbye", "gbs%d" % i, "9 s, 2 lines typed"))
+        text = app.goodbye_stats(self.con)
+        self.assertIn("Shown 3 times to 2 addresses · 2 in the last 7 days", text)
