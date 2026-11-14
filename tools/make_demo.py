@@ -6,7 +6,7 @@
 # Every attacker address, network and AS number comes from the ranges reserved for documentation
 # (RFC 5737, RFC 3849, RFC 5398), so none of it belongs to a real person or company.
 # The pages are rendered by Huginn itself and saved as plain HTML, so any static web host can serve them.
-import argparse, hashlib, json, os, random, re, shutil, sys, tempfile, time, urllib.parse
+import argparse, hashlib, html, json, os, random, re, shutil, sys, tempfile, time, urllib.parse
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -299,11 +299,14 @@ def P(path):
     return BASE + path
 
 
+DEMO_TAGS = ("took-bait",)
+
+
 def link(m):
     attr, q, url = m.group(1), m.group(2), m.group(3)
     if not url.startswith("/") or url.startswith("//"):
         return m.group(0)
-    u = urllib.parse.urlsplit(url)
+    u = urllib.parse.urlsplit(html.unescape(url))            # links in the pages are HTML-escaped (&amp;)
     path, qs, frag = u.path, dict(urllib.parse.parse_qsl(u.query)), ("#" + u.fragment if u.fragment else "")
     target = None
     if path == "/":
@@ -311,6 +314,8 @@ def link(m):
     elif path == "/ips":
         if qs.get("cc"):
             target = "ips-cc-%s.html" % qs["cc"].upper()
+        elif qs.get("tag") in DEMO_TAGS:
+            target = "ips-tag-%s.html" % qs["tag"]          # the Overview's clickable bait count (0.42)
         elif qs.get("p") and qs.get("p") != "0":
             target = "ips-p%s.html" % qs["p"]
         else:
@@ -373,6 +378,8 @@ save("ips.html", fix(app.v_ips({"days": "30"})))
 total = con.execute("SELECT COUNT(*) FROM ips WHERE last>=?", (NOW - 30 * 86400,)).fetchone()[0]
 for p in range(1, (total + 99) // 100):
     save("ips-p%d.html" % p, fix(app.v_ips({"days": "30", "p": str(p)})))
+for tag in DEMO_TAGS:
+    save("ips-tag-%s.html" % tag, fix(app.v_ips({"days": "7", "tag": tag})))
 for (cc,) in con.execute("SELECT DISTINCT cc FROM enrich WHERE cc IS NOT NULL"):
     save("ips-cc-%s.html" % cc, fix(app.v_ips({"days": "7", "cc": cc})))
 for (ip,) in con.execute("SELECT ip FROM ips"):
