@@ -43,7 +43,7 @@ def clean(con):
     with con:
         for t in ("files", "vt", "greynoise", "ips", "enrich", "events"):
             con.execute("DELETE FROM %s" % t)
-        for k in ("vt_key", "vt_day", "vt_wait_until", "vt_error", "gn_day", "gn_wait_until", "gn_error"):
+        for k in ("vt_key", "vt_day", "vt_wait_until", "vt_error", "gn_day", "gn_wait_until", "gn_error", "mb_wait_until"):
             con.execute("DELETE FROM meta WHERE k=?", (k,))
 
 
@@ -62,7 +62,7 @@ class VirusTotal(unittest.TestCase):
 
     def run_lookup(self, answers, **kw):
         f = Fake(answers)
-        with mock.patch.object(app.urllib.request, "urlopen", f):
+        with mock.patch.object(app, "api_urlopen", f):
             n = app.vt_lookup(self.con, pause=0, **kw)
         return n, f
 
@@ -135,7 +135,7 @@ class GreyNoise(unittest.TestCase):
     def lookup(self, answers):
         f = Fake(answers)
         public = lambda ip: ip.startswith("198.51.100.")          # documentation addresses stand in for public ones here
-        with mock.patch.object(app.urllib.request, "urlopen", f), mock.patch.object(app.time, "sleep", lambda s: None), \
+        with mock.patch.object(app, "api_urlopen", f), mock.patch.object(app.time, "sleep", lambda s: None), \
                 mock.patch.object(app, "sendable_ip", public):
             n = app.gn_lookup(self.con)
         return n, f
@@ -202,7 +202,7 @@ class SettingsKey(unittest.TestCase):
         return r, data
 
     def post_key(self, key, answer):
-        with mock.patch.object(app.urllib.request, "urlopen", Fake({app.VT_TEST_SHA: answer})):
+        with mock.patch.object(app, "api_urlopen", Fake({app.VT_TEST_SHA: answer})):
             return self.req("POST", "/settings/virustotal", urllib.parse.urlencode({"key": key}), self.hdr({"Cookie": self.cookie}))
 
     def test_save_test_and_never_show(self):

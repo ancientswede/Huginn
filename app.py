@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.35.0"
+HUGINN_VERSION = "0.36.0"
 CHANGELOG = [
+    ("0.36.0", "2026-11-14", "Fixes from a deep security and bug review. The decoy cap never drops a web attack, a bait hit or a login with a new kind of password, and knows rows by their content, so two hits at the same second both count and a resent line is never counted twice. A pasted chmod line can no longer make the attacker page slow. Lookups never follow redirects, so a key only ever goes to its own service. A changed GreyNoise answer takes the research mark off again, and web exploits or bait use always keep an attacker on the blocklist. A collection source that stopped stays alerted for 30 days instead of two. MalwareBazaar copes with odd answers and pauses on a refused key. Engagement counts late commands of long sessions and uses a true median; the timeline always shows the newest activity; Files is faster."),
     ("0.35.0", "2026-11-14", "New Help page (link in the header, or g h): what every attacker tag, session badge, file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it."),
     ("0.34.0", "2026-11-14", "The MalwareBazaar key can be pasted on the Settings page too (Lookups), like the VirusTotal key: it is tested before it is saved and never shown again. The page shows how many files were checked and how many abuse.ch knows, and the last error if a lookup failed."),
     ("0.33.0", "2026-11-14", "VirusTotal verdicts for captured files: only the SHA-256 is sent, never the file. Each file shows how many engines flag it, or \"novel\" when VirusTotal has never seen it, and VirusTotal's label names the family when nothing better is known. Paste the key on the Settings page (it is tested, then never shown again) or set HUGINN_VIRUSTOTAL_KEY. GreyNoise (no key needed) says whether an attacker is a known mass scanner: benign ones count as research unless they logged in or ran something. Both keep to a daily allowance."),
@@ -89,6 +90,7 @@ import re
 import secrets
 import shutil
 import socket
+import statistics
 import sqlite3
 import subprocess
 import sys
@@ -277,6 +279,7 @@ CREATE TABLE IF NOT EXISTS webhits(h TEXT PRIMARY KEY, ip TEXT, ts REAL, level T
 CREATE INDEX IF NOT EXISTS wh_ip ON webhits(ip);
 CREATE INDEX IF NOT EXISTS wh_type ON webhits(type, ts);
 CREATE TABLE IF NOT EXISTS vt(sha TEXT PRIMARY KEY, checked REAL, data TEXT);
+CREATE TABLE IF NOT EXISTS capped_seen(h TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 """
@@ -319,6 +322,10 @@ def init_db():
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
     if "termsize" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN termsize TEXT")
+    if "src" not in [r[1] for r in con.execute("PRAGMA table_info(capped)")]:
+        con.execute("ALTER TABLE capped ADD COLUMN src TEXT")
+    if not get_meta(con, "capped_seen_since"):     # 0.36: rows the old cap handled (ts <= upto) before this are not counted again
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('capped_seen_since',?)", (str(time.time()),))
     fcols = [r[1] for r in con.execute("PRAGMA table_info(files)")]
     for col, typ in (("family", "TEXT"), ("mb", "TEXT"), ("mb_checked", "REAL")):
         if col not in fcols:
@@ -977,7 +984,7 @@ def name_family(names):
     return ""
 
 
-def file_family(f, names="", sha=None):
+def file_family(f, names="", sha=None, vt=False):
     # Best guess, most reliable first: MalwareBazaar's signature, strings in the file, VirusTotal's label, then its name or URL.
     if f is not None:
         try:
@@ -989,7 +996,7 @@ def file_family(f, names="", sha=None):
         if f["family"]:
             return f["family"], "strings in the file"
         sha = sha or f["sha"]
-    fam = vt_family(vt_get(sha)) if sha else ""
+    fam = vt_family(vt_get(sha) if vt is False else vt) if sha else ""      # vt: the answer when the caller has it (None = none)
     if fam:
         return fam, "VirusTotal"
     fam = name_family(names)
@@ -1016,8 +1023,9 @@ def mb_test(key):
     req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=urllib.parse.urlencode({"query": "get_info", "hash": VT_TEST_SHA}).encode(),
                                  headers={"Auth-Key": key, "User-Agent": UA})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            st = str(json.loads(r.read(2 * 1024 * 1024)).get("query_status") or "")
+        with api_urlopen(req, timeout=15) as r:
+            d = json.loads(r.read(2 * 1024 * 1024))
+        st = str(d.get("query_status") or "") if isinstance(d, dict) else ""
     except urllib.error.HTTPError as e:
         return "busy" if e.code == 429 else "bad" if e.code in (401, 403) else "error"
     except Exception:
@@ -1027,37 +1035,78 @@ def mb_test(key):
     return "bad" if "auth" in st else "error"
 
 
+def mb_parse(d):
+    # {"found": ...} from a MalwareBazaar answer, or None when the answer has an unexpected shape.
+    if not isinstance(d, dict):
+        return None
+    st = d.get("query_status")
+    if st in ("hash_not_found", "no_results"):
+        return {"found": False}
+    data = d.get("data")
+    if st != "ok" or not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    x = data[0]
+    tags = x.get("tags") if isinstance(x.get("tags"), list) else []
+    return {"found": True, "signature": clean(str(x.get("signature") or ""), 60),
+            "tags": [clean(str(t), 30) for t in tags[:8]], "first_seen": clean(str(x.get("first_seen") or ""), 20)}
+
+
 def mb_lookup(con, limit=4):
     # Ask MalwareBazaar about files we have not asked about yet (or not found a week ago). Only the hash leaves Huginn.
     key = mb_key(con)
-    if not key:
+    if not key or float(get_meta(con, "mb_wait_until", "0") or 0) > time.time():
         return 0
     rows = con.execute("SELECT sha FROM files WHERE mb_checked IS NULL OR (mb LIKE '%\"found\": false%' AND mb_checked < ?) "
                        "ORDER BY mtime DESC LIMIT ?", (time.time() - 7 * 86400, limit)).fetchall()
     done = 0
     for (sha,) in rows:
+        if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+            continue
         req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=urllib.parse.urlencode({"query": "get_info", "hash": sha}).encode(),
                                      headers={"Auth-Key": key, "User-Agent": UA})
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with api_urlopen(req, timeout=20) as r:
                 d = json.loads(r.read(2 * 1024 * 1024))
-        except Exception as e:
-            set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+        except urllib.error.HTTPError as e:
+            wait = 6 * 3600 if e.code in (401, 403) else 3600 if e.code == 429 else 900
+            set_meta(con, "mb_wait_until", time.time() + wait)
+            set_meta(con, "mb_error", "%s HTTP %s" % (fmt_ts(time.time()), e.code))
             break
-        if d.get("query_status") == "ok" and d.get("data"):
-            x = d["data"][0]
-            mb = {"found": True, "signature": str(x.get("signature") or "")[:60],
-                  "tags": [str(t)[:30] for t in (x.get("tags") or [])][:8], "first_seen": str(x.get("first_seen") or "")[:20]}
-        elif d.get("query_status") in ("hash_not_found", "no_results"):
-            mb = {"found": False}
+        except Exception as e:
+            set_meta(con, "mb_wait_until", time.time() + 900)
+            set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), clean(str(e), 120)))
+            break
+        mb = mb_parse(d)
+        if mb is None:
+            status = clean(str(d.get("query_status") if isinstance(d, dict) else "unexpected answer"), 60)
+            if "auth" in status or "limit" in status:
+                set_meta(con, "mb_wait_until", time.time() + 6 * 3600)
+                set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), status))
+                break
+            mb = {"found": False, "odd": status}            # this file only: asked again in a week, the rest go on
+            set_meta(con, "mb_error", "%s unexpected answer for one file (%s)" % (fmt_ts(time.time()), status))
         else:
-            set_meta(con, "mb_error", "%s %s" % (fmt_ts(time.time()), clean(str(d.get("query_status") or "no answer"), 60)))
-            break                                    # bad key, rate limit, ...: try again later
+            set_meta(con, "mb_error", "")
         with con:
             con.execute("UPDATE files SET mb=?, mb_checked=? WHERE sha=?", (json.dumps(mb), time.time(), sha))
-        set_meta(con, "mb_error", "")
         done += 1
     return done
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None                      # a 3xx comes back as an HTTPError instead of being followed with our key
+
+
+_api_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def api_urlopen(req, timeout=20):
+    # All lookups that carry a key or go to an outside service use this: HTTPS only, no redirects followed.
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    if not url.startswith("https://"):
+        raise ValueError("only https lookups are allowed")
+    return _api_opener.open(req, timeout=timeout)
 
 
 VT_KEY_RE = re.compile(r"[0-9a-f]{64}")
@@ -1074,7 +1123,7 @@ def vt_test(key):
     # One lookup of a well-known file: "ok", "bad" (key refused) or "busy" (valid, but over the allowance right now).
     req = urllib.request.Request("https://www.virustotal.com/api/v3/files/" + VT_TEST_SHA, headers={"x-apikey": key, "User-Agent": UA})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with api_urlopen(req, timeout=15) as r:
             r.read(64 * 1024)
         return "ok"
     except urllib.error.HTTPError as e:
@@ -1149,7 +1198,7 @@ def vt_lookup(con, limit=3, pause=16):
         req = urllib.request.Request("https://www.virustotal.com/api/v3/files/" + sha, headers={"x-apikey": key, "User-Agent": UA})
         day_spend(con, "vt_day")
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with api_urlopen(req, timeout=20) as r:
                 a = (json.loads(r.read(4 * 1024 * 1024)).get("data") or {}).get("attributes") or {}
             st = a.get("last_analysis_stats") or {}
             cnt = lambda k: st.get(k) if isinstance(st.get(k), int) and 0 <= st.get(k) < 1000 else 0
@@ -1183,10 +1232,20 @@ def vt_lookup(con, limit=3, pause=16):
 GN_CLASSES = {"benign", "malicious", "suspicious", "unknown"}
 
 
-def gn_parse(d):
-    # Only known fields and values are kept; everything else from outside is dropped.
+def gn_parse(d, ip=None):
+    # Only known fields and values are kept; everything else from outside is dropped. Booleans must be real booleans,
+    # and an answer about another address than the one asked about counts as nothing seen.
+    if not isinstance(d, dict):
+        d = {}
+    if ip and d.get("ip") is not None:
+        try:
+            if ipaddress.ip_address(str(d.get("ip"))) != ipaddress.ip_address(ip):
+                d = {}
+        except ValueError:
+            d = {}
+    noise, riot = d.get("noise") is True, d.get("riot") is True
     cls = str(d.get("classification") or "unknown").lower()
-    return {"seen": bool(d.get("noise")) or bool(d.get("riot")), "noise": bool(d.get("noise")), "riot": bool(d.get("riot")),
+    return {"seen": noise or riot, "noise": noise, "riot": riot,
             "class": cls if cls in GN_CLASSES else "unknown", "name": ext_text(d.get("name"), 60) or "",
             "last": str(d.get("last_seen") or "")[:10] if re.fullmatch(r"\d{4}-\d\d-\d\d", str(d.get("last_seen") or "")[:10]) else ""}
 
@@ -1199,6 +1258,15 @@ def gn_benign(data):
     except ValueError:
         return False
     return bool(g.get("seen")) and g.get("class") == "benign"
+
+
+def research_now(con, ip, base=None):
+    # The research flag from every source, the same way everywhere: by name/network (enrich), or GreyNoise's latest answer.
+    if base is None:
+        r = con.execute("SELECT rdns, org, isp, hostnames, rdns_ok FROM enrich WHERE ip=?", (ip,)).fetchone()
+        base = research_flag(r[0], r[1], r[2], r[3], r[4]) if r else 0
+    g = con.execute("SELECT data FROM greynoise WHERE ip=?", (ip,)).fetchone()
+    return 1 if base or (g and gn_benign(g[0])) else 0
 
 
 def gn_get(con, ip):
@@ -1246,11 +1314,11 @@ def gn_lookup(con, limit=5):
             h["key"] = GN_KEY
         day_spend(con, "gn_day")
         try:
-            with urllib.request.urlopen(urllib.request.Request("https://api.greynoise.io/v3/community/" + urllib.parse.quote(ip), headers=h), timeout=15) as r:
-                g = gn_parse(json.loads(r.read(256 * 1024)))
+            with api_urlopen(urllib.request.Request("https://api.greynoise.io/v3/community/" + urllib.parse.quote(ip), headers=h), timeout=15) as r:
+                g = gn_parse(json.loads(r.read(256 * 1024)), ip)
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                g = gn_parse({})
+                g = gn_parse({}, ip)
             else:
                 # 429: the allowance is used up (the community limit is per day); anything else: try again later.
                 set_meta(con, "gn_wait_until", time.time() + (6 * 3600 if e.code == 429 else 3600))
@@ -1261,8 +1329,7 @@ def gn_lookup(con, limit=5):
             break
         with con:
             con.execute("INSERT OR REPLACE INTO greynoise(ip, checked, data) VALUES(?,?,?)", (ip, time.time(), json.dumps(g)))
-            if gn_benign(g):
-                con.execute("UPDATE enrich SET research=1 WHERE ip=?", (ip,))
+            con.execute("UPDATE enrich SET research=? WHERE ip=?", (research_now(con, ip), ip))     # benign -> on, changed -> off
         set_meta(con, "gn_error", "")
         done += 1
         time.sleep(1)
@@ -1648,35 +1715,75 @@ def utc_day(ts):
     return time.strftime("%Y-%m-%d", time.gmtime(ts))
 
 
+CAP_CLASSIFY_SECS = 5.0          # web requests over the cap are checked for attacks for at most this long per sync
+
+
+def decoy_keep(svc, b, memo):
+    # Rows kept even over the cap: logins, bait values, and web requests that are attacks, probes, the robots trap or bait
+    # replies. Floods repeat the same request, so each distinct request is classified once (memo), within a time budget.
+    b = b or ""
+    if BAIT and any(x in b for x in BAIT):
+        return True
+    if canary_is_login(svc, b):
+        # A login over the cap is kept when its password has a shape Huginn has not seen yet (what New would show);
+        # the same brute-force list over and over is counted, not stored.
+        shape = "pw:" + pw_shape(b.rsplit(" / ", 1)[-1])
+        if shape not in memo:
+            memo[shape] = memo.get("_con") is not None and memo["_con"].execute(
+                "SELECT 1 FROM seen WHERE kind='pw' AND key=?", (shape[3:],)).fetchone() is None
+            new = memo[shape]
+            memo[shape] = False                    # once per sync
+            return new
+        return False
+    if svc not in ("http", "https"):
+        return False
+    if b not in memo:
+        if time.time() > memo.setdefault("_until", time.time() + CAP_CLASSIFY_SECS):
+            return False
+        try:
+            c = web_classify(b)
+            memo[b] = c[0] in ("exploit", "probe") or bool(c[5]) or c[6] in WEB_BAIT_REPLIES
+        except Exception:
+            memo[b] = False
+    return memo[b]
+
+
 def cap_rows(con, rows):
-    # Decoy events beyond DECOY_CAP per IP, service and day are counted in `capped`, not stored. The export sends the newest
-    # lines again on every sync, so each (IP, service, day) remembers the last time it handled (`upto`): older or equal rows
-    # were stored then or counted then, and are skipped now. Inside store()'s transaction, so the count and the rows agree.
+    # Decoy events beyond DECOY_CAP per IP, service and day are counted in `capped`, not stored, unless they hold something
+    # that matters (decoy_keep). The export sends the newest lines again on every sync, so a row is known by its hash:
+    # stored ones are in events, counted ones in capped_seen (kept for 3 days). `upto` = newest activity, also when dropped.
     if DECOY_CAP <= 0:
         return rows
-    out, state, dirty = [], {}, set()
+    out, state, dirty, memo, dropped = [], {}, set(), {"_con": con}, []
+    since = float(get_meta(con, "capped_seen_since", "0") or 0)
     for r in rows:
         if r[4] != "canary":
             out.append(r)
             continue
+        if con.execute("SELECT 1 FROM events WHERE h=?", (r[0],)).fetchone() or \
+                con.execute("SELECT 1 FROM capped_seen WHERE h=?", (r[0],)).fetchone():
+            continue
         key = (r[2], r[6] or "", utc_day(r[1]))
         st = state.get(key)
         if st is None:
-            got = con.execute("SELECT kept, dropped, upto FROM capped WHERE ip=? AND svc=? AND day=?", key).fetchone()
-            st = state[key] = [got[0], got[1], got[2]] if got else [0, 0, 0.0]
-        if r[1] <= st[2]:
+            got = con.execute("SELECT kept, dropped, upto, src FROM capped WHERE ip=? AND svc=? AND day=?", key).fetchone()
+            # [kept, dropped, newest, source, old cap's upto]: rows written before 0.36 have no source and only remember a time.
+            st = state[key] = ([got[0], got[1], got[2] or 0.0, r[3], (got[2] or 0.0) if got[3] is None else 0.0]
+                               if got else [0, 0, 0.0, r[3], 0.0])
+        if r[1] < since and r[1] <= st[4]:          # handled by the cap before 0.36 (it remembered times, not rows)
             continue
-        st[2] = r[1]
-        if st[0] < DECOY_CAP:
+        st[2] = max(st[2], r[1])
+        if st[0] < DECOY_CAP or decoy_keep(r[6] or "", r[7], memo):
             st[0] += 1
             out.append(r)
         else:
             st[1] += 1
+            dropped.append((r[0], r[1]))
         dirty.add(key)
-    con.executemany("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto) VALUES(?,?,?,?,?,?)",
-                    [key + tuple(state[key]) for key in dirty])
+    con.executemany("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto, src) VALUES(?,?,?,?,?,?,?)",
+                    [key + tuple(state[key][:4]) for key in dirty])
+    con.executemany("INSERT OR IGNORE INTO capped_seen(h, ts) VALUES(?,?)", dropped)
     return out
-
 
 def trim_decoys(con):
     # One time (0.28): bring the history under DECOY_CAP and set up `capped` for the days the export can still send again.
@@ -1688,9 +1795,19 @@ def trim_decoys(con):
                              "WHERE kind='canary' GROUP BY ip, svc, d HAVING n > ? OR MAX(ts) >= ?", (DECOY_CAP, now - 14 * 86400)).fetchall()
         for ip, svc, d, n, u in groups:
             if n > DECOY_CAP:
-                con.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ip=? AND kind='canary' AND COALESCE(a,'')=? "
-                            "AND ts>=? AND ts<? ORDER BY ts LIMIT -1 OFFSET ?)", (ip, svc, d * 86400, (d + 1) * 86400, DECOY_CAP))
+                memo = {"_con": con}
+                extra = con.execute("SELECT e.rowid, e.b, w.h IS NOT NULL FROM events e LEFT JOIN webhits w ON w.h=e.h AND "
+                                    "(w.level IN ('exploit','probe') OR w.robots=1 OR w.reply IN (%s)) "
+                                    "WHERE e.ip=? AND e.kind='canary' AND COALESCE(e.a,'')=? AND e.ts>=? AND e.ts<? ORDER BY e.ts LIMIT -1 OFFSET ?"
+                                    % ",".join("'%s'" % x for x in sorted(WEB_BAIT_REPLIES)),
+                                    (ip, svc, d * 86400, (d + 1) * 86400, DECOY_CAP)).fetchall()
+                # Rows already classified as something that matters, or that would be now, are never deleted.
+                gone = [(rid,) for rid, b, known in extra if not known and not decoy_keep(svc, b, memo)]
+                con.executemany("DELETE FROM events WHERE rowid=?", gone)
                 touched.add(ip)
+                con.execute("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto) VALUES(?,?,?,?,?,?)",
+                            (ip, svc, utc_day(d * 86400), DECOY_CAP + len(extra) - len(gone), len(gone), u))
+                continue
             con.execute("INSERT OR REPLACE INTO capped(ip, svc, day, kept, dropped, upto) VALUES(?,?,?,?,?,?)",
                         (ip, svc, utc_day(d * 86400), min(n, DECOY_CAP), max(0, n - DECOY_CAP), u))
         if touched:
@@ -1748,9 +1865,16 @@ def retention(con):
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
         # Cap state is only needed while the export can send a day again; the rows that dropped something stay as the count.
         con.execute("DELETE FROM capped WHERE dropped=0 AND day < ?", (utc_day(time.time() - 14 * 86400),))
+        con.execute("DELETE FROM capped_seen WHERE ts < ?", (time.time() - 3 * 86400,))
     if RETENTION_DAYS == 0:          # keep the whole history
         con.execute("PRAGMA optimize")
         return
+    cutoff_day = utc_day(time.time() - RETENTION_DAYS * 86400)
+    with con:                         # counted-only decoy hits follow the same history limit as stored ones
+        gone_ips = [r[0] for r in con.execute("SELECT DISTINCT ip FROM capped WHERE day < ? AND dropped > 0", (cutoff_day,))]
+        con.execute("DELETE FROM capped WHERE day < ?", (cutoff_day,))
+        for ip in gone_ips:
+            recompute_ip(con, ip)
     cutoff = time.time() - RETENTION_DAYS * 86400
     with con:
         old_ips = [r[0] for r in con.execute("SELECT ip FROM ips WHERE first < ?", (cutoff,))]
@@ -1917,15 +2041,21 @@ GAP_MIN = max(600, POLL * 5)
 # Collection health (0.29): is data still coming in, per source? "Quiet" is measured against each source's own longest
 # silence in the last week, so a tarpit that is often idle for hours does not raise an alarm that a busy SSH port would.
 HEALTH_SYNC_LATE = max(1800, POLL * 6)
+HEALTH_FORGET = 30 * 86400          # a source silent this long is taken off the list (it is gone, not just quiet)
 
 
 def health_sources(con, now=None):
     # {key: newest time}: OpenCanary, hp-traps and endlessh from events, Cowrie per listening port from sessions (last 2 days).
+    # A source that went silent stays in the list for 30 days, so it keeps alerting instead of being forgotten after two.
     now = now or time.time()
+    since = now - HEALTH_FORGET
     out = {}
-    for src, last in con.execute("SELECT src, MAX(ts) FROM events WHERE ts>=? AND src IN ('canary','traps','endlessh') GROUP BY src", (now - 2 * 86400,)):
+    for src, last in con.execute("SELECT src, MAX(ts) FROM events WHERE ts>=? AND src IN ('canary','traps','endlessh') GROUP BY src", (since,)):
         out[src] = last
-    for port, last in con.execute("SELECT port, MAX(start) FROM sessions WHERE start>=? AND port IS NOT NULL GROUP BY port", (now - 2 * 86400,)):
+    for src, last in con.execute("SELECT COALESCE(src,'canary'), MAX(upto) FROM capped WHERE upto>=? GROUP BY 1", (since,)):
+        if src in ("canary", "traps") and last:                 # hits over the decoy cap are activity too
+            out[src] = max(out.get(src, 0), last)
+    for port, last in con.execute("SELECT port, MAX(start) FROM sessions WHERE start>=? AND port IS NOT NULL GROUP BY port", (since,)):
         out["cowrie:%s" % port] = last
     return out
 
@@ -1950,7 +2080,8 @@ def health_limits(con):
         if cached.get("day") == day and isinstance(cached.get("lim"), dict):
             return cached["lim"]
     except ValueError:
-        pass
+        cached = {}
+    old = cached.get("lim") if isinstance(cached, dict) and isinstance(cached.get("lim"), dict) else {}
     since = time.time() - 7 * 86400
     lim = {}
     q = ("SELECT COUNT(*), MAX(t - p) FROM (SELECT t, LAG(t) OVER (ORDER BY t) p FROM (%s))")
@@ -1962,6 +2093,9 @@ def health_limits(con):
         n, gap = con.execute(q % "SELECT start t FROM sessions WHERE port=? AND start>=?", (port, since)).fetchone()
         if n >= 20 and gap:
             lim["cowrie:%s" % port] = min(2 * 86400, max(7200, 2.5 * gap))
+    for k, v in old.items():                     # a source with too little history this week keeps last known limit
+        if k not in lim and isinstance(v, (int, float)):
+            lim[k] = v
     set_meta(con, "health_limits", json.dumps({"day": day, "lim": lim}))
     return lim
 
@@ -2148,7 +2282,7 @@ def check_update(con):
     try:
         req = urllib.request.Request("https://api.github.com/repos/%s/tags?per_page=50" % REPO,
                                      headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
-        tags = json.loads(urllib.request.urlopen(req, timeout=15).read(500000))
+        tags = json.loads(api_urlopen(req, timeout=15).read(500000))
         versions = [t.get("name", "") for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t.get("name", ""))]
         latest = max(versions, key=vtuple) if versions else ""
         set_meta(con, "update_latest", latest.lstrip("v"))
@@ -2241,7 +2375,7 @@ _rdns_pool = ThreadPoolExecutor(max_workers=2)
 def http_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with api_urlopen(req, timeout=10) as r:
             return json.loads(r.read(200000).decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -2480,6 +2614,7 @@ def enrich_loop():
                         con.execute("INSERT OR REPLACE INTO enrich(ip,fetched,ok) VALUES(?,?,1)", (ip, time.time()))
                     continue
                 d, ok, research = enrich_ip(ip)
+                research = research_now(con, ip, research)       # keep a benign GreyNoise answer
                 fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:
                     con.execute("INSERT OR REPLACE INTO enrich VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3598,7 +3733,7 @@ ATTACK = [
     ("T1552.001", "Credentials In Files", r"\.my\.cnf\b|\.aws/credentials\b|\.git-credentials\b|wp-config\.php\b|/\.env\b"),
     ("T1105", "Ingress Tool Transfer", r"\b(?:wget|curl|tftp|ftpget)\b"),
     ("T1059.004", "Unix Shell", r"\|\s*(?:ba)?sh\b|\b(?:ba)?sh\s+-c\b"),
-    ("T1222.002", "Linux File Permissions Modification", r"\bchmod\s+(?:[ugoa]*\+x|[0-7]*[1357][0-7]*)\b"),
+    ("T1222.002", "Linux File Permissions Modification", r"\bchmod\s+(?:[ugoa]*\+x|(?=[0-7]{1,4}\b)[0-7]{0,3}[1357])"),   # bounded: no backtracking blow-up
     ("T1098.004", "SSH Authorized Keys", r"authorized_keys"),
     ("T1053.003", "Cron", r"\bcrontab\b|/etc/cron"),
     ("T1543.002", "Systemd Service", r"\bsystemctl\s+enable\b|/etc/systemd/system/"),
@@ -3613,11 +3748,20 @@ ATTACK_NAME = dict((t, n) for t, n, _p in ATTACK)
 ATTACK_NAME.update({"T1110": "Brute Force", "T1090": "Proxy"})
 
 
+ATTACK_BUDGET = 64 * 1024        # characters of commands looked at per call: a page with many huge commands stays cheap
+
+
 def attack_ids(cmds, logins_fail=0, proxy=0, files=0):
     # Techniques in ATTACK order, plus what a session shows without commands (brute force, proxy, transferred files).
-    found = []
+    found, seen, left = [], [], ATTACK_BUDGET
+    for c in cmds:
+        if left <= 0:
+            break
+        c = (c or "")[:min(left, 4096)]
+        seen.append(c)
+        left -= len(c)
     for t, _n, rx in ATTACK_RE:
-        if any(rx.search(c or "") for c in cmds):
+        if any(rx.search(c) for c in seen):
             found.append(t)
     if files and "T1105" not in found:
         found.append("T1105")
@@ -3648,21 +3792,23 @@ def ip_timeline(con, ip, days=30, steps_max=40):
     since = time.time() - days * 86400
     items = []
     cmds_by, runs = {}, set()
-    for sid, a, kind in con.execute("SELECT session, a, kind FROM events WHERE ip=? AND kind IN ('cmd','exec_sim') AND ts>=? LIMIT 20000", (ip, since)):
+    for sid, a, kind in con.execute("SELECT session, a, kind FROM events WHERE ip=? AND kind IN ('cmd','exec_sim') AND ts>=? ORDER BY ts DESC LIMIT 20000", (ip, since)):
         if kind == "cmd":
             cmds_by.setdefault(sid, []).append(a)
         else:
             runs.add(sid)
+    for v in cmds_by.values():                       # fetched newest first so the latest survive the limit
+        v.reverse()
     for s in con.execute("SELECT session, start, end, proto, logins_ok lo, logins_fail lf, cmds, files, tcpip FROM sessions "
-                         "WHERE ip=? AND start>=? ORDER BY start LIMIT 5000", (ip, since)):
+                         "WHERE ip=? AND start>=? ORDER BY start DESC LIMIT 5000", (ip, since)):
         k = "shell" if (s["cmds"] or s["files"]) else ("login" if s["lo"] + s["lf"] else "connect")
         items.append([s["start"], s["end"] or s["start"], (k, (s["proto"] or "?").upper()),
                       {"n": 1, "lo": s["lo"], "lf": s["lf"], "cmds": s["cmds"], "files": s["files"], "proxy": s["tcpip"],
                        "run": s["session"] in runs, "c": cmds_by.get(s["session"], [])}])
-    for ts, svc in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='canary' AND ts>=? ORDER BY ts LIMIT 20000", (ip, since)):
+    for ts, svc in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='canary' AND ts>=? ORDER BY ts DESC LIMIT 20000", (ip, since)):
         key = ("web", "Web") if svc in ("http", "https") else ("decoy", (svc or "?").upper())
         items.append([ts, ts, key, {"n": 1}])
-    for ts, secs in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='tarpit' AND ts>=? LIMIT 5000", (ip, since)):
+    for ts, secs in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='tarpit' AND ts>=? ORDER BY ts DESC LIMIT 5000", (ip, since)):
         try:
             secs = max(0.0, float(secs))
         except (TypeError, ValueError):
@@ -4205,6 +4351,7 @@ def v_personas():
 # how long they stayed, how many were typed by hand, and whether the attackers were new. A release can be picked to
 # compare the days before it with the days after it.
 ENG_RANGES = (7, 14, 30)
+ENG_MAX = 200000                 # sessions per window; more are left out and the page says so
 ENG_OUTCOMES = (("left", "Left at once", "o-none"), ("proxy", "Proxy only", "o-one"), ("cmds", "Ran commands", "o-short"), ("payload", "Went for payload", "o-pay"))
 _eng_cache = {}
 
@@ -4217,11 +4364,15 @@ def eng_sessions(con, since, until):
     # Finished shell sessions that got in, started in [since, until). One dict per session, oldest first.
     rows = con.execute("SELECT s.session, s.ip, s.start, s.duration, s.tcpip, s.files, s.termsize, i.first FROM sessions s "
                        "LEFT JOIN ips i ON i.ip=s.ip WHERE s.start>=? AND s.start<? AND s.logins_ok>0 AND s.duration IS NOT NULL "
-                       "ORDER BY s.start LIMIT 200000", (since, until)).fetchall()
+                       "ORDER BY s.start LIMIT ?", (since, until, ENG_MAX + 1)).fetchall()
     cmds = {}
-    for sid, ts, a in con.execute("SELECT session, ts, a FROM events WHERE kind='cmd' AND ts>=? AND ts<? AND session IS NOT NULL",
-                                  (since, until + 86400)):
+    # Every command of the chosen sessions, however long after the start they came.
+    for sid, ts, a in con.execute("SELECT e.session, e.ts, e.a FROM sessions s JOIN events e ON e.session=s.session "
+                                  "WHERE s.start>=? AND s.start<? AND s.logins_ok>0 AND s.duration IS NOT NULL AND e.kind='cmd' "
+                                  "ORDER BY e.ts, e.rowid", (since, until)):
         cmds.setdefault(sid, []).append((ts, a or ""))
+    eng_sessions.truncated = len(rows) > ENG_MAX
+    rows = rows[:ENG_MAX]
     out = []
     for r in rows:
         c = [x for x in cmds.get(r["session"], []) if x[1].strip()]
@@ -4247,26 +4398,28 @@ def eng_summary(rows):
          "human": sum(r["human"] for r in rows)}
     for k, _l, _c in ENG_OUTCOMES:
         d[k] = sum(r["kind"] == k for r in rows)
-    durs = sorted(r["dur"] for r in rows)
-    d["median"] = durs[n // 2] if n else None
+    d["median"] = statistics.median(r["dur"] for r in rows) if n else None
     busy = [r["cmds"] for r in rows if r["cmds"]]
     d["cmds_avg"] = sum(busy) / len(busy) if busy else None
     return d
 
 
 def engagement_data(con, days, version=None):
-    key = (days, version, get_meta(con, "last_ingest", ""), con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+    key = (days, version, datetime.now(TZ).strftime("%Y-%m-%d"), get_meta(con, "last_ingest", ""),
+           con.execute("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM sessions").fetchone()[:],
+           con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0])
     if _eng_cache.get("key") == key:
         return _eng_cache["data"]
     today = datetime.now(TZ).date()
     start = day_start(today - timedelta(days=days - 1))
     rows = eng_sessions(con, start, time.time() + 1)
+    truncated = eng_sessions.truncated
     labels = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
     per = {lab: [] for lab in labels}
     for r in rows:
         if r["day"] in per:
             per[r["day"]].append(r)
-    data = {"labels": labels, "days": [(lab, eng_summary(per[lab])) for lab in labels], "total": eng_summary(rows)}
+    data = {"labels": labels, "days": [(lab, eng_summary(per[lab])) for lab in labels], "total": eng_summary(rows), "truncated": truncated}
     # Terminal sizes in the same window: every SSH session that asked for one, not only those that got in.
     sizes = {}
     asked = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND termsize IS NOT NULL", (start,)).fetchone()[0]
@@ -4342,8 +4495,9 @@ def v_engagement(qs=None):
                    for lab, r in reversed(d["days"]))
     table = ('<div class="card">%s<table class="wide etab"><thead><tr><th>Day</th><th class=num>Got in</th><th>After the login</th><th class=num>Left at once</th>'
              '<th class=num>Typed by hand</th><th class=num>Median stay</th><th class=num>Commands</th><th class=num>New / returning</th></tr></thead><tbody>%s</tbody></table>'
-             '<p class="muted small note">Finished SSH and Telnet sessions that logged in. Left at once: no command, no file, no proxy use. Commands: average per session that ran any. '
-             'New / returning: attackers first seen that day, and those seen before.</p></div>' % (leg, rows)) if t["n"] else '<div class="card">%s</div>' % none_yet("No sessions got in during these days")
+             '%s<p class="muted small note">Finished SSH and Telnet sessions that logged in. Left at once: no command, no file, no proxy use. Commands: average per session that ran any. '
+             'New / returning: attackers first seen that day, and those seen before.</p></div>'
+             % (leg, rows, ('<p class="err small">Only the first %s sessions of these days are counted.</p>' % num(ENG_MAX)) if d["truncated"] else "")) if t["n"] else '<div class="card">%s</div>' % none_yet("No sessions got in during these days")
 
     # Before / after a release
     opts = "".join('<option value="%s"%s>%s · %s</option>' % (esc(v), " selected" if v == version else "", esc(v), esc(dt)) for v, dt, _t in CHANGELOG[:20])
@@ -4595,7 +4749,7 @@ def v_files(qs=None):
             vts[sha_] = json.loads(d_)
         except ValueError:
             pass
-    fams = {sha: file_family(fi.get(sha), ev[sha]["names"] if sha in ev else "", sha) for sha in shas}
+    fams = {sha: file_family(fi.get(sha), ev[sha]["names"] if sha in ev else "", sha, vts.get(sha)) for sha in shas}
     # Chips per family (with counts) filter the list; "Unknown" are files no rule recognised yet.
     counts = {}
     for fam, _how in fams.values():
@@ -4960,7 +5114,9 @@ def v_campaign_web(con, rtype):
 def blocklist_ips(con, min_score, days, research, v6):
     since = time.time() - days * 86400
     rows = con.execute(
-        "SELECT i.ip, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 maybe "
+        "SELECT i.ip, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
+        "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,web-exploit,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,took-bait,%' "
+        "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,read-bait,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,sshole-probe,%' maybe "
         "FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
         "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=?))",
         (since, min_score)).fetchall()

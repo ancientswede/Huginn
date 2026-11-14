@@ -56,12 +56,12 @@ class MalwareBazaar(unittest.TestCase):
             body = {"query_status": "ok", "data": [{"signature": "Gafgyt", "tags": ["elf", "gafgyt"]}]} if h == sha2 else {"query_status": "hash_not_found"}
             return Resp(json.dumps(body).encode())
 
-        orig_key, orig_open = app.MB_KEY, app.urllib.request.urlopen
-        app.MB_KEY, app.urllib.request.urlopen = "test-key", fake_urlopen
+        orig_key, orig_open = app.MB_KEY, app.api_urlopen
+        app.MB_KEY, app.api_urlopen = "test-key", fake_urlopen
         try:
             n = app.mb_lookup(con, limit=50)
         finally:
-            app.MB_KEY, app.urllib.request.urlopen = orig_key, orig_open
+            app.MB_KEY, app.api_urlopen = orig_key, orig_open
         self.assertGreaterEqual(n, 1)
         self.assertTrue(all(u == "https://mb-api.abuse.ch/api/v1/" and k == "test-key" and d.startswith("query=get_info&hash=") for u, d, k in sent))
         f = con.execute("SELECT * FROM files WHERE sha=?", (sha2,)).fetchone()

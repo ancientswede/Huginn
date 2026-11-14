@@ -13,7 +13,7 @@ SHA = "c" * 64
 def clean(con):
     with con:
         con.execute("DELETE FROM files")
-        for k in ("mb_key", "mb_error"):
+        for k in ("mb_key", "mb_error", "mb_wait_until"):
             con.execute("DELETE FROM meta WHERE k=?", (k,))
 
 
@@ -29,7 +29,7 @@ class Lookup(unittest.TestCase):
 
     def run_lookup(self, answers):
         f = Fake(answers)
-        with mock.patch.object(app.urllib.request, "urlopen", f):
+        with mock.patch.object(app, "api_urlopen", f):
             return app.mb_lookup(self.con), f
 
     def test_saved_key_is_used(self):
@@ -57,7 +57,7 @@ class Lookup(unittest.TestCase):
     def test_key_test(self):
         for answer, want in (({"query_status": "hash_not_found"}, "ok"), ({"query_status": "ok", "data": []}, "ok"),
                              ({"query_status": "unknown_auth_key"}, "bad"), (401, "bad"), (429, "busy"), (500, "error")):
-            with mock.patch.object(app.urllib.request, "urlopen", Fake({"mb-api.abuse.ch": answer})):
+            with mock.patch.object(app, "api_urlopen", Fake({"mb-api.abuse.ch": answer})):
                 self.assertEqual(app.mb_test(KEY), want, answer)
 
 
@@ -96,7 +96,7 @@ class SettingsKey(unittest.TestCase):
         return r, data
 
     def post_key(self, key, answer):
-        with mock.patch.object(app.urllib.request, "urlopen", Fake({"mb-api.abuse.ch": answer})):
+        with mock.patch.object(app, "api_urlopen", Fake({"mb-api.abuse.ch": answer})):
             return self.req("POST", "/settings/malwarebazaar", urllib.parse.urlencode({"key": key}), self.hdr({"Cookie": self.cookie}))
 
     def test_save_show_remove(self):

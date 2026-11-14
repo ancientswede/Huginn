@@ -75,7 +75,7 @@ class Pages(Base):
             for sha, fam in (("a" * 64, "Mirai"), ("b" * 64, "Mirai"), ("c" * 64, "")):
                 self.con.execute("INSERT INTO files(sha, size, type, arch, packed, src, mtime, iocs, family) VALUES(?,?,?,?,?,?,?,?,?)",
                                  (sha, 100, "ELF", "arm", 0, "dl", NOW, "[]", fam))
-        with mock.patch.object(app, "file_family", lambda f, names, sha=None: ((f["family"] or "") if f else "", "rule")):
+        with mock.patch.object(app, "file_family", lambda f, names, sha=None, vt=False: ((f["family"] or "") if f else "", "rule")):
             all_ = app.v_files({})
             self.assertIn("Mirai <span class=muted>2</span>", all_)
             self.assertIn("Unknown <span class=muted>1</span>", all_)
@@ -102,6 +102,8 @@ class Pages(Base):
 
 class DecoyCap(Base):
     def test_cap_resend_and_counts(self):
+        with self.con:          # a password shape Huginn knows already: over the cap these are counted, not kept (0.36)
+            self.con.execute("INSERT OR IGNORE INTO seen(kind,key,observed,ip,session,ex,n) VALUES('pw','a',0,'',NULL,'password',1)")
         with mock.patch.object(app, "DECOY_CAP", 5):
             day = (int(NOW // 86400) - 1) * 86400 + 3600
             first = [row(A, day + i) for i in range(8)]
@@ -132,11 +134,12 @@ class DecoyCap(Base):
         with mock.patch.object(app, "DECOY_CAP", 5):
             self.assertEqual(app.trim_decoys(self.con), 1)
             kept = [r[0] for r in self.con.execute("SELECT ts FROM events WHERE ip=? ORDER BY ts", (B,))]
-            self.assertEqual(kept, [day + i for i in range(5)])            # the first ones of the day stay
-            self.assertEqual([r[0] for r in self.con.execute("SELECT h FROM webhits")], [rows[0][0]])
+            # The first ones of the day stay, and since 0.36 so does a row already classified as an attack (rows[7]).
+            self.assertEqual(kept, [day + i for i in range(5)] + [day + 7])
+            self.assertEqual(sorted(r[0] for r in self.con.execute("SELECT h FROM webhits")), sorted([rows[0][0], rows[7][0]]))
             self.assertEqual(self.con.execute("SELECT canary FROM ips WHERE ip=?", (B,)).fetchone()[0], 8)
             app.store(self.con, rows)                                       # resent after the trim: nothing comes back
-            self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE ip=?", (B,)).fetchone()[0], 5)
+            self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE ip=?", (B,)).fetchone()[0], 6)
 
 
 class Growth(Base):
