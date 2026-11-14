@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.31.0"
+HUGINN_VERSION = "0.32.0"
 CHANGELOG = [
+    ("0.32.0", "2026-11-14", "New Engagement page: sessions that got in, day by day, with what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it. Huginn now also stores the terminal size a client asks for: it shows on each session and in a table on the Engagement page."),
     ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
     ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
     ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
@@ -302,6 +303,8 @@ def init_db():
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
     if "tty" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
+    if "termsize" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN termsize TEXT")
     fcols = [r[1] for r in con.execute("PRAGMA table_info(files)")]
     for col, typ in (("family", "TEXT"), ("mb", "TEXT"), ("mb_checked", "REAL")):
         if col not in fcols:
@@ -451,6 +454,12 @@ def p_cowrie(line):
         kind, a = "version", ev.get("version")
     elif k == "cowrie.client.kex":
         kind, a = "hassh", ev.get("hassh")
+    elif k == "cowrie.client.size":
+        # The terminal size the client asked for (SSH pty request). Bots that ask often use one fixed size.
+        w, h = ev.get("width"), ev.get("height")
+        if not (type(w) is int and type(h) is int and 0 < w <= 2000 and 0 < h <= 2000):       # not bool, not float
+            return None
+        kind, a = "termsize", "%dx%d" % (w, h)
     elif k == "cowrie.log.closed":
         if not ev.get("shasum") or not ev.get("size"):
             return None
@@ -1185,7 +1194,7 @@ def recompute_session(con, sid):
         con.execute("DELETE FROM sessions WHERE session=?", (sid,))
         return
     ip, start, end = rows[0]["ip"], rows[0]["ts"], rows[-1]["ts"]
-    proto = port = version = hassh = dur = tty = None
+    proto = port = version = hassh = dur = tty = termsize = None
     lo = lf = c = f = t = x = 0
     cmds = []
     for r in rows:
@@ -1213,14 +1222,16 @@ def recompute_session(con, sid):
             hassh = a
         elif k == "tty":
             tty = a
+        elif k == "termsize":
+            termsize = a
         elif k == "closed":
             dur = float(a) if sane_duration(a) is not None else dur
     if proto is None and port is None and version:
         proto = "ssh"
     cmdhash = script_hash(cmds)
     con.execute("INSERT OR REPLACE INTO sessions(session,ip,start,end,proto,port,version,hassh,duration,logins_ok,"
-                "logins_fail,cmds,files,tcpip,exploits,cmdhash,tty) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (sid, ip, start, end, proto, port, version, hassh, dur, lo, lf, c, f, t, x, cmdhash, tty))
+                "logins_fail,cmds,files,tcpip,exploits,cmdhash,tty,termsize) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, ip, start, end, proto, port, version, hassh, dur, lo, lf, c, f, t, x, cmdhash, tty, termsize))
 
 
 def bait_flags(rows):
@@ -1898,12 +1909,17 @@ def update_badge(con):
     return ""
 
 
-def human_like(con, sid):
-    ts = [r[0] for r in con.execute("SELECT ts FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid,))]
+def human_gaps(ts):
+    # At least three commands and a median pause over two seconds between them: typed, not pasted by a script.
+    ts = sorted(ts)
     if len(ts) < 3:
         return False
     gaps = sorted(b - a for a, b in zip(ts, ts[1:]))
     return gaps[len(gaps) // 2] > 2.0
+
+
+def human_like(con, sid):
+    return human_gaps([r[0] for r in con.execute("SELECT ts FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid,))])
 
 
 def notify(con):
@@ -2494,7 +2510,7 @@ def html_attrs(st):
     return a
 
 
-NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/personas", "Personas"), ("/search", "Search"), ("/files", "Files"),
+NAV = [("/", "Overview"), ("/new", "New"), ("/ips", "Attackers"), ("/campaigns", "Campaigns"), ("/personas", "Personas"), ("/engagement", "Engagement"), ("/search", "Search"), ("/files", "Files"),
        ("/creds", "Credentials"), ("/blocklist", "Blocklist")]
 
 
@@ -2647,7 +2663,7 @@ def v_overview(qs=None):
 # the Credentials page counts as one); only the layout is different.
 
 BOARD_RANGES = {"24h": (86400, 3600, "per hour"), "7d": (7 * 86400, 4 * 3600, "per 4 hours")}
-BOARD_SKIP = ("version", "hassh", "closed", "tty", "tarpit_open")         # bookkeeping rows, not something an attacker did
+BOARD_SKIP = ("version", "hassh", "closed", "tty", "tarpit_open", "termsize")         # bookkeeping rows, not something an attacker did
 BOARD_FEED = ("login_ok", "login_fail", "cmd", "file", "file_fail", "tcpip", "exploit", "canary", "tarpit")
 BOARD_SVC = "CASE WHEN e.src='cowrie' THEN COALESCE(s.proto,'ssh') WHEN e.src='endlessh' THEN 'tarpit' ELSE COALESCE(e.a,'?') END"
 BOARD_FROM = " FROM events e LEFT JOIN sessions s ON e.src='cowrie' AND s.session=e.session WHERE e.ts>=?"
@@ -3567,6 +3583,7 @@ def v_ip(ip, qs=None):
         meta_ = '<div class="smeta">Session <span class=mono>%s</span>%s%s' % (
             esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (esc(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
             (' · script <a class=mono href="/campaign/script/%s">%s</a>' % (esc(s["cmdhash"]), esc(s["cmdhash"]))) if s["cmdhash"] else "") \
+            + ((' · terminal <span class=mono>%s</span>' % esc(s["termsize"].replace("x", "×"))) if s["termsize"] else "") \
             + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] else "")
         meta_ += "</div>"
         return ('<details class="sess" id="s-%s"><summary>%s%s</summary>%s<div class="term">%s</div></details>'
@@ -3886,6 +3903,216 @@ def v_personas():
                '<table class="wide"><thead><tr><th>Last command, example</th><th class=num>Stopped here</th><th class=num>Ran it</th><th class=num>Stop rate</th><th>Persona</th></tr></thead><tbody>%s</tbody></table>' % stops if stops else none_yet("No repeated stopping points yet"),
                '<table class="wide"><thead><tr><th>Command, example</th><th class=num>Sessions</th></tr></thead><tbody>%s</tbody></table>' % probes if probes else none_yet("No one-line sessions yet")))
     return page("Personas", body, "/personas")
+
+
+# ---------------------------------------------------------------- engagement over time (0.32)
+# Do changes to the honeypot keep attackers busier? Sessions that got in, by local day: what they did after the login,
+# how long they stayed, how many were typed by hand, and whether the attackers were new. A release can be picked to
+# compare the days before it with the days after it.
+ENG_RANGES = (7, 14, 30)
+ENG_OUTCOMES = (("left", "Left at once", "o-none"), ("proxy", "Proxy only", "o-one"), ("cmds", "Ran commands", "o-short"), ("payload", "Went for payload", "o-pay"))
+_eng_cache = {}
+
+
+def day_start(d):
+    return datetime(d.year, d.month, d.day, tzinfo=TZ).timestamp()
+
+
+def eng_sessions(con, since, until):
+    # Finished shell sessions that got in, started in [since, until). One dict per session, oldest first.
+    rows = con.execute("SELECT s.session, s.ip, s.start, s.duration, s.tcpip, s.files, s.termsize, i.first FROM sessions s "
+                       "LEFT JOIN ips i ON i.ip=s.ip WHERE s.start>=? AND s.start<? AND s.logins_ok>0 AND s.duration IS NOT NULL "
+                       "ORDER BY s.start LIMIT 200000", (since, until)).fetchall()
+    cmds = {}
+    for sid, ts, a in con.execute("SELECT session, ts, a FROM events WHERE kind='cmd' AND ts>=? AND ts<? AND session IS NOT NULL",
+                                  (since, until + 86400)):
+        cmds.setdefault(sid, []).append((ts, a or ""))
+    out = []
+    for r in rows:
+        c = [x for x in cmds.get(r["session"], []) if x[1].strip()]
+        text = [x[1] for x in c]
+        if r["files"] or any(PAYLOAD_RE.search(x) for x in text):
+            kind = "payload"
+        elif text:
+            kind = "cmds"
+        elif r["tcpip"]:
+            kind = "proxy"
+        else:
+            kind = "left"
+        day = datetime.fromtimestamp(r["start"], TZ).strftime("%Y-%m-%d")
+        first = datetime.fromtimestamp(r["first"], TZ).strftime("%Y-%m-%d") if r["first"] else day
+        out.append({"day": day, "ip": r["ip"], "kind": kind, "dur": r["duration"] or 0.0, "cmds": len(text),
+                    "human": human_gaps([x[0] for x in c]), "new": first >= day, "size": r["termsize"]})
+    return out
+
+
+def eng_summary(rows):
+    n = len(rows)
+    d = {"n": n, "ips": len({r["ip"] for r in rows}), "new_ips": len({r["ip"] for r in rows if r["new"]}),
+         "human": sum(r["human"] for r in rows)}
+    for k, _l, _c in ENG_OUTCOMES:
+        d[k] = sum(r["kind"] == k for r in rows)
+    durs = sorted(r["dur"] for r in rows)
+    d["median"] = durs[n // 2] if n else None
+    busy = [r["cmds"] for r in rows if r["cmds"]]
+    d["cmds_avg"] = sum(busy) / len(busy) if busy else None
+    return d
+
+
+def engagement_data(con, days, version=None):
+    key = (days, version, get_meta(con, "last_ingest", ""), con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+    if _eng_cache.get("key") == key:
+        return _eng_cache["data"]
+    today = datetime.now(TZ).date()
+    start = day_start(today - timedelta(days=days - 1))
+    rows = eng_sessions(con, start, time.time() + 1)
+    labels = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
+    per = {lab: [] for lab in labels}
+    for r in rows:
+        if r["day"] in per:
+            per[r["day"]].append(r)
+    data = {"labels": labels, "days": [(lab, eng_summary(per[lab])) for lab in labels], "total": eng_summary(rows)}
+    # Terminal sizes in the same window: every SSH session that asked for one, not only those that got in.
+    sizes = {}
+    asked = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND termsize IS NOT NULL", (start,)).fetchone()[0]
+    shells = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND cmds>0 AND proto='ssh'", (start,)).fetchone()[0]
+    sized = con.execute("SELECT COUNT(*) FROM sessions WHERE start>=? AND cmds>0 AND proto='ssh' AND termsize IS NOT NULL", (start,)).fetchone()[0]
+    hum = {r["ip"] for r in rows if r["human"]}
+    for size, sid, ip, c in con.execute("SELECT termsize, session, ip, cmds FROM sessions WHERE start>=? AND termsize IS NOT NULL LIMIT 50000", (start,)):
+        x = sizes.setdefault(size, {"size": size, "n": 0, "ips": set(), "cmds": 0, "human_ips": set()})
+        x["n"] += 1
+        x["ips"].add(ip)
+        x["cmds"] += 1 if c else 0
+        if ip in hum:
+            x["human_ips"].add(ip)
+    data["sizes"] = sorted(({"size": v["size"], "n": v["n"], "ips": len(v["ips"]), "cmds": v["cmds"], "human_ips": len(v["human_ips"])}
+                            for v in sizes.values()), key=lambda v: (-v["n"], v["size"]))[:30]
+    data["asked"], data["shells"], data["sized"] = asked, shells, sized
+    # Before and after a release: up to 7 whole days on each side, the release day itself left out.
+    data["cmp"] = None
+    rel = {v: dt for v, dt, _t in CHANGELOG}
+    if version in rel:
+        vday = datetime.strptime(rel[version], "%Y-%m-%d").date()
+        after_days = max(0, min(7, (today - vday).days - 1))
+        span = max(after_days, 1)
+        before = eng_sessions(con, day_start(vday - timedelta(days=span)), day_start(vday))
+        after = eng_sessions(con, day_start(vday + timedelta(days=1)), day_start(vday + timedelta(days=1 + after_days))) if after_days else []
+        data["cmp"] = {"version": version, "date": rel[version], "days": after_days, "before": eng_summary(before), "after": eng_summary(after)}
+    _eng_cache.update(key=key, data=data)
+    return data
+
+
+def eng_pct(a, b):
+    return "%d%%" % round(a * 100.0 / b) if b else "–"
+
+
+def v_engagement(qs=None):
+    qs = qs or {}
+    try:
+        days = int(qs.get("days", 14))
+    except (TypeError, ValueError):
+        days = 14
+    days = days if days in ENG_RANGES else 14
+    version = qs.get("v") or None
+    versions = [v for v, _d, _t in CHANGELOG][:20]
+    version = version if version in versions else None
+    d = engagement_data(db(), days, version)
+    t = d["total"]
+    link = lambda n: "/engagement?" + urllib.parse.urlencode(dict({"days": n}, **({"v": version} if version else {})))
+    chips = '<div class="chips">%s</div>' % "".join('<a class="chip%s" href="%s">%d days</a>' % (" on" if n == days else "", esc(link(n)), n) for n in ENG_RANGES)
+
+    def dist(r):
+        if not r["n"]:
+            return "<span class=muted>Nobody got in</span>"
+        bar = "".join('<i class="%s p%d" title="%s: %s"></i>' % (c, max(1, round(r[k] * 100.0 / r["n"])), esc(lab), num(r[k])) for k, lab, c in ENG_OUTCOMES if r[k])
+        return '<div class="dist" role="img" aria-label="What they did after the login">%s</div>' % bar
+
+    leg = '<div class="dleg">%s</div>' % "".join('<span><i class="%s"></i>%s <b>%s</b></span>' % (c, esc(lab), num(t[k])) for k, lab, c in ENG_OUTCOMES)
+    kpis = [("Got in", num(t["n"]), "%s attackers" % num(t["ips"])),
+            ("Left at once", eng_pct(t["left"], t["n"]), "logged in, then nothing"),
+            ("Ran commands", eng_pct(t["cmds"] + t["payload"], t["n"]), "%s went for a payload" % num(t["payload"])),
+            ("Typed by hand", num(t["human"]), "human-like sessions"),
+            ("Median stay", esc(dur(t["median"])) if t["median"] is not None else "–", "per session that got in"),
+            ("New attackers", eng_pct(t["new_ips"], t["ips"]), "first seen that day")]
+    kp = '<div class="kpis">%s</div>' % "".join('<div class="kpi"><div class="kpi-l">%s</div><div class="kpi-v">%s</div><div class="kpi-s">%s</div></div>'
+                                                 % (esc(a), b, esc(c)) for a, b, c in kpis)
+    chart = ('<div class="card"><h3>Sessions that got in, per day</h3>%s<div class="axis"><span>%s</span><span>today</span></div></div>'
+             % (bars([x[1]["n"] for x in d["days"]], d["labels"], 60, partial_last=True), esc(d["labels"][0])))
+    cell = lambda v, label: "<td class='num nw' data-l='%s'>%s</td>" % (esc(label), v)
+    rows = "".join("<tr><td class=nw>%s</td>%s<td class=pb>%s</td>%s%s%s%s%s</tr>"
+                   % (esc(lab), cell(num(r["n"]), "Got in"), dist(r), cell(eng_pct(r["left"], r["n"]), "Left at once"),
+                      cell(num(r["human"]) if r["n"] else "–", "Typed by hand"), cell(esc(dur(r["median"])) if r["median"] is not None else "–", "Median stay"),
+                      cell(("%.1f" % r["cmds_avg"]) if r["cmds_avg"] else "–", "Commands"),
+                      cell(("%s / %s" % (num(r["new_ips"]), num(r["ips"] - r["new_ips"]))) if r["ips"] else "–", "New / returning"))
+                   for lab, r in reversed(d["days"]))
+    table = ('<div class="card">%s<table class="wide etab"><thead><tr><th>Day</th><th class=num>Got in</th><th>After the login</th><th class=num>Left at once</th>'
+             '<th class=num>Typed by hand</th><th class=num>Median stay</th><th class=num>Commands</th><th class=num>New / returning</th></tr></thead><tbody>%s</tbody></table>'
+             '<p class="muted small note">Finished SSH and Telnet sessions that logged in. Left at once: no command, no file, no proxy use. Commands: average per session that ran any. '
+             'New / returning: attackers first seen that day, and those seen before.</p></div>' % (leg, rows)) if t["n"] else '<div class="card">%s</div>' % none_yet("No sessions got in during these days")
+
+    # Before / after a release
+    opts = "".join('<option value="%s"%s>%s · %s</option>' % (esc(v), " selected" if v == version else "", esc(v), esc(dt)) for v, dt, _t in CHANGELOG[:20])
+    form = ('<form class="filters" method=get action="/engagement"><input type=hidden name=days value="%d"><select name=v aria-label="Release">'
+            '<option value="">Pick a release</option>%s</select><button>Compare</button></form>' % (days, opts))
+    cmp_html = ""
+    c = d["cmp"]
+    if c and not c["days"]:
+        cmp_html = '<p class=muted>%s is from %s: there is no whole day after it yet.</p>' % (esc(c["version"]), esc(c["date"]))
+    elif c:
+        b, a = c["before"], c["after"]
+        def line(label, fb, fa, better_up=True, kind="pct"):
+            if fb is None or fa is None:
+                return "<tr><td>%s</td><td class=num>–</td><td class=num>–</td><td class=num>–</td></tr>" % esc(label)
+            if kind == "pct":
+                vb, va, show = fb, fa, lambda v: "%d%%" % round(v)
+                diff = "%+d points" % round(va - vb)
+            elif kind == "dur":
+                vb, va, show = fb, fa, lambda v: dur(v)
+                diff = ("%+d%%" % round((va - vb) * 100.0 / vb)) if vb else "–"
+            else:
+                vb, va, show = fb, fa, lambda v: ("%.1f" % v) if isinstance(v, float) else num(v)
+                diff = ("%+d%%" % round((va - vb) * 100.0 / vb)) if vb else ("%+d" % round(va) if va else "–")
+            good = (va > vb) == better_up if va != vb and better_up is not None else None
+            cls = "" if good is None else (" t-green" if good else " t-red")
+            return "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class='num%s'>%s</td></tr>" % (esc(label), esc(show(vb)), esc(show(va)), cls, esc(diff))
+        per_day = lambda x: x["n"] / float(c["days"])
+        sh = lambda x, k: (x[k] * 100.0 / x["n"]) if x["n"] else None
+        ran = lambda x: ((x["cmds"] + x["payload"]) * 100.0 / x["n"]) if x["n"] else None
+        new_share = lambda x: (x["new_ips"] * 100.0 / x["ips"]) if x["ips"] else None
+        body_rows = "".join([
+            line("Got in, per day", per_day(b), per_day(a), None, "n"),
+            line("Left at once", sh(b, "left"), sh(a, "left"), False),
+            line("Proxy only", sh(b, "proxy"), sh(a, "proxy"), False),
+            line("Ran commands", ran(b), ran(a), True),
+            line("Went for payload", sh(b, "payload"), sh(a, "payload"), True),
+            line("Typed by hand", b["human"], a["human"], True, "n"),
+            line("Median stay", b["median"], a["median"], True, "dur"),
+            line("Commands per busy session", b["cmds_avg"], a["cmds_avg"], True, "n"),
+            line("New attackers", new_share(b), new_share(a), None)])
+        few = '<p class="muted small note">Few sessions on one side (under 30): read the change with care.</p>' if min(b["n"], a["n"]) < 30 else ""
+        cmp_html = ('<p class=muted>%d whole days before %s (%s) against %d whole days after it. The release day itself is left out. '
+                    'Other things change too (new botnets, quiet weekends), so this is a hint, not proof.</p>'
+                    '<table class="wide"><thead><tr><th>Measure</th><th class=num>Before (%s)</th><th class=num>After (%s)</th><th class=num>Change</th></tr></thead><tbody>%s</tbody></table>%s'
+                    % (c["days"], esc(c["version"]), esc(c["date"]), c["days"], num(b["n"]), num(a["n"]), body_rows, few))
+
+    # Terminal sizes
+    if d["sizes"]:
+        srows = "".join("<tr><td class=mono>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td></tr>"
+                        % (esc(x["size"].replace("x", "×")), num(x["n"]), num(x["ips"]), num(x["cmds"]), num(x["human_ips"]) if x["human_ips"] else "<span class=muted>–</span>")
+                        for x in d["sizes"])
+        sizes = ('<p class=muted>%s of %s SSH sessions with commands asked for a terminal (%s sessions asked in all). Scripts usually run commands without one, '
+                 'and a bot that asks tends to use the same size every time; a person\'s window size varies.</p>'
+                 '<table class="wide"><thead><tr><th>Size</th><th class=num>Sessions</th><th class=num>Attackers</th><th class=num>With cmds</th>'
+                 '<th class=num title="Attackers with a session that looks typed by hand">By hand</th></tr></thead><tbody>%s</tbody></table>'
+                 % (num(d["sized"]), num(d["shells"]), num(d["asked"]), srows))
+    else:
+        sizes = none_yet("No session asked for a terminal size in these days")
+
+    body = ('<h1>Engagement</h1><p class=muted>How far attackers get once they are in, day by day, and how that changes after a release. Times are %s.</p>%s%s%s%s'
+            '<h2>Before and after a release</h2><div class="card">%s%s</div>'
+            '<h2>Terminal sizes</h2><div class="card">%s</div>'
+            % (esc(str(TZ)), chips, kp, chart, table, form, cmp_html, sizes))
+    return page("Engagement", body, "/engagement")
 
 
 SEARCH_ROWS = 50
@@ -4908,7 +5135,7 @@ copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copi
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
 (function(){
-var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g p','Personas'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
+var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g p','Personas'],['g e','Engagement'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
 ['/','Search / filter'],['t','Switch theme'],['Space','Play / pause a replay'],['?','This help'],['Esc','Close']];
 var box=null;function hide(){if(box){box.remove();box=null}}
 function show(){if(box){hide();return}box=document.createElement('div');box.className='kbd-help';var c=document.createElement('div');c.className='card';
@@ -4916,7 +5143,7 @@ var h=document.createElement('h3');h.textContent='Keyboard shortcuts';c.appendCh
 var a=document.createElement('kbd');a.textContent=k[0];var b=document.createElement('span');b.textContent=k[1];r.appendChild(a);r.appendChild(b);c.appendChild(r)});
 box.appendChild(c);box.addEventListener('click',function(e){if(e.target===box)hide()});document.body.appendChild(box)}
 var hb=document.getElementById('kbdHelp');if(hb)hb.addEventListener('click',function(e){e.preventDefault();show()});
-var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',p:'/personas',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
+var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',p:'/personas',e:'/engagement',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
 document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.metaKey||e.altKey)return;
 if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
 var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
@@ -5089,6 +5316,9 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         "@media (max-width:800px){[data-h]{display:none}.m-row{display:table-row}.m-row td{padding:0 8px 7px}.m-row td:empty{display:none}tr:has(+.m-row) td{border-bottom:0}.top5 tbody tr:nth-child(n+11){display:none}h1.ip-title{font-size:22px}"
         ".ptab thead{display:none}.ptab tr{display:grid;grid-template-columns:1fr auto auto;gap:6px 14px;padding:10px 0;border-bottom:1px solid var(--line)}.ptab tr:last-child{border:0}.ptab td{border:0;padding:0}"
         ".ptab td.pb{grid-column:1/-1;grid-row:2;min-width:0;width:auto}.ptab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}.ptab td[data-l='Payload share']{grid-column:1/-1;grid-row:3;text-align:left}"
+        ".etab thead{display:none}.etab tr{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px;padding:10px 0;border-bottom:1px solid var(--line)}.etab tr:last-child{border:0}"
+        ".etab td{border:0;padding:0}.etab td.num{text-align:left}.etab td:first-child{flex:1 0 auto;font-weight:600}.etab td.pb{flex:1 0 100%;min-width:0;width:auto;order:1}.etab td.pb~td{order:2}"
+        ".etab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}"
         ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
 CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
 # 0.28: wide screens (2K) get three columns on the Overview (dense, so a wide card never leaves a hole) and two on Campaigns.
@@ -5325,6 +5555,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_new(qs))
         if path == "/personas":
             return self.send(200, v_personas())
+        if path == "/engagement":
+            return self.send(200, v_engagement(qs))
         if path == "/receipt":
             return self.send(200, v_receipt(qs))
         if path == "/search":
