@@ -1,0 +1,11 @@
+# Add under scrape_configs in prometheus.yml. Turn metrics on in Huginn first (Settings > Metrics), which also shows
+# this job with your own address and token filled in. Or keep the token in a file instead of in prometheus.yml:
+#   authorization:
+#     credentials_file: /etc/prometheus/huginn.token
+- job_name: huginn
+  scrape_interval: 60s
+  metrics_path: /metrics
+  authorization:
+    credentials: PASTE-THE-TOKEN-FROM-SETTINGS
+  static_configs:
+    - targets: ['huginn.lan:8095']

@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.37.0"
+HUGINN_VERSION = "0.38.0"
 CHANGELOG = [
+    ("0.38.0", "2026-11-14", "Metrics for Prometheus and Grafana, off until you turn them on in Settings: events per decoy service, attackers, sessions, blocklist size, sync health and lookup allowances, read with a token. Counts only, never addresses or anything an attacker typed. A ready Grafana dashboard is in examples/grafana. Logs can be JSON for Loki (HUGINN_LOG_FORMAT=json): syncs, collection problems, logins, failed backups and every new error."),
     ("0.37.0", "2026-11-14", "A GreyNoise key can be saved on the Settings page, like the VirusTotal and MalwareBazaar keys. It is tested without using a lookup and never shown again. Without a key Huginn now asks at most 20 addresses a day, under the free allowance; with one, 40."),
     ("0.36.0", "2026-11-14", "Fixes from a deep security and bug review. The decoy cap never drops a web attack, a bait hit or a login with a new kind of password, and knows rows by their content, so two hits at the same second both count and a resent line is never counted twice. A pasted chmod line can no longer make the attacker page slow. Lookups never follow redirects, so a key only ever goes to its own service. A changed GreyNoise answer takes the research mark off again, and web exploits or bait use always keep an attacker on the blocklist. A collection source that stopped stays alerted for 30 days instead of two. MalwareBazaar copes with odd answers and pauses on a refused key. Engagement counts late commands of long sessions and uses a true median; the timeline always shows the newest activity; Files is faster."),
     ("0.35.0", "2026-11-14", "New Help page (link in the header, or g h): what every attacker tag, session badge, file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it."),
@@ -165,6 +166,43 @@ VT_DAILY = max(0, min(500, int(os.environ.get("HUGINN_VIRUSTOTAL_DAILY", "400") 
 # HUGINN_GREYNOISE_DAILY unset: 20 a day without a key, 40 with one (a key can also be saved on the Settings page).
 GN_KEY = os.environ.get("HUGINN_GREYNOISE_KEY", "")
 GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if os.environ.get("HUGINN_GREYNOISE_DAILY", "").strip() else -1
+
+# Logging to stderr (journald): "text" (default) or "json", one object per line, for Loki and the like.
+LOG_FORMAT = "json" if os.environ.get("HUGINN_LOG_FORMAT", "").strip().lower() == "json" else "text"
+LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40}
+LOG_LEVEL = LOG_LEVELS.get(os.environ.get("HUGINN_LOG_LEVEL", "").strip().lower(), 20 if LOG_FORMAT == "json" else 30)
+# Prometheus metrics on /metrics: off unless turned on in Settings, or a token is given here (16+ characters).
+METRICS_TOKEN = os.environ.get("HUGINN_METRICS_TOKEN", "").strip()
+METRICS_TOKEN = METRICS_TOKEN if re.fullmatch(r"[A-Za-z0-9_.~+/=-]{16,128}", METRICS_TOKEN) else ""
+_log_lock = threading.Lock()
+
+
+def _log_text(v):
+    # Attacker text can end up in a log line: no control characters, so it can never start a line of its own.
+    return re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", lambda m: "\\x%02x" % ord(m.group(0)) if ord(m.group(0)) < 256 else "\\u%04x" % ord(m.group(0)), str(v))[:2000]
+
+
+def log(level, event, msg="", **fields):
+    # One line per event. JSON: {"ts", "level", "app", "event", "msg", ...fields}. Never pass secrets in here.
+    if LOG_LEVELS.get(level, 20) < LOG_LEVEL:
+        return
+    if LOG_FORMAT == "json":
+        d = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), "level": level,
+             "app": "huginn", "event": event}
+        if msg:
+            d["msg"] = str(msg)[:2000]
+        for k, v in fields.items():
+            d[k] = v if isinstance(v, (int, float, bool)) or v is None else str(v)[:2000]
+        line = json.dumps(d, ensure_ascii=True)
+    else:
+        line = "%s %s%s%s" % (level.upper(), event, (": " + _log_text(msg)) if msg else "",
+                              "".join(" %s=%s" % (k, _log_text(v)) for k, v in fields.items()))
+    with _log_lock:
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
 
 
 def ntfy_post(body, title, prio=3):
@@ -362,6 +400,13 @@ def get_meta(con, k, default=None):
 
 
 def set_meta(con, k, v):
+    if k.endswith("_error") and v and LOG_LEVEL <= 30:
+        # Every "last error" Huginn keeps for its pages is logged once when it changes.
+        try:
+            if get_meta(con, k) != str(v):
+                log("warning", k, str(v))
+        except sqlite3.Error:
+            pass
     with con:
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, str(v)))
 
@@ -1724,12 +1769,14 @@ def store(con, rows):
         before = con.total_changes
         con.executemany("INSERT OR IGNORE INTO events(h,ts,ip,src,kind,session,a,b) VALUES(?,?,?,?,?,?,?,?)", rows)
         inserted = con.total_changes - before
+        if inserted:
+            count_events(con, top)
         for fn, keys in ((recompute_session, sess), (recompute_ip, ips)):
             for k in keys:
                 try:
                     fn(con, k)
                 except (ValueError, TypeError, OverflowError, sqlite3.Error) as e:
-                    sys.stderr.write("recompute %s: %r\n" % (k, e))
+                    log("error", "recompute", repr(e), key=k)
     try:
         note_seen(con, None)
     except Exception as e:                 # never let the "New" page get in the way of collecting data
@@ -1737,6 +1784,32 @@ def store(con, rows):
             con.rollback()
         set_meta(con, "last_seen_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
     return inserted
+
+
+METRIC_SVC_RE = re.compile(r"[a-z0-9_-]{1,20}")
+
+
+def metric_svc(src, a):
+    # The decoy service of an OpenCanary or trap row (vnc, http, smtp...); nothing for Cowrie. Odd values become "other".
+    if src not in ("canary", "traps"):
+        return ""
+    return a if isinstance(a, str) and METRIC_SVC_RE.fullmatch(a) else "other"
+
+
+def count_events(con, top):
+    # Running totals per source, kind and decoy service for /metrics, kept in meta so a restart does not reset them.
+    # Called inside store()'s transaction, so it writes with execute and never commits on its own.
+    try:
+        tot = json.loads(get_meta(con, "metric_totals", "{}") or "{}")
+        tot = tot if isinstance(tot, dict) else {}
+    except ValueError:
+        tot = {}
+    for src, kind, a, n in con.execute("SELECT src, kind, CASE WHEN src IN ('canary','traps') THEN a END, COUNT(*) FROM events "
+                                       "WHERE rowid>? GROUP BY 1, 2, 3", (top,)):
+        k = "%s|%s|%s" % (src, kind, metric_svc(src, a))
+        if len(tot) < 500 or k in tot:            # a hard limit on series, whatever a broken export sends
+            tot[k] = int(tot.get(k, 0)) + n
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('metric_totals',?)", (json.dumps(tot),))
 
 
 def utc_day(ts):
@@ -2150,6 +2223,10 @@ def health_check(con, now=None):
         alerted = {}
     new = sorted(k for k in issues if k not in alerted)
     back = sorted(k for k in alerted if k not in issues)
+    for k in new:
+        log("warning", "collection_problem", issues[k], check=k)
+    for k in back:
+        log("info", "collection_back", health_label(k), check=k)
     if NTFY_URL and settings(con)["notify"]:
         if new:
             ntfy_post("\n".join(issues[k] for k in new), "Huginn: collection problem", 4)
@@ -2266,6 +2343,7 @@ def collector_loop():
             set_meta(con, "last_ingest_new", n)
             set_meta(con, "last_ingest_secs", round(time.time() - t0, 1))
             set_meta(con, "last_error", "")
+            log("info", "sync", new=n, rows=len(rows), files=len(parse_export.files), secs=round(time.time() - t0, 1))
             set_meta(con, "last_export_warn", ", ".join(parse_export.meta["warnings"])[:200])
         except Exception as e:
             set_meta(con, "last_error", "%s %s" % (fmt_ts(time.time()), str(e)[:300]))
@@ -2595,12 +2673,12 @@ def backup_once(con):
     except Exception as e:
         msg = "%s %s" % (fmt_ts(now), str(e)[:200])
         set_meta(con, "backup_error", msg)
-        sys.stderr.write("database backup: %s\n" % msg)
+        log("error", "backup_failed", msg)
         try:
             if NTFY_URL and settings(con)["notify"]:
                 ntfy_post("Database backup failed: %s" % str(e)[:200], "Huginn: backup failed", 4)
         except Exception as e2:
-            sys.stderr.write("ntfy: %r\n" % e2)
+            log("warning", "ntfy_failed", repr(e2))
         return False
 
 
@@ -2612,7 +2690,7 @@ def backup_loop():
             if backup_due(con, time.time()):
                 backup_once(con)
         except Exception as e:
-            sys.stderr.write("backup loop: %r\n" % e)
+            log("error", "backup_loop", repr(e))
         time.sleep(600)
 
 
@@ -5263,6 +5341,141 @@ FEEDS = [("txt", "Plain list", "One IP per line. OPNsense/pfSense URL Table alia
          ("csv", "CSV", "IP with score, last seen, country and tags. CrowdSec: cscli decisions import -i huginn.csv")]
 
 
+def metrics_token(con):
+    # The token Prometheus must send, or "" while metrics are off. HUGINN_METRICS_TOKEN wins over Settings.
+    if METRICS_TOKEN:
+        return METRICS_TOKEN
+    if get_meta(con, "metrics_on") != "1":
+        return ""
+    return get_meta(con, "metrics_token", "") or ""
+
+
+def _mlabel(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+_metrics_cache = {"at": 0, "text": ""}
+_metrics_lock = threading.Lock()
+
+
+def metrics_text(con, now=None):
+    # Prometheus text format. Counts only: no addresses, names or anything an attacker typed (a label per attacker would
+    # also make one time series per address). Kept for 15 s so several scrapers cost one set of queries.
+    now = now or time.time()
+    with _metrics_lock:
+        if now - _metrics_cache["at"] < 15 and _metrics_cache["text"]:
+            return _metrics_cache["text"]
+        t0 = time.time()
+        out = []
+
+        def metric(name, kind, help_, samples):
+            out.append("# HELP huginn_%s %s\n# TYPE huginn_%s %s\n" % (name, help_, name, kind))
+            for labels, v in samples:
+                lab = ",".join('%s="%s"' % (k, _mlabel(x)) for k, x in labels.items())
+                out.append("huginn_%s%s %s\n" % (name, "{%s}" % lab if lab else "", repr(float(v)) if isinstance(v, float) else int(v)))
+
+        metric("info", "gauge", "Huginn version.", [({"version": HUGINN_VERSION}, 1)])
+        try:
+            tot = json.loads(get_meta(con, "metric_totals", "{}") or "{}")
+        except ValueError:
+            tot = {}
+        samples = []
+        for k, n in sorted(tot.items() if isinstance(tot, dict) else []):
+            src, _, rest = k.partition("|")
+            kind, _, svc = rest.partition("|")
+            samples.append(({"source": src, "kind": kind, "service": svc}, int(n) if isinstance(n, int) else 0))
+        metric("events_ingested_total", "counter", "Events stored since metrics were added, by source, kind and decoy service.", samples)
+        samples = [({"source": src, "kind": kind, "service": metric_svc(src, a)}, n) for src, kind, a, n in con.execute(
+            "SELECT src, kind, CASE WHEN src IN ('canary','traps') THEN a END, COUNT(*) FROM events WHERE ts>=? GROUP BY 1, 2, 3", (now - 86400,))]
+        merged = {}
+        for lab, n in samples:
+            key = tuple(sorted(lab.items()))
+            merged[key] = merged.get(key, 0) + n
+        metric("events_last_24h", "gauge", "Events in the last 24 hours, by source, kind and decoy service.", [(dict(k), n) for k, n in sorted(merged.items())])
+        metric("events_stored", "gauge", "Events in the database.", [({}, con.execute("SELECT COUNT(*) FROM events").fetchone()[0])])
+        metric("attackers", "gauge", "Addresses active within the window.",
+               [({"window": w}, con.execute("SELECT COUNT(*) FROM ips WHERE last>=?", (now - sec,)).fetchone()[0])
+                for w, sec in (("1h", 3600), ("24h", 86400), ("7d", 7 * 86400), ("30d", 30 * 86400))])
+        metric("attackers_new", "gauge", "Addresses first seen within the window.",
+               [({"window": w}, con.execute("SELECT COUNT(*) FROM ips WHERE first>=?", (now - sec,)).fetchone()[0])
+                for w, sec in (("24h", 86400), ("7d", 7 * 86400))])
+        metric("sessions_last_24h", "gauge", "SSH and Telnet sessions in the last 24 hours, and how many logged in.",
+               [({"proto": p or "unknown", "logged_in": "yes" if ok else "no"}, n) for p, ok, n in con.execute(
+                   "SELECT proto, logins_ok>0, COUNT(*) FROM sessions WHERE start>=? GROUP BY 1, 2", (now - 86400,))
+                if p in (None, "ssh", "telnet")])
+        metric("files_captured", "gauge", "Captured files in the database.", [({}, con.execute("SELECT COUNT(*) FROM files").fetchone()[0])])
+        st = settings(con)
+        metric("blocklist_entries", "gauge", "Addresses on the blocklist with the Settings defaults.",
+               [({}, len(blocklist_ips(con, int(st["bl_min"]), int(st["bl_days"]), False, True)))])
+        metric("decoy_dropped_today", "gauge", "Repeated decoy tries counted but not stored today (UTC), by service.",
+               [({"service": metric_svc("canary", svc)}, n or 0) for svc, n in con.execute(
+                   "SELECT svc, SUM(dropped) FROM capped WHERE day=? GROUP BY svc", (utc_day(now),))])
+        li = float(get_meta(con, "last_ingest", "0") or 0)
+        metric("last_sync_timestamp_seconds", "gauge", "When the last sync with the honeypot finished well (Unix time).", [({}, li)])
+        metric("last_sync_duration_seconds", "gauge", "How long the last sync took.", [({}, float(get_meta(con, "last_ingest_secs", "0") or 0))])
+        metric("last_sync_new_events", "gauge", "New events in the last sync.", [({}, int(float(get_meta(con, "last_ingest_new", "0") or 0)))])
+        metric("sync_error", "gauge", "1 if the last sync failed.", [({}, 1 if (get_meta(con, "last_error", "") or "").strip() else 0)])
+        try:
+            problems = json.loads(get_meta(con, "health_now", "{}") or "{}")
+        except ValueError:
+            problems = {}
+        problems = problems if isinstance(problems, dict) else {}
+        metric("collection_problems", "gauge", "Collection problems right now (see Account).", [({}, len(problems))])
+        metric("collection_problem", "gauge", "1 for each check that has a problem right now.",
+               [({"check": k[:40]}, 1) for k in sorted(problems)[:50]])
+        lk = []
+        for svc, budget, daily, key_set, err, wait in (
+                ("virustotal", "vt_day", VT_DAILY, bool(vt_key(con)), "vt_error", "vt_wait_until"),
+                ("greynoise", "gn_day", gn_daily(con), bool(gn_key(con)), "gn_error", "gn_wait_until"),
+                ("malwarebazaar", None, 0, bool(mb_key(con)), "mb_error", "mb_wait_until")):
+            used = day_budget(con, budget, daily)[2] if budget else 0
+            paused = float(get_meta(con, wait, "0") or 0) > now
+            lk.append((svc, used, daily, key_set, 1 if (get_meta(con, err, "") or "").strip() else 0, paused))
+        metric("lookups_used_today", "gauge", "Outside lookups made today (UTC).", [({"service": x[0]}, x[1]) for x in lk if x[0] != "malwarebazaar"])
+        metric("lookups_daily_limit", "gauge", "Most lookups Huginn makes a day.", [({"service": x[0]}, x[2]) for x in lk if x[0] != "malwarebazaar"])
+        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk])
+        metric("lookup_error", "gauge", "1 if the last lookup failed.", [({"service": x[0]}, x[4]) for x in lk])
+        metric("lookup_paused", "gauge", "1 while lookups are paused (allowance used up or refused key).", [({"service": x[0]}, 1 if x[5] else 0) for x in lk])
+        size = sum(os.path.getsize(DB_PATH + x) for x in ("", "-wal") if os.path.exists(DB_PATH + x))
+        metric("database_bytes", "gauge", "Size of the database and its write-ahead log.", [({}, size)])
+        metric("backup_last_timestamp_seconds", "gauge", "When the last database backup was made (Unix time, 0 = never).",
+               [({}, float(get_meta(con, "backup_last", "0") or 0))])
+        metric("metrics_duration_seconds", "gauge", "Time taken to build these metrics.", [({}, round(time.time() - t0, 4))])
+        _metrics_cache["at"], _metrics_cache["text"] = now, "".join(out)
+        return _metrics_cache["text"]
+
+
+def metrics_card():
+    # Settings: Prometheus metrics on or off, the address and token, and an example job.
+    con = db()
+    tok = metrics_token(con)
+    base = getattr(_local, "base", "") or "http://huginn:8095"
+    if METRICS_TOKEN:
+        state, buttons = "On, with the token from HUGINN_METRICS_TOKEN in .env.", ""
+    elif tok:
+        state = "On."
+        buttons = ('<form method=post action="/settings/metrics" class="inline"><input type=hidden name=on value=0><button class="btn-s">Turn off</button></form> '
+                   '<form method=post action="/settings/metrics/token" class="inline"><button class="btn-s">New token</button></form>')
+    else:
+        state = "Off. Nothing is served on /metrics."
+        buttons = '<form method=post action="/settings/metrics" class="inline"><input type=hidden name=on value=1><button>Turn on</button></form>'
+    detail = ""
+    if tok and not METRICS_TOKEN:
+        u = urllib.parse.urlsplit(base)
+        job = ("- job_name: huginn\n  scheme: %s\n  metrics_path: /metrics\n  authorization:\n    credentials: %s\n  static_configs:\n    - targets: ['%s']"
+               % (u.scheme or "http", tok, u.netloc or "huginn:8095"))
+        detail = ('<div class="feed"><div class="feed-h"><b>Address</b><button class="btn-s" data-copy="%s/metrics">Copy</button></div><div class="mono url">%s/metrics</div></div>'
+                  '<div class="feed"><div class="feed-h"><b>Token</b> <span class="muted small">sent as Authorization: Bearer</span><button class="btn-s" data-copy="%s">Copy token</button></div>'
+                  '<div class="mono url">••••%s</div></div>'
+                  '<div class="feed"><div class="feed-h"><b>Prometheus job</b><button class="btn-s" data-copy="%s">Copy</button></div>'
+                  '<div class="mono url small">%s</div></div>'
+                  % (esc(base), esc(base), esc(tok), esc(tok[-4:]), esc(job), esc(job.replace(tok, "••••")).replace("\n", "<br>")))
+    return ('<div class="card"><h3>Metrics</h3><p>Counts for Prometheus and Grafana: events per decoy, attackers, sessions, blocklist size, '
+            'sync health and lookup allowances. No addresses or anything attackers typed. A ready dashboard is in '
+            '<span class=mono>examples/grafana</span> in the source.</p><p class="muted small">%s Logs: HUGINN_LOG_FORMAT=json gives one JSON object per line '
+            'for Loki (now: %s).</p>%s%s</div>' % (esc(state), esc(LOG_FORMAT), detail, buttons))
+
+
 def base_url(h):
     host = h.headers.get("Host") or ("%s:%d" % (BIND, PORT))
     proto = "http"
@@ -5456,7 +5669,8 @@ def v_settings(ok="", err=""):
            "mbbusy": "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own.",
            "mbdel": "MalwareBazaar key removed.", "gn": "GreyNoise key saved. It works.",
            "gnbusy": "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own.",
-           "gndel": "GreyNoise key removed."}.get(ok, "")
+           "gndel": "GreyNoise key removed.", "mon": "Metrics are on. Add the job below to Prometheus.",
+           "moff": "Metrics are off.", "mtok": "New metrics token. Update it in Prometheus."}.get(ok, "")
     note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
     note += ('<p class="err">%s</p>' % esc(err)) if err else ""
     accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
@@ -5496,7 +5710,7 @@ def v_settings(ok="", err=""):
                ntfy_line, check("notify", "1", "Send ntfy notifications", st["notify"]),
                "".join(check("notify_events", k, l, k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
                "" if NTFY_URL else " disabled"))
-    return page("Settings", body + lookups_card(), "/settings")
+    return page("Settings", body + lookups_card() + metrics_card(), "/settings")
 
 
 def lookups_card():
@@ -6058,7 +6272,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.route_get()
         except Exception as e:
-            sys.stderr.write("GET %s: %r\n" % (self.path, e))
+            log("error", "http_error", repr(e), method="GET", path=self.path[:300])
             self.close_connection = True
             self.send(500, "Internal error", "text/plain")
         finally:
@@ -6069,7 +6283,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.route_post()
         except Exception as e:
-            sys.stderr.write("POST %s: %r\n" % (self.path, e))
+            log("error", "http_error", repr(e), method="POST", path=self.path[:300])
             self.close_connection = True
             self.send(500, "Internal error", "text/plain")
         finally:
@@ -6077,6 +6291,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_get(self):
         _local.h12 = settings().get("clock") == "12"
+        _local.base = base_url(self)
         u = urllib.parse.urlsplit(self.path)
         path = u.path
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
@@ -6117,6 +6332,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, ICON, "image/svg+xml", cache=True)
         if path == "/static/app.js":
             return self.send(200, JS, "application/javascript; charset=utf-8", cache=True)
+        if path == "/metrics":
+            con = db()
+            tok = metrics_token(con)
+            auth = self.headers.get("Authorization") or ""
+            if not tok:
+                return self.send(404, "Not found", "text/plain")
+            if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip().encode(), tok.encode())):
+                log("warning", "metrics_refused", client=self.client_ip())
+                return self.send(401, "Unauthorized", "text/plain")
+            return self.send(200, metrics_text(con), "text/plain; version=0.0.4; charset=utf-8")
         m = re.fullmatch(r"/feed/([A-Za-z0-9_-]{16,64})/(txt|nft|ipset|mikrotik|csv|c2)", path)
         if m:
             tok = get_meta(db(), "feed_token") or ""
@@ -6207,6 +6432,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self):
         _local.h12 = settings().get("clock") == "12"
+        _local.base = base_url(self)
         path = urllib.parse.urlsplit(self.path).path
         if not self.host_ok():
             return self.send(421, "Unknown host", "text/plain")
@@ -6217,12 +6443,15 @@ class Handler(BaseHTTPRequestHandler):
             ip = self.client_ip()
             f = self.form()
             if not reserve_attempt(ip):
+                log("warning", "login_locked", "too many attempts", client=ip)
                 return self.send(429, v_login("Too many attempts. Wait 15 minutes."))
             stored = get_meta(con, "pw")
             if not stored or not check_pw(f.get("password", ""), stored):
+                log("warning", "login_failed", client=ip)
                 time.sleep(1)
                 return self.send(401, v_login("Wrong password."))
             release_attempt(ip)
+            log("info", "login", client=ip)
             tok = secrets.token_urlsafe(32)
             with con:
                 con.execute("INSERT INTO logins VALUES(?,?)", (hashlib.sha256(tok.encode()).hexdigest(), time.time() + SESSION_DAYS * 86400))
@@ -6287,6 +6516,17 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "gn_wait_until", "0")      # a new key gets a fresh allowance
             set_meta(con, "gn_error", "")
             return self.redirect("/settings?ok=" + ("gn" if res == "ok" else "gnbusy"))
+        if path == "/settings/metrics":
+            on = self.form().get("on") == "1"
+            if on and not get_meta(con, "metrics_token"):
+                set_meta(con, "metrics_token", secrets.token_urlsafe(32))
+            set_meta(con, "metrics_on", "1" if on else "0")
+            log("info", "metrics_on" if on else "metrics_off")
+            return self.redirect("/settings?ok=" + ("mon" if on else "moff"))
+        if path == "/settings/metrics/token":
+            set_meta(con, "metrics_token", secrets.token_urlsafe(32))
+            log("info", "metrics_token_new")
+            return self.redirect("/settings?ok=mtok")
         if path == "/settings/greynoise/remove":
             set_meta(con, "gn_key", "")
             return self.redirect("/settings?ok=gndel")
@@ -6515,7 +6755,10 @@ def serve():
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
     threading.Thread(target=backup_loop, daemon=True, name="backup").start()
     srv = HuginnServer((BIND, PORT), Handler)
-    print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
+    log("info", "start", "Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), version=HUGINN_VERSION,
+        metrics=bool(metrics_token(connect())), log_format=LOG_FORMAT)
+    if LOG_LEVEL > 20:
+        print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
     srv.serve_forever()
 
 

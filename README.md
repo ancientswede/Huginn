@@ -518,6 +518,9 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_VIRUSTOTAL_DAILY` | `400` | Most VirusTotal lookups a day (the free key allows 500, and 4 a minute) |
 | `HUGINN_GREYNOISE_DAILY` | `20` / `40` | Most GreyNoise community lookups a day (20 without a key, 40 with one), top attackers first; `0` = off. Benign mass scanners count as research unless they logged in or ran something |
 | `HUGINN_GREYNOISE_KEY` | – | Optional free GreyNoise key for a larger allowance. Can also be pasted on the Settings page (Lookups), where it is tested without using a lookup and never shown again. Free key at [viz.greynoise.io](https://viz.greynoise.io) |
+| `HUGINN_METRICS_TOKEN` | – | Turns on `/metrics` with this bearer token (16+ characters). Otherwise turn metrics on in Settings |
+| `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line (Loki) |
+| `HUGINN_LOG_LEVEL` | `warning` / `info` | `debug`, `info`, `warning` or `error`; the default is `info` with JSON logs |
 | `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
 | `HUGINN_ALLOWED_HOSTS` | (empty) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
@@ -538,6 +541,26 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io. Set `HUGINN_ENRICH=0` to turn it off.
 
 **Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.
+
+## Metrics and Grafana (optional)
+
+Huginn can serve counts for [Prometheus](https://prometheus.io) on `/metrics`, for a Grafana dashboard next to the rest of your homelab. It is **off** until you turn it on, and then only answers requests with the right token.
+
+1. **Settings > Metrics > Turn on.** Huginn makes a token and shows the address, the token and a ready Prometheus job (or set `HUGINN_METRICS_TOKEN` in `.env`, 16+ characters, for automated setups).
+2. Add the job to `prometheus.yml` (example: [`examples/prometheus-huginn.yml`](examples/prometheus-huginn.yml)) and reload Prometheus.
+3. In Grafana: **Dashboards > New > Import** and upload [`examples/grafana/huginn-dashboard.json`](examples/grafana/huginn-dashboard.json), then pick your Prometheus data source.
+
+What is in it: events per source, kind and decoy service (a counter for `rate()`, and the last 24 hours), active and new attackers, SSH/Telnet sessions and logins, captured files, blocklist size, repeated decoy tries not stored, sync time and errors, collection problems, lookup allowances used and paused, database size and the last backup. **Never addresses, usernames, passwords or commands**: one label per attacker would also give Prometheus a new time series for every address. Details stay in Huginn. **New token** in Settings stops the old one at once.
+
+### JSON logs for Loki
+
+Huginn logs to stderr (the systemd journal, or `docker logs`). With `HUGINN_LOG_FORMAT=json` each line is one JSON object, ready for Loki, Promtail or Grafana Alloy:
+
+```json
+{"ts": "2026-11-14T12:00:00.123Z", "level": "info", "app": "huginn", "event": "sync", "new": 41, "rows": 41, "files": 0, "secs": 1.2}
+```
+
+Events: `start`, `sync`, `collection_problem` / `collection_back`, `login` / `login_failed` / `login_locked` (with the client address of whoever logged in to Huginn, not attackers), `metrics_refused`, `backup_failed`, `http_error`, and every new error Huginn shows on its pages (`last_error`, `vt_error`, `gn_error` …). `HUGINN_LOG_LEVEL` (`debug`, `info`, `warning`, `error`) sets how much: `info` for JSON, `warning` for plain text, so the default journal stays quiet. Attack data itself is not logged; it is in the database and on `/metrics`.
 
 ## Logs and disk space
 
