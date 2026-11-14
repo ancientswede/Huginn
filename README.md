@@ -513,6 +513,10 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_ENRICH` | `1` | Look up attacker IPs at ipwho.is and Shodan InternetDB |
 | `HUGINN_PERSONAS` | announced by the honeypot | `port=name,...` for several Cowrie instances |
 | `HUGINN_MALWAREBAZAAR_KEY` | – | Look captured files up on MalwareBazaar by SHA-256 (only the hash is sent). Free key at [auth.abuse.ch](https://auth.abuse.ch) |
+| `HUGINN_VIRUSTOTAL_KEY` | – | VirusTotal verdicts for captured files: how many engines flag a file, or *novel* if VirusTotal has never seen it (only the SHA-256 is sent). Can also be pasted on the Settings page, where it is tested and never shown again. Free key at [virustotal.com](https://www.virustotal.com) |
+| `HUGINN_VIRUSTOTAL_DAILY` | `400` | Most VirusTotal lookups a day (the free key allows 500, and 4 a minute) |
+| `HUGINN_GREYNOISE_DAILY` | `40` | Most GreyNoise community lookups a day, top attackers first; `0` = off. Benign mass scanners count as research unless they logged in or ran something |
+| `HUGINN_GREYNOISE_KEY` | – | Optional free GreyNoise key for a larger allowance |
 | `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
 | `HUGINN_ALLOWED_HOSTS` | (empty) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |

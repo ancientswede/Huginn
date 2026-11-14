@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.32.0"
+HUGINN_VERSION = "0.33.0"
 CHANGELOG = [
+    ("0.33.0", "2026-11-14", "VirusTotal verdicts for captured files: only the SHA-256 is sent, never the file. Each file shows how many engines flag it, or \"novel\" when VirusTotal has never seen it, and VirusTotal's label names the family when nothing better is known. Paste the key on the Settings page (it is tested, then never shown again) or set HUGINN_VIRUSTOTAL_KEY. GreyNoise (no key needed) says whether an attacker is a known mass scanner: benign ones count as research unless they logged in or ran something. Both keep to a daily allowance."),
     ("0.32.0", "2026-11-14", "New Engagement page: sessions that got in, day by day, with what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it. Huginn now also stores the terminal size a client asks for: it shows on each session and in a table on the Engagement page."),
     ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
     ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
@@ -150,6 +151,14 @@ NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan
 NTFY_TOKEN = os.environ.get("HUGINN_NTFY_TOKEN", "")      # access token (tk_...) for ntfy servers with access control
 # Optional: look captured files up on MalwareBazaar (abuse.ch) by SHA-256. Sends only the hash. Free key: auth.abuse.ch
 MB_KEY = os.environ.get("HUGINN_MALWAREBAZAAR_KEY", "")
+# Optional: VirusTotal verdicts for captured files by SHA-256. Only the hash leaves Huginn, never a file. The free key allows
+# 4 lookups a minute and 500 a day; Huginn stays under HUGINN_VIRUSTOTAL_DAILY (default 400). Key: virustotal.com, API key.
+VT_KEY = os.environ.get("HUGINN_VIRUSTOTAL_KEY", "")
+VT_DAILY = max(0, min(500, int(os.environ.get("HUGINN_VIRUSTOTAL_DAILY", "400") or 0)))
+# GreyNoise community API: is an address a known mass scanner, and is it a benign one (Censys, Shodan, a university)?
+# Works without a key, with a small daily allowance; a free key raises it. Only the attacker's address is sent.
+GN_KEY = os.environ.get("HUGINN_GREYNOISE_KEY", "")
+GN_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_GREYNOISE_DAILY", "40") or 0)))
 
 
 def ntfy_post(body, title, prio=3):
@@ -265,6 +274,8 @@ CREATE TABLE IF NOT EXISTS web_identities(ts REAL PRIMARY KEY, id TEXT, kind TEX
 CREATE TABLE IF NOT EXISTS webhits(h TEXT PRIMARY KEY, ip TEXT, ts REAL, level TEXT, type TEXT, cve TEXT, sev INTEGER, rule TEXT, robots INTEGER, reply TEXT);
 CREATE INDEX IF NOT EXISTS wh_ip ON webhits(ip);
 CREATE INDEX IF NOT EXISTS wh_type ON webhits(type, ts);
+CREATE TABLE IF NOT EXISTS vt(sha TEXT PRIMARY KEY, checked REAL, data TEXT);
+CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 """
 
@@ -298,8 +309,9 @@ def init_db():
         con.execute("ALTER TABLE enrich ADD COLUMN rdns_ok INTEGER")
         con.execute("UPDATE enrich SET fetched=0 WHERE research=1")       # look these up again soon, now with the forward check
     # Re-evaluate the research flag with the current rules (cheap, runs at start).
+    benign = {ip for ip, d in con.execute("SELECT ip, data FROM greynoise") if gn_benign(d)}
     for ip, rd, org, isp, hn, ok in con.execute("SELECT ip, rdns, org, isp, hostnames, rdns_ok FROM enrich").fetchall():
-        con.execute("UPDATE enrich SET research=? WHERE ip=?", (research_flag(rd, org, isp, hn, ok), ip))
+        con.execute("UPDATE enrich SET research=? WHERE ip=?", (1 if ip in benign else research_flag(rd, org, isp, hn, ok), ip))
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
     if "tty" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN tty TEXT")
@@ -963,8 +975,8 @@ def name_family(names):
     return ""
 
 
-def file_family(f, names=""):
-    # Best guess, most reliable first: MalwareBazaar's signature, strings in the file, then its name or URL.
+def file_family(f, names="", sha=None):
+    # Best guess, most reliable first: MalwareBazaar's signature, strings in the file, VirusTotal's label, then its name or URL.
     if f is not None:
         try:
             mb = json.loads(f["mb"] or "{}")
@@ -974,6 +986,10 @@ def file_family(f, names=""):
             return mb["signature"], "MalwareBazaar"
         if f["family"]:
             return f["family"], "strings in the file"
+        sha = sha or f["sha"]
+    fam = vt_family(vt_get(sha)) if sha else ""
+    if fam:
+        return fam, "VirusTotal"
     fam = name_family(names)
     return (fam, "file name") if fam else ("", "")
 
@@ -1010,6 +1026,215 @@ def mb_lookup(con, limit=4):
         with con:
             con.execute("UPDATE files SET mb=?, mb_checked=? WHERE sha=?", (json.dumps(mb), time.time(), sha))
         done += 1
+    return done
+
+
+VT_KEY_RE = re.compile(r"[0-9a-f]{64}")
+VT_TEST_SHA = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"   # the EICAR test file, known to every engine
+
+
+def vt_key(con=None):
+    # A key saved on the Settings page wins over HUGINN_VIRUSTOTAL_KEY. It is never shown again once saved.
+    k = get_meta(con or db(), "vt_key", "") or ""
+    return k if VT_KEY_RE.fullmatch(k) else VT_KEY
+
+
+def vt_test(key):
+    # One lookup of a well-known file: "ok", "bad" (key refused) or "busy" (valid, but over the allowance right now).
+    req = urllib.request.Request("https://www.virustotal.com/api/v3/files/" + VT_TEST_SHA, headers={"x-apikey": key, "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read(64 * 1024)
+        return "ok"
+    except urllib.error.HTTPError as e:
+        return "busy" if e.code == 429 else "bad" if e.code in (401, 403) else "error"
+    except Exception:
+        return "error"
+
+
+def vt_get(sha, con=None):
+    # The stored VirusTotal answer for a file, or None if it was never asked about.
+    r = (con or db()).execute("SELECT data FROM vt WHERE sha=?", (sha,)).fetchone()
+    try:
+        return json.loads(r[0]) if r and r[0] else None
+    except ValueError:
+        return None
+
+
+VT_LABEL_RE = re.compile(r"[a-z0-9_.-]{1,40}(?:/[a-z0-9_.-]{1,40}){0,3}")
+
+
+def vt_family(v):
+    # "trojan.mirai/gafgyt" -> "Mirai". Only a well-formed label counts.
+    lab = (v or {}).get("label") or ""
+    if not VT_LABEL_RE.fullmatch(lab):
+        return ""
+    name = lab.split("/")[0].split(".")[-1]
+    return name.capitalize() if 2 < len(name) <= 30 else ""
+
+
+def vt_html(v):
+    if v is None:
+        return '<span class=muted>%s</span>' % ("not checked yet" if vt_key() else "–")
+    if not v.get("found"):
+        return '<span class="tag t-orange" title="VirusTotal has never seen this file (checked %s)">novel</span>' % esc(fmt_ts(v.get("at") or 0))
+    mal, total = int(v.get("mal") or 0), int(v.get("total") or 0)
+    title = "%s of %s engines flag it%s · checked %s" % (mal, total, (" · " + v["label"]) if v.get("label") else "", fmt_ts(v.get("at") or 0))
+    return '<span class="tag %s" title="%s">%d/%d</span>' % ("t-red" if mal else "", esc(title), mal, total)
+
+
+def day_budget(con, key, cap):
+    # A daily counter in meta ("YYYY-MM-DD:n"). Returns how many calls are left today (UTC).
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day, _, n = (get_meta(con, key, "") or "").partition(":")
+    used = int(n) if day == today and n.isdigit() else 0
+    return max(0, cap - used), today, used
+
+
+def day_spend(con, key):
+    _left, today, used = day_budget(con, key, 0)
+    set_meta(con, key, "%s:%d" % (today, used + 1))
+
+
+def vt_lookup(con, limit=3, pause=16):
+    # Ask VirusTotal about captured files: new ones first, unknown ones again after a week, known ones after 30 days.
+    key = vt_key(con)
+    if not key:
+        return 0
+    if float(get_meta(con, "vt_wait_until", "0") or 0) > time.time():
+        return 0
+    left, _t, _u = day_budget(con, "vt_day", VT_DAILY)
+    now = time.time()
+    shas = [r[0] for r in con.execute(
+        "SELECT x.sha FROM (SELECT sha, mtime t FROM files UNION SELECT b, MAX(ts) FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b) x "
+        "LEFT JOIN vt v ON v.sha=x.sha WHERE v.sha IS NULL OR (v.data LIKE '%\"found\": false%' AND v.checked<?) OR v.checked<? "
+        "GROUP BY x.sha ORDER BY (v.sha IS NULL) DESC, MAX(x.t) DESC LIMIT ?", (now - 7 * 86400, now - 30 * 86400, min(limit, left)))]
+    done = 0
+    for sha in shas:
+        if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+            continue
+        if done:
+            time.sleep(pause)                      # free tier: 4 a minute
+        req = urllib.request.Request("https://www.virustotal.com/api/v3/files/" + sha, headers={"x-apikey": key, "User-Agent": UA})
+        day_spend(con, "vt_day")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                a = (json.loads(r.read(4 * 1024 * 1024)).get("data") or {}).get("attributes") or {}
+            st = a.get("last_analysis_stats") or {}
+            cnt = lambda k: st.get(k) if isinstance(st.get(k), int) and 0 <= st.get(k) < 1000 else 0
+            label = str((a.get("popular_threat_classification") or {}).get("suggested_threat_label") or "").lower()
+            first = a.get("first_submission_date")
+            v = {"found": True, "mal": cnt("malicious"), "sus": cnt("suspicious"),
+                 "total": sum(cnt(k) for k in ("malicious", "suspicious", "undetected", "harmless")),
+                 "label": label if VT_LABEL_RE.fullmatch(label) else "", "first": first if isinstance(first, int) else None}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                v = {"found": False}
+            elif e.code == 429:
+                set_meta(con, "vt_wait_until", time.time() + 3600)      # over the minute or day allowance: an hour off
+                set_meta(con, "vt_error", "%s rate limited, paused for an hour" % fmt_ts(time.time()))
+                break
+            else:
+                set_meta(con, "vt_wait_until", time.time() + 6 * 3600)  # 401 bad key and the like: do not hammer
+                set_meta(con, "vt_error", "%s HTTP %s" % (fmt_ts(time.time()), e.code))
+                break
+        except Exception as e:
+            set_meta(con, "vt_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+            break
+        v["at"] = int(time.time())
+        with con:
+            con.execute("INSERT OR REPLACE INTO vt(sha, checked, data) VALUES(?,?,?)", (sha, time.time(), json.dumps(v)))
+        set_meta(con, "vt_error", "")
+        done += 1
+    return done
+
+
+GN_CLASSES = {"benign", "malicious", "suspicious", "unknown"}
+
+
+def gn_parse(d):
+    # Only known fields and values are kept; everything else from outside is dropped.
+    cls = str(d.get("classification") or "unknown").lower()
+    return {"seen": bool(d.get("noise")) or bool(d.get("riot")), "noise": bool(d.get("noise")), "riot": bool(d.get("riot")),
+            "class": cls if cls in GN_CLASSES else "unknown", "name": ext_text(d.get("name"), 60) or "",
+            "last": str(d.get("last_seen") or "")[:10] if re.fullmatch(r"\d{4}-\d\d-\d\d", str(d.get("last_seen") or "")[:10]) else ""}
+
+
+def gn_benign(data):
+    # A scanner GreyNoise knows and calls benign (research, search engines) counts as research. Activity still wins,
+    # exactly as for the research flag from names: anyone who logged in or ran something stays on the blocklist.
+    try:
+        g = json.loads(data) if isinstance(data, str) else (data or {})
+    except ValueError:
+        return False
+    return bool(g.get("seen")) and g.get("class") == "benign"
+
+
+def gn_get(con, ip):
+    r = con.execute("SELECT data FROM greynoise WHERE ip=?", (ip,)).fetchone()
+    try:
+        return json.loads(r[0]) if r and r[0] else None
+    except ValueError:
+        return None
+
+
+def gn_html(g):
+    if g is None:
+        return '<span class=muted>not checked yet</span>' if GN_DAILY else "–"
+    if not g.get("seen"):
+        return "not seen scanning the internet"
+    what = ("benign service" if g.get("riot") and not g.get("noise") else "%s scanner" % g.get("class", "unknown"))
+    cls = {"benign": "t-grey", "malicious": "t-red", "suspicious": "t-orange"}.get(g.get("class"), "")
+    return '<span class="tag %s">%s</span>%s%s' % (cls, esc(what), (" " + esc(g["name"])) if g.get("name") and g["name"].lower() != "unknown" else "",
+                                                ' <span class=muted>last seen %s</span>' % esc(g["last"]) if g.get("last") else "")
+
+
+def sendable_ip(ip):
+    # Only public addresses ever go to an outside service (test mode can store LAN addresses).
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
+
+
+def gn_lookup(con, limit=5):
+    # Top attackers first (highest score, active in 30 days), each again after 14 days. Stays under the daily allowance.
+    if not GN_DAILY or float(get_meta(con, "gn_wait_until", "0") or 0) > time.time():
+        return 0
+    left, _t, _u = day_budget(con, "gn_day", GN_DAILY)
+    now = time.time()
+    ips = [r[0] for r in con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN greynoise g USING(ip) WHERE i.last>=? AND (g.ip IS NULL OR g.checked<?) "
+        "ORDER BY (g.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 14 * 86400, min(limit, left)))]
+    done = 0
+    for ip in ips:
+        if not sendable_ip(ip):
+            continue
+        h = {"User-Agent": UA, "Accept": "application/json"}
+        if GN_KEY:
+            h["key"] = GN_KEY
+        day_spend(con, "gn_day")
+        try:
+            with urllib.request.urlopen(urllib.request.Request("https://api.greynoise.io/v3/community/" + urllib.parse.quote(ip), headers=h), timeout=15) as r:
+                g = gn_parse(json.loads(r.read(256 * 1024)))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                g = gn_parse({})
+            else:
+                # 429: the allowance is used up (the community limit is per day); anything else: try again later.
+                set_meta(con, "gn_wait_until", time.time() + (6 * 3600 if e.code == 429 else 3600))
+                set_meta(con, "gn_error", "%s HTTP %s%s" % (fmt_ts(time.time()), e.code, ", daily allowance used up" if e.code == 429 else ""))
+                break
+        except Exception as e:
+            set_meta(con, "gn_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+            break
+        with con:
+            con.execute("INSERT OR REPLACE INTO greynoise(ip, checked, data) VALUES(?,?,?)", (ip, time.time(), json.dumps(g)))
+            if gn_benign(g):
+                con.execute("UPDATE enrich SET research=1 WHERE ip=?", (ip,))
+        set_meta(con, "gn_error", "")
+        done += 1
+        time.sleep(1)
     return done
 
 
@@ -2232,6 +2457,11 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
+        for f in (vt_lookup, gn_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+            try:
+                f(con)
+            except Exception as e:
+                set_meta(con, "last_enrich_error", "%s %s: %s" % (fmt_ts(time.time()), f.__name__, str(e)[:200]))
         time.sleep(60)
 
 
@@ -3469,7 +3699,7 @@ def v_ip(ip, qs=None):
                     ("ASN", esc("AS" + e["asn"]) if e["asn"] else "–"), ("Org", esc(e["org"] or "–")), ("ISP", esc(e["isp"] or "–")),
                     ("Reverse DNS", '<span class=mono>%s</span>' % esc(e["rdns"] or "–")), ("Hostnames", esc(e["hostnames"] or "–")),
                     ("Open ports", esc(e["ports"] or "–")), ("Shodan tags", esc(e["tags"] or "–")),
-                    ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("Looked up", esc(ago(e["fetched"])))])
+                    ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))), ("Looked up", esc(ago(e["fetched"])))])
     else:
         right = '<p class=muted>Lookup pending (country, network, Shodan) — runs in the background.</p>'
 
@@ -3498,8 +3728,8 @@ def v_ip(ip, qs=None):
     frows = ""
     for x in files:
         sha = x["b"] or ""
-        links_f = (ext("https://bazaar.abuse.ch/sample/" + sha + "/", "MalwareBazaar") + " · " + ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")) if sha else (ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(x["a"] or ""), "URLhaus") if x["a"] else "")
-        fam, how = file_family(con.execute("SELECT * FROM files WHERE sha=?", (sha,)).fetchone() if sha else None, x["a"] or "")
+        links_f = (vt_html(vt_get(sha, con)) + " " + ext("https://bazaar.abuse.ch/sample/" + sha + "/", "MalwareBazaar") + " · " + ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")) if sha else (ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(x["a"] or ""), "URLhaus") if x["a"] else "")
+        fam, how = file_family(con.execute("SELECT * FROM files WHERE sha=?", (sha,)).fetchone() if sha else None, x["a"] or "", sha or None)
         frows += "<tr><td class='mono trunc'>%s %s</td><td class=mono>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
             family_tag(fam, how), esc(clean(x["a"], 200)), esc(sha[:16] + "…" if sha else ("download failed" if x["kind"] == "file_fail" else "")), esc(ago(x["l"])), num(x["n"]), links_f)
     files_html = ('<div class="card span2"><h3>Files and URLs</h3><table><thead><tr><th>Name / URL</th><th>SHA-256</th><th>Last</th><th>Count</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table></div>' % frows) if frows else ""
@@ -4233,7 +4463,13 @@ def v_files(qs=None):
                                             "FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b")}
     fi = {r["sha"]: r for r in con.execute("SELECT * FROM files")}
     shas = sorted(set(ev) | set(fi), key=lambda x: -((ev[x]["l"] if x in ev else 0) or (fi[x]["mtime"] if x in fi else 0)))
-    fams = {sha: file_family(fi.get(sha), ev[sha]["names"] if sha in ev else "") for sha in shas}
+    vts = {}
+    for sha_, d_ in con.execute("SELECT sha, data FROM vt"):
+        try:
+            vts[sha_] = json.loads(d_)
+        except ValueError:
+            pass
+    fams = {sha: file_family(fi.get(sha), ev[sha]["names"] if sha in ev else "", sha) for sha in shas}
     # Chips per family (with counts) filter the list; "Unknown" are files no rule recognised yet.
     counts = {}
     for fam, _how in fams.values():
@@ -4255,11 +4491,11 @@ def v_files(qs=None):
         fam, how = fams[sha]
         kind = (family_tag(fam, how) if fam else "") + ('<div class="ft">%s</div>' % (esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
                 + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>')
-        trs += ("<tr><td class=mono>%s</td><td>%s</td><td class='num nw'>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td class=nw>%s</td><td class=num>%s</td><td class=nw>%s · %s</td></tr>"
+        trs += ("<tr><td class=mono>%s</td><td>%s</td><td class='num nw'>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td class=nw>%s</td><td class=num>%s</td><td class=nw>%s</td><td class=nw>%s · %s</td></tr>"
                 % (("<a href='/campaign/file/%s'>%s…</a>" % (esc(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
                    esc("%.1f KB" % (f["size"] / 1024.0)) if f else "", esc(clean(e["names"], 200)) if e else "",
                    ioc_cell(iocs),
-                   esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "",
+                   esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "", vt_html(vts.get(sha)),
                    ext("https://bazaar.abuse.ch/sample/%s/" % sha, "MalwareBazaar"), ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")))
     urls = con.execute("SELECT a, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='file_fail' AND a IS NOT NULL GROUP BY a ORDER BY l DESC LIMIT 200").fetchall()
     urs = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
@@ -4267,7 +4503,7 @@ def v_files(qs=None):
     body = ('<h1>Files</h1><p class=muted>Captured by the honeypot (uploads and downloads). Never executed here — look them up by hash only.</p>'
             '<div class="card">%s%s</div><h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
             % (chips, '<input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
-               '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % trs if trs else none_yet("No files captured yet"),
+               '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>VirusTotal</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % trs if trs else none_yet("No files captured yet"),
                '<table class="wide"><thead><tr><th>URL</th><th>Last</th><th class=num>Tries</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % urs if urs else none_yet("No blocked downloads recorded")))
     return page("Files", body, "/files")
 
@@ -4553,8 +4789,8 @@ def v_campaign(kind, val):
     elif kind == "file":
         ips = con.execute("SELECT ip, COUNT(*) n, MAX(ts) l FROM events WHERE kind='file' AND b=? GROUP BY ip ORDER BY l DESC", (val,)).fetchall()
         names = con.execute("SELECT DISTINCT a FROM events WHERE kind='file' AND b=? LIMIT 30", (val,)).fetchall()
-        detail = ('<div class="card"><h3>File</h3><div class=mono>%s</div><p>%s · %s</p>%s</div>'
-                  % (esc(val), ext("https://bazaar.abuse.ch/sample/%s/" % val, "MalwareBazaar"), ext("https://www.virustotal.com/gui/file/" + val, "VirusTotal"),
+        detail = ('<div class="card"><h3>File</h3><div class=mono>%s</div><p>VirusTotal %s · %s · %s</p>%s</div>'
+                  % (esc(val), vt_html(vt_get(val, con)), ext("https://bazaar.abuse.ch/sample/%s/" % val, "MalwareBazaar"), ext("https://www.virustotal.com/gui/file/" + val, "VirusTotal"),
                      "".join("<div class=mono>%s</div>" % esc(clean(n[0], 200)) for n in names)))
         title = "File " + val[:16]
     else:
@@ -4904,7 +5140,9 @@ def v_settings(ok="", err=""):
         return '<label class="opt"><input type=checkbox name=%s value="%s"%s> %s</label>' % (name, val, " checked" if on else "", esc(label))
     def sel(name, vals):
         return '<select name=%s>%s</select>' % (name, "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(st[name]) == str(v) else "", esc(l)) for v, l in vals))
-    msg = {"1": "Saved.", "test": "Test notification sent."}.get(ok, "")
+    msg = {"1": "Saved.", "test": "Test notification sent.", "vt": "VirusTotal key saved. It works.",
+           "vtbusy": "VirusTotal key saved. It is valid, but over its allowance right now: lookups start when it resets.",
+           "vtdel": "VirusTotal key removed."}.get(ok, "")
     note = ('<p class="okmsg">%s</p>' % esc(msg)) if msg else ""
     note += ('<p class="err">%s</p>' % esc(err)) if err else ""
     accents = "".join('<label class="opt sw"><input type=radio name=accent value="%s"%s><span class="dot dot-%s"></span> %s</label>'
@@ -4944,7 +5182,32 @@ def v_settings(ok="", err=""):
                ntfy_line, check("notify", "1", "Send ntfy notifications", st["notify"]),
                "".join(check("notify_events", k, l, k in st["notify_events"]) for k, l in NOTIFY_EVENTS),
                "" if NTFY_URL else " disabled"))
-    return page("Settings", body, "/settings")
+    return page("Settings", body + lookups_card(), "/settings")
+
+
+def lookups_card():
+    # Outside lookups by hash or address. The VirusTotal key can be pasted here; it is never shown again, only whether one is set.
+    con = db()
+    saved = VT_KEY_RE.fullmatch(get_meta(con, "vt_key", "") or "") is not None
+    src = "a key saved here" if saved else ("HUGINN_VIRUSTOTAL_KEY in .env" if VT_KEY else "")
+    vleft, _t, vused = day_budget(con, "vt_day", VT_DAILY)
+    vn = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"found\": false%'),0) FROM vt").fetchone()
+    gleft, _t, gused = day_budget(con, "gn_day", GN_DAILY)
+    gn = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"class\": \"benign\"%'),0) FROM greynoise").fetchone()
+    err = lambda k: ('<p class="err small">Last error: %s</p>' % esc(get_meta(con, k, ""))) if get_meta(con, k, "") else ""
+    vt_state = ("On, using %s. %s of %s lookups used today; %s files checked, %s never seen by VirusTotal."
+                % (src, num(vused), num(VT_DAILY), num(vn[0]), num(vn[1]))) if src else "Off: no key."
+    remove = ('<form method=post action="/settings/virustotal/remove" class="inline"><button class="btn-s">Remove saved key</button></form>' if saved else "")
+    return ('<div class="card"><h3>Lookups</h3>'
+            '<p><b>VirusTotal</b> · verdicts for captured files. Only the SHA-256 is sent, never the file. A free key allows 500 lookups a day; '
+            'Huginn uses at most %s.</p><p class="muted small">%s</p>%s'
+            '<form method=post action="/settings/virustotal" class="filters"><input type=password name=key class="key-input" autocomplete=off spellcheck=false maxlength=128 '
+            'placeholder="%s" aria-label="VirusTotal API key"><button>Save and test</button></form>%s'
+            '<p class="note"><b>GreyNoise</b> · is an attacker a known mass scanner, and a benign one? No key needed. Only the address is sent, '
+            'top attackers first, at most %s a day. Benign scanners count as research unless they logged in or ran something.</p>'
+            '<p class="muted small">%s of %s used today; %s addresses checked, %s benign scanners.</p>%s</div>'
+            % (num(VT_DAILY), esc(vt_state), err("vt_error"), "Paste a new key to replace the saved one" if saved else "Paste your VirusTotal API key",
+               remove, num(GN_DAILY), num(gused), num(GN_DAILY), num(gn[0]), num(gn[1]), err("gn_error")))
 
 
 def save_settings(f, lists):
@@ -5321,6 +5584,7 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".etab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}"
         ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
 CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
+CSS += ".key-input{flex:1 1 360px;max-width:560px;font-family:var(--mono,monospace)}"
 # 0.28: wide screens (2K) get three columns on the Overview (dense, so a wide card never leaves a hole) and two on Campaigns.
 CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
         "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
@@ -5642,6 +5906,23 @@ class Handler(BaseHTTPRequestHandler):
                 st["overview"] = view
                 set_meta(con, "settings", json.dumps(st))
             return self.redirect("/")
+        if path == "/settings/virustotal":
+            key = (self.form().get("key") or "").strip().lower()
+            if not VT_KEY_RE.fullmatch(key):
+                return self.send(400, v_settings(err="That does not look like a VirusTotal API key (64 characters, 0-9 and a-f)."))
+            res = vt_test(key)
+            if res == "bad":
+                return self.send(400, v_settings(err="VirusTotal refused that key. Nothing was saved."))
+            if res == "error":
+                return self.send(502, v_settings(err="Could not reach VirusTotal to test the key. Nothing was saved, try again."))
+            day_spend(con, "vt_day")
+            set_meta(con, "vt_key", key)
+            set_meta(con, "vt_wait_until", "0")
+            set_meta(con, "vt_error", "")
+            return self.redirect("/settings?ok=" + ("vt" if res == "ok" else "vtbusy"))
+        if path == "/settings/virustotal/remove":
+            set_meta(con, "vt_key", "")
+            return self.redirect("/settings?ok=vtdel")
         if path == "/settings/test-ntfy":
             if not NTFY_URL:
                 return self.send(400, v_settings(err="HUGINN_NTFY_URL is not set."))

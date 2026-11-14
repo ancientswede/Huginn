@@ -75,7 +75,7 @@ class Pages(Base):
             for sha, fam in (("a" * 64, "Mirai"), ("b" * 64, "Mirai"), ("c" * 64, "")):
                 self.con.execute("INSERT INTO files(sha, size, type, arch, packed, src, mtime, iocs, family) VALUES(?,?,?,?,?,?,?,?,?)",
                                  (sha, 100, "ELF", "arm", 0, "dl", NOW, "[]", fam))
-        with mock.patch.object(app, "file_family", lambda f, names: ((f["family"] or "") if f else "", "rule")):
+        with mock.patch.object(app, "file_family", lambda f, names, sha=None: ((f["family"] or "") if f else "", "rule")):
             all_ = app.v_files({})
             self.assertIn("Mirai <span class=muted>2</span>", all_)
             self.assertIn("Unknown <span class=muted>1</span>", all_)
