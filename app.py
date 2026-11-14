@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.34.0"
+HUGINN_VERSION = "0.35.0"
 CHANGELOG = [
+    ("0.35.0", "2026-11-14", "New Help page (link in the header, or g h): what every attacker tag, session badge, file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it."),
     ("0.34.0", "2026-11-14", "The MalwareBazaar key can be pasted on the Settings page too (Lookups), like the VirusTotal key: it is tested before it is saved and never shown again. The page shows how many files were checked and how many abuse.ch knows, and the last error if a lookup failed."),
     ("0.33.0", "2026-11-14", "VirusTotal verdicts for captured files: only the SHA-256 is sent, never the file. Each file shows how many engines flag it, or \"novel\" when VirusTotal has never seen it, and VirusTotal's label names the family when nothing better is known. Paste the key on the Settings page (it is tested, then never shown again) or set HUGINN_VIRUSTOTAL_KEY. GreyNoise (no key needed) says whether an attacker is a known mass scanner: benign ones count as research unless they logged in or ran something. Both keep to a daily allowance."),
     ("0.32.0", "2026-11-14", "New Engagement page: sessions that got in, day by day, with what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it. Huginn now also stores the terminal size a client asks for: it shows on each session and in a table on the Engagement page."),
@@ -2609,10 +2610,43 @@ TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell
              "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
+# What each attacker tag means: the tooltip on every tag and the Help page read this one table.
+# tests/test_v035.py checks that every tag Huginn can set is explained here.
+TAG_HELP = {
+    "shell": "Ran at least one command in the fake shell.",
+    "dropper": "Downloaded or uploaded a file to the honeypot.",
+    "proxy": "Tried to use the honeypot as a proxy (SSH port forwarding) to reach other sites.",
+    "exploit": "Sent a known exploit to the Telnet honeypot (Cowrie recognised it by its CVE).",
+    "bruteforce": "10 or more login attempts in total.",
+    "multi-service": "Used two or more services: SSH, Telnet, the tarpit, or a decoy such as FTP, MySQL, Redis, VNC, mail or web.",
+    "tarpitted": "Spent at least a minute stuck in the SSH tarpit.",
+    "research": "A known research or internet-measurement scanner, by its name or network, or called benign by GreyNoise. "
+                "Left off the blocklist unless it logged in or ran something.",
+    "took-bait": "Used a fake credential planted on the honeypot somewhere else: in a login, a command or a decoy service.",
+    "read-bait": "Read a bait file (.env, cloud keys, backup scripts and the like), or was handed fake secrets by the web trap.",
+    "human-like": "A session with 3 or more commands and a median pause of over 2 seconds between them: probably typed by a person, not pasted by a script.",
+    "sshole-probe": "An SSH login with a 257 to 1024 byte password: testing for the SSHole bug in sshd.",
+    "web-exploit": "A web request that matched an exploit rule, often for a known CVE.",
+    "web-probe": "A web request looking for something specific, such as admin pages or config files, but no exploit.",
+    "robots-trap": "Visited a path that only the web trap's robots.txt mentions: a crawler that reads robots.txt to find hidden places.",
+    "block": "You flagged this attacker: always on the blocklist.",
+    "allow": "You flagged this attacker: never on the blocklist.",
+}
+
+
+def tag_title(t):
+    if t in TAG_HELP:
+        return TAG_HELP[t]
+    if t in set(PERSONA.values()):
+        return "Persona: the session hit the fake %s." % t
+    return ""
+
+
 def tag_html(tags):
     out = []
     for t in [x for x in (tags or "").split(",") if x]:
-        out.append('<span class="tag %s">%s</span>' % (TAG_CLASS.get(t, ""), esc(t)))
+        tip = tag_title(t)
+        out.append('<span class="tag %s"%s>%s</span>' % (TAG_CLASS.get(t, ""), (' title="%s"' % esc(tip)) if tip else "", esc(t)))
     return " ".join(out)
 
 
@@ -2798,6 +2832,7 @@ def page(title, body, active="/"):
             "<header><div class=brand id=brand data-file='%s' data-took='%d' data-read='%d'><a href='/'><img class=brand-ic src='/static/icon-32.png' alt=''>%s</a></div><nav>%s</nav>"
             "<div class=hdr-right>%s<span class=muted>v%s</span>%s%s"
             "<button class='link kbd-btn' id='kbdHelp' title='Keyboard shortcuts (?)'>?</button>"
+            "<a class='hdr-link' href='/help'>Help</a>"
             "<a class='hdr-link%s' href='/settings'>Settings</a>"
             "<a class='hdr-link%s' href='/account'>Account</a><form method=post action='/logout'><button class=link>Log out</button></form></div></header>"
             "<main>%s</main>%s</body></html>") % (html_attrs(st), esc(title), esc(st["title"]), HUGINN_VERSION, HUGINN_VERSION,
@@ -4375,6 +4410,67 @@ def v_engagement(qs=None):
     return page("Engagement", body, "/engagement")
 
 
+# ---------------------------------------------------------------- help (0.35)
+def v_help():
+    # What the tags, badges and numbers mean. Tags come from TAG_HELP, the score from SCORE_HELP: one source each.
+    row = lambda term, text: "<tr><td class=nw>%s</td><td>%s</td></tr>" % (term, text)
+    table = lambda rows: '<table class="wide help"><tbody>%s</tbody></table>' % "".join(rows)
+    tag = lambda t, cls="": '<span class="tag %s">%s</span>' % (cls or TAG_CLASS.get(t, ""), esc(t))
+    personas = sorted(set(PERSONA.values()))
+    tags = [row(tag(t), esc(TAG_HELP[t])) for t in ("shell", "dropper", "proxy", "exploit", "bruteforce", "human-like", "took-bait", "read-bait",
+                                                    "sshole-probe", "web-exploit", "web-probe", "robots-trap", "multi-service", "tarpitted",
+                                                    "research", "block", "allow")]
+    if personas:
+        tags.append(row(" ".join(tag(p) for p in personas), "Persona: which fake machine a session hit. Set by the installer (HUGINN_PERSONAS)."))
+    sessions = [
+        row("Left at once", "Logged in, then nothing: no command, no file, no proxy use."),
+        row("Proxy only", "Logged in only to send traffic through the honeypot to other sites."),
+        row("Ran commands / One line / Stopped short", "Typed or pasted commands. On Personas: one line and gone, or several lines with no download seen."),
+        row("Went for payload", "Downloaded or uploaded a file, or ran a command that fetches or plants something (wget, curl, an SSH key)."),
+        row("×N like this", "The same command script, after the parts bots randomise are ignored. Shown once, the repeats folded under it."),
+        row("terminal 240×24", "The terminal size the client asked for. Scripts usually ask for none; one bot often uses the same size every time."),
+        row("▶ Replay", "Plays the session back as the attacker saw it."),
+        row('<span class="tag">T1105</span>', "A MITRE ATT&amp;CK technique recognised in the commands. Click for MITRE's description."),
+        row("Timeline", "On an attacker's page: Recon, Access, Commands, Payload and Exploit steps over 30 days, across every service."),
+    ]
+    files = [
+        row('<span class="tag t-red">Mirai</span>', "The malware family, best source first: MalwareBazaar, strings in the file, VirusTotal's label, then the file name or URL. Hover to see which."),
+        row('<span class="tag t-red">41/62</span>', "VirusTotal: how many antivirus engines flag the file. Only the SHA-256 is sent, never the file."),
+        row('<span class="tag t-orange">novel</span>', "VirusTotal has never seen this file. Rare, and worth a closer look."),
+        row('<span class="tag t-orange">UPX</span>', "Packed with UPX, which hides its contents from simple string searches."),
+        row('<span class="tag">echo-built</span>', "Written on the honeypot line by line with echo or printf instead of being downloaded."),
+        row("Embedded IPs / URLs", "Addresses found inside the file: often its command server or the next download. They feed the C2 list."),
+        row("Malware URLs (fetch blocked)", "Downloads the attacker tried. The honeypot has no way out to the internet, so nothing was fetched."),
+    ]
+    lookups = [
+        row('<span class="tag t-grey">benign scanner</span>', "GreyNoise knows the address as a harmless mass scanner (research, search engines). Counts as research."),
+        row('<span class="tag t-red">malicious scanner</span>', "GreyNoise has seen the address scanning the internet with bad intent."),
+        row("not seen scanning the internet", "GreyNoise has no record of it: not a mass scanner, so more likely aimed or new."),
+        row("MalwareBazaar", "abuse.ch's malware database: family names and tags for known files, by hash."),
+        row("Keys", "VirusTotal and MalwareBazaar keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
+    ]
+    overview = [
+        row("Time wasted", "Attacker time spent stuck in the tarpit plus time in fake shells. <i>stuck now</i>: tarpit connections still open."),
+        row("Orange line under a bar", "No sync from the honeypot during that time: missing data, not a quiet period. Hover the bar for how long."),
+        row("synced … ago", "When Huginn last pulled the honeypot's logs. Red: the last sync failed or is late. Hover it, or see Account, for the reason."),
+        row("New", "Things seen for the first time: passwords, commands, files, SSH clients, web attacks. Mark them reviewed when read."),
+        row("Engagement", "Day by day, how far attackers get after the login, and before against after a release."),
+    ]
+    block = [
+        row("Who is on it", "Attackers whose score reaches the minimum (Settings, default 3) within the window (default 30 days)."),
+        row("Left off", "Research scanners that never logged in or ran anything, and anyone you flagged <i>allow</i>."),
+        row("Always on", "Anyone you flagged <i>block</i>."),
+        row("Feeds", "The Blocklist page gives links in several formats (plain text, nftables, ipset, MikroTik, CSV) and a C2 list from captured malware."),
+    ]
+    body = ('<h1>Help</h1><p class=muted>What the tags, badges and numbers in Huginn mean. Hover any tag for its meaning too; press <kbd>?</kbd> for keyboard shortcuts.</p>'
+            '<h2>Attacker tags</h2><div class="card">%s</div>'
+            '<h2>Score</h2><div class="card"><p>Every attacker gets points for what it did. The score sorts the Attackers list and decides the blocklist.</p><p class=mono>%s</p></div>'
+            '<h2>Sessions</h2><div class="card">%s</div><h2>Files</h2><div class="card">%s</div>'
+            '<h2>Lookups</h2><div class="card">%s</div><h2>Overview and pages</h2><div class="card">%s</div><h2>Blocklist</h2><div class="card">%s</div>'
+            % (table(tags), esc(SCORE_HELP), table(sessions), table(files), table(lookups), table(overview), table(block)))
+    return page("Help", body, "/help")
+
+
 SEARCH_ROWS = 50
 
 
@@ -5444,7 +5540,7 @@ copyText(b.dataset.copy).then(function(){var t=b.textContent;b.textContent='Copi
 document.querySelectorAll('input[data-filter]').forEach(function(inp){var t=document.getElementById(inp.dataset.filter);if(!t)return;
 inp.addEventListener('input',function(){var q=inp.value.toLowerCase();t.querySelectorAll('tbody tr').forEach(function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0})})});
 (function(){
-var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g p','Personas'],['g e','Engagement'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
+var keys=[['g o','Overview'],['g n','New'],['g a','Attackers'],['g c','Campaigns'],['g p','Personas'],['g e','Engagement'],['g h','Help'],['g f','Files'],['g r','Credentials'],['g b','Blocklist'],['g s','Settings'],
 ['/','Search / filter'],['t','Switch theme'],['Space','Play / pause a replay'],['?','This help'],['Esc','Close']];
 var box=null;function hide(){if(box){box.remove();box=null}}
 function show(){if(box){hide();return}box=document.createElement('div');box.className='kbd-help';var c=document.createElement('div');c.className='card';
@@ -5452,7 +5548,7 @@ var h=document.createElement('h3');h.textContent='Keyboard shortcuts';c.appendCh
 var a=document.createElement('kbd');a.textContent=k[0];var b=document.createElement('span');b.textContent=k[1];r.appendChild(a);r.appendChild(b);c.appendChild(r)});
 box.appendChild(c);box.addEventListener('click',function(e){if(e.target===box)hide()});document.body.appendChild(box)}
 var hb=document.getElementById('kbdHelp');if(hb)hb.addEventListener('click',function(e){e.preventDefault();show()});
-var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',p:'/personas',e:'/engagement',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
+var g=false,gt=null,map={o:'/',n:'/new',a:'/ips',c:'/campaigns',p:'/personas',e:'/engagement',h:'/help',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'};
 document.addEventListener('keydown',function(e){var t=e.target;if(e.ctrlKey||e.metaKey||e.altKey)return;
 if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable)){if(e.key==='Escape')t.blur();return}
 var k=e.key;if(g){g=false;clearTimeout(gt);if(map[k]){location.href=map[k];e.preventDefault()}return}
@@ -5630,7 +5726,7 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".etab td[data-l]::before{content:attr(data-l) ' ';color:var(--muted);font-size:11px}"
         ".pager{flex-wrap:wrap;gap:6px}.sizes{margin-left:8px}.top5 th,.top5 td{padding-left:5px;padding-right:5px}}")
 CSS += "".join(".dist .p%d{flex-grow:%d}" % (n, n) for n in range(1, 101))
-CSS += ".key-input{flex:1 1 360px;max-width:560px;font-family:var(--mono,monospace)}"
+CSS += ".key-input{flex:1 1 360px;max-width:560px;font-family:var(--mono,monospace)}.help td:first-child{width:220px;vertical-align:top}.help td{line-height:1.5}@media (max-width:800px){.help tr{display:block;padding:8px 0;border-bottom:1px solid var(--line)}.help tr:last-child{border:0}.help td,.help td:first-child{display:block;border:0;padding:2px 0;width:auto;white-space:normal}}"
 # 0.28: wide screens (2K) get three columns on the Overview (dense, so a wide card never leaves a hole) and two on Campaigns.
 CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
         "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
@@ -5867,6 +5963,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_personas())
         if path == "/engagement":
             return self.send(200, v_engagement(qs))
+        if path == "/help":
+            return self.send(200, v_help())
         if path == "/receipt":
             return self.send(200, v_receipt(qs))
         if path == "/search":
