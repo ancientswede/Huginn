@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.38.0"
+HUGINN_VERSION = "0.39.0"
 CHANGELOG = [
+    ("0.39.0", "2026-11-14", "Campaigns: scripts that start with the same commands no longer look identical. Each such row shows the first command where it differs from the others (or that it is the same script cut short), and every script has a Preview with all its commands numbered, the differing one marked, so you can choose what to open without opening it. The JSON log setting now says it is for log tools such as Grafana Loki, Graylog or Elasticsearch."),
     ("0.38.0", "2026-11-14", "Metrics for Prometheus and Grafana, off until you turn them on in Settings: events per decoy service, attackers, sessions, blocklist size, sync health and lookup allowances, read with a token. Counts only, never addresses or anything an attacker typed. A ready Grafana dashboard is in examples/grafana. Logs can be JSON for Loki (HUGINN_LOG_FORMAT=json): syncs, collection problems, logins, failed backups and every new error."),
     ("0.37.0", "2026-11-14", "A GreyNoise key can be saved on the Settings page, like the VirusTotal and MalwareBazaar keys. It is tested without using a lookup and never shown again. Without a key Huginn now asks at most 20 addresses a day, under the free allowance; with one, 40."),
     ("0.36.0", "2026-11-14", "Fixes from a deep security and bug review. The decoy cap never drops a web attack, a bait hit or a login with a new kind of password, and knows rows by their content, so two hits at the same second both count and a resent line is never counted twice. A pasted chmod line can no longer make the attacker page slow. Lookups never follow redirects, so a key only ever goes to its own service. A changed GreyNoise answer takes the research mark off again, and web exploits or bait use always keep an attacker on the blocklist. A collection source that stopped stays alerted for 30 days instead of two. MalwareBazaar copes with odd answers and pauses on a refused key. Engagement counts late commands of long sessions and uses a true median; the timeline always shows the newest activity; Files is faster."),
@@ -167,7 +168,7 @@ VT_DAILY = max(0, min(500, int(os.environ.get("HUGINN_VIRUSTOTAL_DAILY", "400") 
 GN_KEY = os.environ.get("HUGINN_GREYNOISE_KEY", "")
 GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if os.environ.get("HUGINN_GREYNOISE_DAILY", "").strip() else -1
 
-# Logging to stderr (journald): "text" (default) or "json", one object per line, for Loki and the like.
+# Logging to stderr (journald): "text" (default) or "json", one object per line, for log tools such as Grafana Loki, Graylog or Elasticsearch.
 LOG_FORMAT = "json" if os.environ.get("HUGINN_LOG_FORMAT", "").strip().lower() == "json" else "text"
 LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40}
 LOG_LEVEL = LOG_LEVELS.get(os.environ.get("HUGINN_LOG_LEVEL", "").strip().lower(), 20 if LOG_FORMAT == "json" else 30)
@@ -2927,13 +2928,53 @@ def first_cmds(con, session, n=2):
     return [r[0] for r in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' AND TRIM(COALESCE(a,''))<>'' ORDER BY ts, rowid LIMIT ?", (session, n))]
 
 
-def script_cell(key, cmds, link=True):
+def script_cell(key, cmds, link=True, diff=None, full=None):
     # What a script does comes first. The hash is only its id, and two scripts can start with the same command.
+    # diff (0.39): ("at", n, command) = first command where this script parts from rows that start the same,
+    # ("ends", n, None) = same start but shorter. full = every command, for the preview under the row.
     label = " ; ".join(clean(c, 90) for c in cmds) or key[:16]
     href = link and re.fullmatch(r"[0-9a-f]{8,64}", key or "")
     head = ('<a class="scr mono" href="/campaign/script/%s" title="%s">%s</a>' % (esc(key), esc(label), esc(label)) if href
             else '<span class="scr mono" title="%s">%s</span>' % (esc(label), esc(label)))
-    return head + ('<div class="hash mono muted">%s</div>' % esc(key[:16]) if cmds else "")
+    if diff and diff[0] == "at":
+        txt = clean(diff[2], 160) or "(empty line)"
+        head += '<div class="scr-diff mono" title="%s"><span class=muted>differs at command %d:</span> %s</div>' % (esc(txt), diff[1], esc(txt))
+    elif diff:
+        head += '<div class="scr-diff mono"><span class=muted>same start, ends after %d command%s</span></div>' % (diff[1], "" if diff[1] == 1 else "s")
+    elif cmds:
+        head += '<div class="hash mono muted">%s</div>' % esc(key[:16])
+    if full:
+        mark = diff[1] if diff and diff[0] == "at" else 0
+        lines = "".join('<div class="pv-l%s"><span class=pv-n>%d</span>%s</div>' % (" pv-d" if i == mark else "", i, esc(clean(c, 200)) or '<span class=muted>(empty)</span>')
+                        for i, c in enumerate(full[:PREVIEW_MAX], 1))
+        more = '<div class="pv-l muted">… %d more, open the campaign for all</div>' % (len(full) - PREVIEW_MAX) if len(full) > PREVIEW_MAX else ""
+        head += '<details class="scr-pv"><summary>Preview · %d command%s</summary><div class="pv mono">%s%s</div></details>' % (len(full), "" if len(full) == 1 else "s", lines, more)
+    return head
+
+
+PREVIEW_MAX = 150
+
+
+def script_diffs(lists, n=2):
+    # Rows whose first n commands read the same: find, for each, the first command (by shape, like the campaign itself)
+    # where it parts from all the others. A script that is only a shorter copy of another "ends after" its last command.
+    out = [None] * len(lists)
+    groups = {}
+    for i, cmds in enumerate(lists):
+        groups.setdefault(tuple(clean(c, 90) for c in cmds[:n]), []).append(i)
+    for idx in groups.values():
+        if len(idx) < 2:
+            continue
+        shapes = {i: [cmd_shape(c) for c in lists[i]] for i in idx}
+        for i in idx:
+            mine = shapes[i]
+            for p in range(1, len(mine) + 1):
+                if all(shapes[j][:p] != mine[:p] for j in idx if j != i):
+                    out[i] = ("at", p, lists[i][p - 1])
+                    break
+            else:
+                out[i] = ("ends", len(mine), None)
+    return out
 
 
 def ip_link(ip, anchor=""):
@@ -5094,9 +5135,12 @@ def v_campaigns(qs=None):
                           + ("HAVING MAX(start)>=? ORDER BY nip7 DESC, nip DESC LIMIT 60" if active else "ORDER BY nip DESC, n DESC LIMIT 60"),
                           (d7, d7) if active else (d7,)).fetchall()
     srows = ""
-    for s in scripts:
+    # 0.39: the whole command list of one session per script, so rows that start alike show where they differ and a preview.
+    fulls = [[c for c in session_commands(con, s["sid"]) if c.strip()] for s in scripts]
+    diffs = script_diffs(fulls)
+    for s, full, diff in zip(scripts, fulls, diffs):
         srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
-            script_cell(s["cmdhash"], first_cmds(con, s["sid"])), num(s["c"]), num(s["nip"]), (num(s["nip7"]) if s["nip7"] else '<span class=muted>–</span>'),
+            script_cell(s["cmdhash"], full[:2], diff=diff, full=full), num(s["c"]), num(s["nip"]), (num(s["nip7"]) if s["nip7"] else '<span class=muted>–</span>'),
             num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
     stabs = ('<div class="chips"><a class="chip%s" href="/campaigns">All time</a><a class="chip%s" href="/campaigns?active=1">Active, 7 days</a></div>'
              % ("" if active else " on", " on" if active else ""))
@@ -5473,7 +5517,7 @@ def metrics_card():
     return ('<div class="card"><h3>Metrics</h3><p>Counts for Prometheus and Grafana: events per decoy, attackers, sessions, blocklist size, '
             'sync health and lookup allowances. No addresses or anything attackers typed. A ready dashboard is in '
             '<span class=mono>examples/grafana</span> in the source.</p><p class="muted small">%s Logs: HUGINN_LOG_FORMAT=json gives one JSON object per line '
-            'for Loki (now: %s).</p>%s%s</div>' % (esc(state), esc(LOG_FORMAT), detail, buttons))
+            'for log tools such as Grafana Loki, Graylog or Elasticsearch (now: %s).</p>%s%s</div>' % (esc(state), esc(LOG_FORMAT), detail, buttons))
 
 
 def base_url(h):
@@ -6111,6 +6155,11 @@ CSS += (":root{--hot:#b4540a}@media (prefers-color-scheme:dark){:root:not([data-
         ".s-hot{color:var(--hot)}.sbar i.hot{background:var(--hot)}.empty{margin:2px 0}.m-row{display:none}"
         ".ip-h{align-items:baseline}h1.ip-title{font-size:26px;font-weight:600;letter-spacing:.2px;overflow-wrap:anywhere}.ip-tags{order:3;flex-basis:100%}"
         ".scr{display:block;max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hash.mono{font-size:11px;margin-top:1px}"
+        ".scr-diff{font-size:12px;margin-top:2px;max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--hot)}"
+        ".scr-pv{margin-top:3px;font-size:12px}.scr-pv summary{cursor:pointer;color:var(--accent);width:max-content}"
+        ".scr-pv .pv{margin-top:4px;max-width:640px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:var(--panel2)}"
+        ".pv-l{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}.pv-n{display:inline-block;min-width:2.6em;color:var(--muted);user-select:none}"
+        ".pv-d{background:var(--accent2);border-radius:3px}"
         ".pager.top{margin:0 0 10px}.sizes{margin-left:14px}.sizes a,.sizes b{margin-left:6px;font-weight:500}.sizes b{color:var(--text)}"
         ".replay-card{max-width:1240px}.twin{border:1px solid var(--line);border-radius:8px;overflow:hidden}"
         ".twin-bar{display:flex;align-items:center;gap:6px;padding:7px 12px;background:var(--panel2);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}"
