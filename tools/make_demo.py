@@ -263,6 +263,22 @@ with con:
     con.execute("INSERT OR REPLACE INTO flags VALUES(?,?,?,?)", (first_camp, "block", "Miner campaign, block for good", NOW))
     research = next(ip for ip, d in ips.items() if d["kind"] == "research")
     con.execute("INSERT OR REPLACE INTO flags VALUES(?,?,?,?)", (research, "allow", "Known research scanner", NOW))
+    # Made-up outside lookups, so the VirusTotal and GreyNoise parts show up (no key is used, nothing is asked).
+    for f in FILES:
+        fam = (f.get("family") or "").lower()
+        v = ({"found": True, "mal": R.randint(28, 44), "sus": R.randint(0, 3), "total": 66, "label": "trojan.%s/%s" % (re.sub(r"[^a-z0-9]", "", fam) or "linux", "linux"),
+              "first": int(NOW - R.uniform(20, 400) * 86400)} if fam or R.random() < 0.4 else {"found": False})
+        v["at"] = int(NOW - R.uniform(0, 2) * 86400)
+        con.execute("INSERT OR REPLACE INTO vt(sha, checked, data) VALUES(?,?,?)", (f["sha"], NOW, json.dumps(v)))
+    for ip, d in ips.items():
+        if d["kind"] == "research":
+            g = {"ip": ip, "noise": True, "classification": "benign", "name": "Example Research Scanner"}
+        elif R.random() < 0.6:
+            g = {"ip": ip, "noise": R.random() < 0.8, "classification": R.choice(["malicious", "malicious", "suspicious", "unknown"])}
+        else:
+            continue
+        g["last_seen"] = time.strftime("%Y-%m-%d", time.gmtime(NOW - R.uniform(0, 3) * 86400))
+        con.execute("INSERT OR REPLACE INTO greynoise(ip, checked, data) VALUES(?,?,?)", (ip, NOW, json.dumps(app.gn_parse(g, ip))))
 for ip in ips:
     with con:
         app.recompute_ip(con, ip)
@@ -305,7 +321,9 @@ def link(m):
         target = "replay/%s.html" % path[8:]
     elif re.fullmatch(r"/campaign/(script|hassh|file)/[0-9a-f]+", path):
         target = path[1:] + ".html"
-    elif path in ("/new", "/personas", "/receipt", "/campaigns", "/files", "/creds", "/blocklist", "/settings"):
+    elif path == "/engagement" and not qs.get("v"):
+        target = "engagement.html" if qs.get("days", "14") == "14" else "engagement-%s.html" % qs.get("days")
+    elif path in ("/new", "/personas", "/receipt", "/campaigns", "/files", "/creds", "/blocklist", "/settings", "/help"):
         target = path[1:] + ".html"
     elif path.startswith("/static/"):
         target = path[1:]
@@ -368,6 +386,9 @@ for kind, sql in (("script", "SELECT DISTINCT cmdhash FROM sessions WHERE cmdhas
         if out:
             save("campaign/%s/%s.html" % (kind, v), fix(out))
 save("files.html", fix(app.v_files()))
+save("help.html", fix(app.v_help()))
+for n in app.ENG_RANGES:
+    save("engagement.html" if n == 14 else "engagement-%d.html" % n, fix(app.v_engagement({"days": str(n)})))
 # The password check works in the demo too: one static answer per hash prefix (missing prefix = not found).
 creds = fix(app.v_creds({"days": "7"}))
 creds = re.sub(r'<div class="card"><h3>Search and export</h3>.*?</div></div>',
@@ -389,8 +410,9 @@ for sha, frames in TTY.items():
 js = app.JS
 js = js.replace("location.href='/ips?days=7&cc='+cc", "location.href='%sips-cc-'+cc+'.html'" % BASE)
 js = js.replace("fetch('/static/world-map.json')", "fetch('%sstatic/world-map.json')" % BASE)
-js = js.replace("map={o:'/',a:'/ips',c:'/campaigns',f:'/files',r:'/creds',b:'/blocklist',s:'/settings'}",
-                "map={o:'%(b)sindex.html',a:'%(b)sips.html',c:'%(b)scampaigns.html',f:'%(b)sfiles.html',r:'%(b)screds.html',b:'%(b)sblocklist.html',s:'%(b)ssettings.html'}" % {"b": BASE})
+_map = re.search(r"map=\{[^}]*\}", js)
+assert _map, "keyboard map not found in app.JS"
+js = js.replace(_map.group(0), re.sub(r"'/([a-z]*)'", lambda m: "'%s%s.html'" % (BASE, m.group(1) or "index"), _map.group(0)))
 js = js.replace("if(f)f.submit()", "if(f)(f.requestSubmit?f.requestSubmit():f.submit())")
 js += r"""
 (function(){var order=['auto','light','dark'];function apply(t){var h=document.documentElement;if(t==='auto')h.removeAttribute('data-theme');else h.setAttribute('data-theme',t);
