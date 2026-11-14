@@ -127,7 +127,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
 - **Blocklists** as plain text, nftables, ipset, MikroTik or CSV, filtered by score and age. There is also a separate **C2 list**: the servers attackers download from and the addresses found inside their malware.
 - **New this week** and **When they attack:** what was new in the last seven days (attackers, countries, campaigns, malware, bait), and a heat map of attacker IPs per hour of the week.
 - **ntfy alerts:** at most one summary per hour, sent only when something worth a look happened (bait taken, new file, human-like session, exploit attempt, SSHole probe), plus a weekly summary on Sunday evening. Huginn also tells you when **collection stops**: no sync from the honeypot, a decoy that went quiet for longer than usual, or a protection missing on the honeypot.
-- **Metrics and JSON logs (optional):** a Prometheus `/metrics` endpoint with a ready Grafana dashboard, and one-JSON-object-per-line logs for Loki. Off until you turn them on. See [Metrics and Grafana](#metrics-and-grafana-optional).
+- **Metrics and JSON logs (optional):** a Prometheus `/metrics` endpoint with a ready Grafana dashboard, and JSON logs for log tools such as Grafana Loki, Graylog or Elasticsearch. Off until you turn them on. See [Metrics and Grafana](#metrics-and-grafana-optional).
 - **Your way:** light, dark or automatic theme, six accent colours, a compact layout, a 12- or 24-hour clock, the columns and overview cards you want, and countries or networks you never want to see (they are still blocklisted). Every attacker can be exported as JSON or CSV. Keyboard shortcuts: press `?`.
 
 Huginn uses only the Python standard library and SQLite. There are no dependencies, no build step and no JavaScript framework. It runs comfortably in a 1 core / 512 MB LXC.
@@ -521,7 +521,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_GREYNOISE_DAILY` | `20` / `40` | Most GreyNoise community lookups a day (20 without a key, 40 with one), top attackers first; `0` = off. Benign mass scanners count as research unless they logged in or ran something |
 | `HUGINN_GREYNOISE_KEY` | – | Optional free GreyNoise key for a larger allowance. Can also be pasted on the Settings page (Lookups), where it is tested without using a lookup and never shown again. Free key at [viz.greynoise.io](https://viz.greynoise.io) |
 | `HUGINN_METRICS_TOKEN` | – | Turns on `/metrics` with this bearer token (16+ characters). Otherwise turn metrics on in Settings |
-| `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line (Loki) |
+| `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line, for log tools such as Grafana Loki, Graylog or Elasticsearch |
 | `HUGINN_LOG_LEVEL` | `warning` / `info` | `debug`, `info`, `warning` or `error`; the default is `info` with JSON logs |
 | `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
 | `HUGINN_ALLOWED_HOSTS` | (empty) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding |
@@ -555,9 +555,9 @@ Huginn can serve counts for [Prometheus](https://prometheus.io) on `/metrics`, f
 
 What is in it: events per source, kind and decoy service (a counter for `rate()`, and the last 24 hours), active and new attackers, SSH/Telnet sessions and logins, captured files, blocklist size, repeated decoy tries not stored, sync time and errors, collection problems, lookup allowances used and paused, database size and the last backup. **Never addresses, usernames, passwords or commands**: one label per attacker would also give Prometheus a new time series for every address. Details stay in Huginn. **New token** in Settings stops the old one at once.
 
-### JSON logs for Loki
+### JSON logs for log tools
 
-Huginn logs to stderr (the systemd journal, or `docker logs`). With `HUGINN_LOG_FORMAT=json` each line is one JSON object, ready for Loki, Promtail or Grafana Alloy:
+Huginn logs to stderr (the systemd journal, or `docker logs`). With `HUGINN_LOG_FORMAT=json` each line is one JSON object, so a log tool such as Grafana Loki, Graylog or Elasticsearch (fed by Alloy, Promtail, Vector, Fluent Bit or similar) can filter on its fields, for example every `login_failed`, or alert on `collection_problem`:
 
 ```json
 {"ts": "2026-11-14T12:00:00.123Z", "level": "info", "app": "huginn", "event": "sync", "new": 41, "rows": 41, "files": 0, "secs": 1.2}
