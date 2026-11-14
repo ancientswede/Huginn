@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.39.0"
+HUGINN_VERSION = "0.40.0"
 CHANGELOG = [
+    ("0.40.0", "2026-11-14", "An optional goodbye: when someone who really logged in types exit or logout, the honeypot can answer with a short note: how long they stayed, how many lines they typed, and that all of it is logged along with their address. Off by default; turn it on with update-honeypot.sh --goodbye-on (and off with --goodbye-off), no restart. It never shows for sh -c, scripts, nested shells or bots that just disconnect, and only at the very end, so it does not change what is collected. The session log shows who got it, and Account says whether it is on. Update the honeypot (update-honeypot.sh) for the patch. Also from a review before release: Campaigns compares long scripts quickly (a crafted script with thousands of repeated commands made the page slow), groups rows by the shape of their first commands, no longer says \"ends after\" for two rows that read the same, and a failed Cowrie upgrade puts Huginn's patches back on the old version."),
     ("0.39.0", "2026-11-14", "Campaigns: scripts that start with the same commands no longer look identical. Each such row shows the first command where it differs from the others (or that it is the same script cut short), and every script has a Preview with all its commands numbered, the differing one marked, so you can choose what to open without opening it. The JSON log setting now says it is for log tools such as Grafana Loki, Graylog or Elasticsearch."),
     ("0.38.0", "2026-11-14", "Metrics for Prometheus and Grafana, off until you turn them on in Settings: events per decoy service, attackers, sessions, blocklist size, sync health and lookup allowances, read with a token. Counts only, never addresses or anything an attacker typed. A ready Grafana dashboard is in examples/grafana. Logs can be JSON for Loki (HUGINN_LOG_FORMAT=json): syncs, collection problems, logins, failed backups and every new error."),
     ("0.37.0", "2026-11-14", "A GreyNoise key can be saved on the Settings page, like the VirusTotal and MalwareBazaar keys. It is tested without using a lookup and never shown again. Without a key Huginn now asks at most 20 addresses a day, under the free allowance; with one, 40."),
@@ -511,6 +512,13 @@ def p_cowrie(line):
         if not re.fullmatch(r"[0-9a-f]{64}", sha):
             return None
         kind, a, b = "exec_sim", clean(("%s %s" % (ev.get("path") or "?", ev.get("args") or "")).strip(), 300), sha
+    elif k == "cowrie.session.hp-goodbye":
+        # Huginn's optional Cowrie patch (0.40): the login typed exit/logout and got the goodbye note. Numbers only.
+        try:
+            secs, n = int(ev.get("secs") or 0), int(ev.get("commands") or 0)
+        except (TypeError, ValueError):
+            return None
+        kind, a = "goodbye", "%d s, %d line%s typed" % (max(0, min(secs, 10 ** 7)), max(0, min(n, 10 ** 6)), "" if n == 1 else "s")
     elif k == "cowrie.direct-tcpip.hp-reply":
         # Huginn's Cowrie patch answered a proxy check (http200) or held TLS (hold); see honeypot/patches.py.
         how, req = ev.get("hp_reply"), ev.get("hp_request")
@@ -921,7 +929,7 @@ def parse_export(text, skip):
     return rows, hashes
 
 
-STATUS_LINE = re.compile(r"^(sandbox|limits|running|patch):([a-z0-9-]{1,20}) (ok|missing)$")
+STATUS_LINE = re.compile(r"^(sandbox|limits|running|patch|option):([a-z0-9-]{1,20}) (ok|missing)$")   # option: a choice, never alerted on
 
 
 def parse_status(lines):
@@ -2252,7 +2260,7 @@ def protection_missing(con):
     items, at = protection_status(con)
     if not items or time.time() - at > 3600:          # nothing reported recently: the sync check covers that
         return []
-    return sorted(k for k, ok in items.items() if not ok)
+    return sorted(k for k, ok in items.items() if not ok and not k.startswith("option:"))
 
 
 def protection_label(key):
@@ -2267,9 +2275,12 @@ def protection_note(con):
     missing = protection_missing(con)
     kinds = lambda w: sum(1 for k in items if k.startswith(w + ":"))
     ok = "sandbox and limits on %d services, %d patches" % (kinds("sandbox"), kinds("patch"))
+    # 0.40: the logout note is a choice, shown here but never a problem.
+    bye = ("" if "option:goodbye" not in items else
+           " · logout note %s" % ("on" if items["option:goodbye"] else "off (update-honeypot.sh --goodbye-on)"))
     if missing:
-        return '<span class="err">missing: %s</span> · reported %s' % (esc(", ".join(protection_label(k) for k in missing)), esc(ago(at)))
-    return "all in place: %s · reported %s" % (esc(ok), esc(ago(at)))
+        return '<span class="err">missing: %s</span> · reported %s%s' % (esc(", ".join(protection_label(k) for k in missing)), esc(ago(at)), esc(bye))
+    return "all in place: %s · reported %s%s" % (esc(ok), esc(ago(at)), esc(bye))
 
 
 def health_note(con):
@@ -2947,33 +2958,52 @@ def script_cell(key, cmds, link=True, diff=None, full=None):
         mark = diff[1] if diff and diff[0] == "at" else 0
         lines = "".join('<div class="pv-l%s"><span class=pv-n>%d</span>%s</div>' % (" pv-d" if i == mark else "", i, esc(clean(c, 200)) or '<span class=muted>(empty)</span>')
                         for i, c in enumerate(full[:PREVIEW_MAX], 1))
-        more = '<div class="pv-l muted">… %d more, open the campaign for all</div>' % (len(full) - PREVIEW_MAX) if len(full) > PREVIEW_MAX else ""
-        head += '<details class="scr-pv"><summary>Preview · %d command%s</summary><div class="pv mono">%s%s</div></details>' % (len(full), "" if len(full) == 1 else "s", lines, more)
+        more = ('<div class="pv-l muted">… %s%d more, open the campaign for all</div>' % ("at least " if len(full) >= DIFF_MAX else "", len(full) - PREVIEW_MAX)
+                if len(full) > PREVIEW_MAX else "")
+        count = ("%d+" % len(full)) if len(full) >= DIFF_MAX else str(len(full))
+        head += '<details class="scr-pv"><summary>Preview · %s command%s</summary><div class="pv mono">%s%s</div></details>' % (count, "" if len(full) == 1 else "s", lines, more)
     return head
 
 
 PREVIEW_MAX = 150
+DIFF_MAX = 1000          # commands per script read for Campaigns (comparison and preview)
 
 
 def script_diffs(lists, n=2):
-    # Rows whose first n commands read the same: find, for each, the first command (by shape, like the campaign itself)
-    # where it parts from all the others. A script that is only a shorter copy of another "ends after" its last command.
+    # Rows whose first n commands have the same shape (like the campaigns themselves): find, for each, the first command
+    # where it parts from all the others. Shapes are worked out once; within a group the rows are sorted, so the longest
+    # shared start with any other row is with a neighbour (no comparing every pair, 0.40 after review). A row that is a
+    # strict start of a longer one "ends after" its last command; rows that read the same as another get nothing.
+    shapes = [[cmd_shape(c) for c in cmds[:DIFF_MAX]] for cmds in lists]
     out = [None] * len(lists)
     groups = {}
-    for i, cmds in enumerate(lists):
-        groups.setdefault(tuple(clean(c, 90) for c in cmds[:n]), []).append(i)
+    for i, sh in enumerate(shapes):
+        if sh:
+            groups.setdefault(tuple(sh[:n]), []).append(i)
+
+    def common(a, b):
+        k, m = 0, min(len(a), len(b))
+        while k < m and a[k] == b[k]:
+            k += 1
+        return k
     for idx in groups.values():
         if len(idx) < 2:
             continue
-        shapes = {i: [cmd_shape(c) for c in lists[i]] for i in idx}
-        for i in idx:
+        order = sorted(idx, key=lambda i: shapes[i])
+        for pos, i in enumerate(order):
             mine = shapes[i]
-            for p in range(1, len(mine) + 1):
-                if all(shapes[j][:p] != mine[:p] for j in idx if j != i):
-                    out[i] = ("at", p, lists[i][p - 1])
-                    break
+            near = [order[q] for q in (pos - 1, pos + 1) if 0 <= q < len(order)]
+            best = max(common(mine, shapes[j]) for j in near)
+            if best < len(mine):
+                out[i] = ("at", best + 1, lists[i][best])
             else:
-                out[i] = ("ends", len(mine), None)
+                # A longer row that starts with all of mine sorts right after it (after any equal rows).
+                for j in order[pos + 1:]:
+                    if common(mine, shapes[j]) < len(mine):
+                        break
+                    if len(shapes[j]) > len(mine):
+                        out[i] = ("ends", len(mine), None)
+                        break
     return out
 
 
@@ -3383,6 +3413,8 @@ def board_text(kind, a, b):
         return "%s%s" % (a or "?", ("  sha256 " + b[:16]) if b else "")
     if kind == "exec_sim":
         return "ran an uploaded program (simulated): %s" % (a or "?")
+    if kind == "goodbye":
+        return "logged out and got the goodbye note (%s)" % (a or "?")
     if kind == "file_fail":
         return "download failed: %s" % (a or "?")
     if kind == "tcpip":
@@ -4125,7 +4157,7 @@ def v_ip(ip, qs=None):
     evs = {}
     if sids:
         ph = ",".join("?" * len(sids))
-        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','exec_sim','tcpip','proxy_reply','exploit') ORDER BY ts" % ph, sids):
+        for x in con.execute("SELECT session,ts,kind,a,b FROM events WHERE session IN (%s) AND kind IN ('login_ok','login_fail','cmd','file','file_fail','exec_sim','tcpip','proxy_reply','exploit','goodbye') ORDER BY ts" % ph, sids):
             evs.setdefault(x["session"], []).append(x)
     def sess_block(s, more=""):
         ev = evs.get(s["session"], [])
@@ -4154,6 +4186,8 @@ def v_ip(ip, qs=None):
                              % (rel_t, esc(clean(x["a"], 300)), esc(x["b"]), esc((x["b"] or "")[:16])))
             elif k == "file_fail":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, cmd_html(clean(x["a"], 300))))
+            elif k == "goodbye":
+                lines.append('<div class="ln"><span class=t>%s</span><span class="pr">bye</span><code>got the goodbye note on logout (%s)</code></div>' % (rel_t, esc(clean(x["a"], 60))))
             elif k == "tcpip":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">proxy</span><code>→ %s</code></div>' % (rel_t, esc(x["a"])))
             elif k == "proxy_reply":
@@ -5136,7 +5170,8 @@ def v_campaigns(qs=None):
                           (d7, d7) if active else (d7,)).fetchall()
     srows = ""
     # 0.39: the whole command list of one session per script, so rows that start alike show where they differ and a preview.
-    fulls = [[c for c in session_commands(con, s["sid"]) if c.strip()] for s in scripts]
+    fulls = [[r[0] for r in con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' AND TRIM(COALESCE(a,''))<>'' "
+                                         "ORDER BY ts, rowid LIMIT ?", (s["sid"], DIFF_MAX))] for s in scripts]
     diffs = script_diffs(fulls)
     for s, full, diff in zip(scripts, fulls, diffs):
         srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (

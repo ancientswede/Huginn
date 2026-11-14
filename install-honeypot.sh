@@ -311,6 +311,8 @@ if [ -f "$C/src/cowrie/commands/ping.py" ]; then
   case $rc in 0|3) ok "wget answers like the persona's own wget" ;; *) warn "wget not patched (Cowrie changed); harmless" ;; esac
   rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
   case $rc in 0|3) ok "uploaded programs run silently (simulated, logged)" ;; *) warn "exec not patched (Cowrie changed); harmless" ;; esac
+  rc=0; patch_as cowrie cowrie-goodbye "$C/src/cowrie" || rc=$?
+  case $rc in 0|3) ok "logout note ready ($( [ -f /etc/huginn-goodbye ] && echo on || echo 'off; turn on with update-honeypot.sh --goodbye-on' ))" ;; *) warn "goodbye not patched (Cowrie changed); harmless" ;; esac
 fi
 cat > /etc/systemd/system/cowrie.service <<EOF
 [Unit]

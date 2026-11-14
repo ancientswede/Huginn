@@ -3,6 +3,7 @@
 #
 #   cd Huginn && git pull && ./update-honeypot.sh                  hp-export, hp-fileinfo, hp-traps
 #   ./update-honeypot.sh --cowrie --opencanary                     ...and upgrade Cowrie / OpenCanary too
+#   ./update-honeypot.sh --goodbye-on | --goodbye-off              only turn the logout note on or off (nothing else changes)
 #
 # Configs, personas, bait, logs and keys are never replaced. Huginn's small patches to Cowrie and
 # OpenCanary are put back after an upgrade. Run as root. Your admin SSH port is not touched.
@@ -11,11 +12,14 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 UP_COWRIE=0
 UP_CANARY=0
+GOODBYE=""
 for a in "$@"; do
   case "$a" in
     --cowrie) UP_COWRIE=1 ;;
     --opencanary) UP_CANARY=1 ;;
-    -h|--help) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --goodbye-on) GOODBYE=on ;;
+    --goodbye-off) GOODBYE=off ;;
+    -h|--help) sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $a"; exit 2 ;;
   esac
 done
@@ -26,6 +30,20 @@ warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
+
+# The logout note (honeypot/patches.py hp_goodbye): a root-owned flag file Cowrie only checks for. Read at every logout,
+# so no restart. Only this when asked for: the note is a choice, not part of an update.
+if [ -n "$GOODBYE" ]; then
+  if [ "$GOODBYE" = on ]; then
+    [ ! -L /etc/huginn-goodbye ] || die "/etc/huginn-goodbye is a symlink; remove it first."
+    install -m 644 -o root -g root /dev/null /etc/huginn-goodbye
+    printf '    \033[32mok\033[0m %s\n' "logout note on: a real login that types exit or logout gets a short goodbye"
+  else
+    rm -f /etc/huginn-goodbye
+    printf '    \033[32mok\033[0m %s\n' "logout note off"
+  fi
+  exit 0
+fi
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
 for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
@@ -70,27 +88,39 @@ if [ "$UP_COWRIE" = 1 ]; then
   say "Cowrie"
   [ -d "$C/.git" ] || die "$C is not a git checkout of Cowrie."
   FREE="$C/src/cowrie/commands/free.py"
+cowrie_patches() {  # every Huginn patch on the Cowrie source in $C (after an upgrade, or after a failed one); counts misses in PFAIL
+    PFAIL=0
+    rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
+    case $rc in 0|3) ok "free.py patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "free.py patch no longer fits the new Cowrie (harmless: free shows the host's memory)" ;; esac
+    rc=0; patch_as cowrie cowrie-forward "$C/src/cowrie/ssh/forwarding.py" || rc=$?
+    case $rc in 0|3) ok "proxy reply patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "proxy reply patch no longer fits the new Cowrie (harmless: proxy checks are refused as before)" ;; esac
+    rc=0; patch_as cowrie cowrie-ping "$C/src/cowrie/commands/ping.py" || rc=$?
+    case $rc in 0|3) ok "ping patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "ping patch no longer fits the new Cowrie (harmless: ping -c fails as upstream)" ;; esac
+    rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
+    case $rc in 0|3) ok "upload patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "upload patch no longer fits the new Cowrie (harmless: uploads vanish as upstream)" ;; esac
+    rc=0; patch_as cowrie cowrie-wget "$C/src/cowrie/commands/wget.py" || rc=$?
+    case $rc in 0|3) ok "wget patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "wget patch no longer fits the new Cowrie (harmless: GNU wget text everywhere)" ;; esac
+    rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
+    case $rc in 0|3) ok "exec patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "exec patch no longer fits the new Cowrie (harmless: Exec format error as upstream)" ;; esac
+    rc=0; patch_as cowrie cowrie-goodbye "$C/src/cowrie" || rc=$?
+    case $rc in 0|3) ok "goodbye patch in place" ;; *) PFAIL=$((PFAIL+1)); warn "goodbye patch no longer fits the new Cowrie (harmless: no logout note)" ;; esac
+}
   # Put Cowrie's own free.py back so git can update it, then patch the new version again.
   runuser -u cowrie -- git -C "$C" checkout -- src/cowrie/commands/free.py src/cowrie/ssh/forwarding.py src/cowrie/commands/ping.py \
     src/cowrie/shell/server.py src/cowrie/shell/session.py src/cowrie/shell/filetransfer.py \
-    src/cowrie/commands/scp.py src/cowrie/shell/fs.py src/cowrie/commands/wget.py src/cowrie/shell/protocol.py 2>/dev/null || true
+    src/cowrie/commands/scp.py src/cowrie/shell/fs.py src/cowrie/commands/wget.py src/cowrie/shell/protocol.py \
+    src/cowrie/commands/bash.py 2>/dev/null || true
   BEFORE=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
-  runuser -u cowrie -- git -C "$C" pull -q --ff-only || die "git pull failed in $C (local changes?) — Cowrie was not updated."
+  back_or_die() {  # put the patches back on whatever source is there now, then stop with an honest message
+    cowrie_patches
+    if [ "$PFAIL" = 0 ]; then die "$1 Huginn's patches are back on the source in $C; restart Cowrie only after checking it."
+    else die "$1 $PFAIL Huginn patch(es) could not be put back (see the warnings above); do not restart Cowrie before fixing $C."; fi
+  }
+  runuser -u cowrie -- git -C "$C" pull -q --ff-only || back_or_die "git pull failed in $C (local changes?) — Cowrie was not updated."
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
-  runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ."
+  runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ." || back_or_die "pip install failed in $C after the update."
   ok "Cowrie $BEFORE -> $AFTER"
-  rc=0; patch_as cowrie cowrie-free "$FREE" || rc=$?
-  case $rc in 0|3) ok "free.py patch in place" ;; *) warn "free.py patch no longer fits the new Cowrie (harmless: free shows the host's memory)" ;; esac
-  rc=0; patch_as cowrie cowrie-forward "$C/src/cowrie/ssh/forwarding.py" || rc=$?
-  case $rc in 0|3) ok "proxy reply patch in place" ;; *) warn "proxy reply patch no longer fits the new Cowrie (harmless: proxy checks are refused as before)" ;; esac
-  rc=0; patch_as cowrie cowrie-ping "$C/src/cowrie/commands/ping.py" || rc=$?
-  case $rc in 0|3) ok "ping patch in place" ;; *) warn "ping patch no longer fits the new Cowrie (harmless: ping -c fails as upstream)" ;; esac
-  rc=0; patch_as cowrie cowrie-upload "$C/src/cowrie" || rc=$?
-  case $rc in 0|3) ok "upload patch in place" ;; *) warn "upload patch no longer fits the new Cowrie (harmless: uploads vanish as upstream)" ;; esac
-  rc=0; patch_as cowrie cowrie-wget "$C/src/cowrie/commands/wget.py" || rc=$?
-  case $rc in 0|3) ok "wget patch in place" ;; *) warn "wget patch no longer fits the new Cowrie (harmless: GNU wget text everywhere)" ;; esac
-  rc=0; patch_as cowrie cowrie-exec "$C/src/cowrie/shell/protocol.py" || rc=$?
-  case $rc in 0|3) ok "exec patch in place" ;; *) warn "exec patch no longer fits the new Cowrie (harmless: Exec format error as upstream)" ;; esac
+  cowrie_patches
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
 
@@ -153,6 +183,12 @@ if [ "$UP_COWRIE" = 0 ] && [ -f "$FWD" ]; then
     0) ok "uploaded programs run silently now (simulated, logged)"; CHANGED=1 ;;
     3) ok "exec patch in place" ;;
     *) warn "exec patch did not fit this Cowrie; no files changed" ;;
+  esac
+  rc=0; patch_as cowrie cowrie-goodbye "$C/src/cowrie" || rc=$?
+  case $rc in
+    0) ok "logout note ready now ($( [ -f /etc/huginn-goodbye ] && echo on || echo 'off; turn on with --goodbye-on' ))"; CHANGED=1 ;;
+    3) ok "goodbye patch in place" ;;
+    *) warn "goodbye patch did not fit this Cowrie; no files changed" ;;
   esac
   if [ "$CHANGED" = 1 ]; then
     for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done

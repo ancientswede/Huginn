@@ -10,6 +10,7 @@
 #   patches.py cowrie-upload DIR       a file uploaded over SFTP/scp is still there for the next command (DIR = src/cowrie)
 #   patches.py cowrie-wget FILE        wget prints what a real wget prints (BusyBox on the camera, no early "connected")
 #   patches.py cowrie-exec FILE        an uploaded program for this CPU "runs" silently and is logged (nothing is executed)
+#   patches.py cowrie-goodbye DIR      optional note on logout of a real login (off unless /etc/huginn-goodbye exists; DIR = src/cowrie)
 #
 # Exit code: 0 = patched/changed, 3 = already patched/nothing to do, 1 = the upstream code changed (not patched).
 import hashlib, json, sys
@@ -472,6 +473,26 @@ EXEC_NEW = ('                    self.exit_code = 126\n'
             '                run_script_file(\n')
 EXEC_HELPER = '\n\n# Huginn exec helper v1. Nothing is ever executed: an uploaded program for this persona\'s CPU "runs" silently (exit 0), and\n# the attempt is logged with its arguments and hash. Wrong CPU keeps upstream\'s "cannot execute binary file", as a real box.\nimport hashlib as hp_hashlib\n\nHP_ELF_MACHINES = {"aarch64": {183}, "x64": {62, 3}, "x86": {3}, "arm": {40}, "mips": {8}, "ppc": {20, 21}}\n\n\ndef hp_exec_sim(cmd, path, name):\n    try:\n        data = cmd.fs.file_contents(path)\n    except Exception:\n        return False\n    if not isinstance(data, bytes) or len(data) < 20 or data[:4] != b"\\x7fELF":\n        return False\n    machine = int.from_bytes(data[18:20], "little" if data[5] == 1 else "big")\n    try:\n        arch = str(cmd.protocol.user.server.arch or "")\n    except Exception:\n        arch = ""\n    family = next((k for k in HP_ELF_MACHINES if k in arch), "")\n    if machine not in HP_ELF_MACHINES.get(family, set()):\n        return False\n    try:\n        cmd.protocol.events.dispatch(\n            "cowrie.session.hp-exec",\n            "huginn: simulated run of %(path)s",\n            path=str(path)[:300],\n            args=" ".join(str(a) for a in cmd.args)[:500],\n            shasum=hp_hashlib.sha256(data).hexdigest(),\n            arch=arch,\n        )\n    except Exception:\n        pass\n    cmd.exit_code = 0\n    return True\n'
 
+# Optional, off by default: a short note when a real login logs out (exit/logout), see hp_goodbye.
+GOODBYE_OLD = ('        self.exit_code = code\n'
+               '        shell.exit_shell(code)\n')
+GOODBYE_NEW = ('        self.exit_code = code\n'
+               '        # Huginn goodbye v1: a note on logout of a real login, only when turned on (see hp_goodbye).\n'
+               '        hp_goodbye(self, shell)\n'
+               '        shell.exit_shell(code)\n')
+GOODBYE_HELPER = '\n\n# Huginn goodbye helper v1. Off unless the file /etc/huginn-goodbye exists (update-honeypot.sh --goodbye-on). Only when a real\n# interactive login logs out of its own top shell: never for "sh -c", exec, a script or a nested shell, so a bot that never\n# types exit sees nothing and the box looks the same while it is being used. All the data is already logged by then.\nimport os as hp_gb_os\nimport random as hp_gb_random\nimport time as hp_gb_time\n\nHP_GOODBYE_FLAG = "/etc/huginn-goodbye"\nHP_GOODBYE_LAST = ("Have a nice day.", "Better luck on the next box.", "Say hi to the rest of the botnet.", "See you in the logs.")\n\n\ndef hp_goodbye_time(secs):\n    s = int(max(0, secs))\n    if s < 60:\n        return "%d s" % s\n    if s < 3600:\n        return "%d min %d s" % (s // 60, s % 60)\n    return "%d h %d min" % (s // 3600, s % 3600 // 60)\n\n\ndef hp_goodbye_text(secs, commands, ip, last):\n    return ("\\n  Thanks for the %s%s.\\n  You typed %d line%s. All of it is logged, along with your address.\\n  %s\\n\\n"\n            % (hp_goodbye_time(secs), (", " + ip) if ip else "", commands, "" if commands == 1 else "s", last))\n\n\ndef hp_goodbye(cmd, shell):\n    try:\n        if not hp_gb_os.path.isfile(HP_GOODBYE_FLAG):\n            return\n        proto = cmd.protocol\n        stack = getattr(proto, "cmdstack", None) or []\n        if not getattr(shell, "interactive", False) or not stack or stack[0] is not shell:\n            return\n        secs = hp_gb_time.time() - float(getattr(proto, "logintime", 0) or hp_gb_time.time())\n        typed = getattr(proto, "hp_lines", None)                                  # prompt lines, nested shells too (protocol.py patch)\n        if typed is None:\n            typed = len(getattr(proto, "historyLines", None) or [])               # top shell only, if that patch is missing\n        commands = max(0, int(typed) - 1)                                         # the exit line itself is not counted\n        ip = str(getattr(proto, "realClientIP", "") or "")[:64]\n        cmd.write(hp_goodbye_text(secs, commands, ip, hp_gb_random.choice(HP_GOODBYE_LAST)))\n        proto.events.dispatch("cowrie.session.hp-goodbye", "huginn: goodbye shown after %(secs)s s",\n                              secs=int(secs), commands=commands)\n    except Exception:\n        pass\n'
+
+# Cowrie keeps a history only for the top shell; count every line typed, in nested shells too, for the note.
+GOODBYE_COUNT_OLD = ('    def handle_RETURN(self) -> None:\n'
+                     '        if len(self.cmdstack) == 1:\n')
+GOODBYE_COUNT_NEW = ('    def handle_RETURN(self) -> None:\n'
+                     '        # Huginn goodbye count v1: lines typed at a shell prompt, also a nested one (not passwords or program input).\n'
+                     '        if (not getattr(self, "password_input", False) and self.cmdstack\n'
+                     '                and type(self.cmdstack[-1]).__name__ == "HoneyPotShell"\n'
+                     '                and any(c not in (b" ", b"\\t") for c in self.lineBuffer)):\n'
+                     '            self.hp_lines = getattr(self, "hp_lines", 0) + 1\n'
+                     '        if len(self.cmdstack) == 1:\n')
+
 
 def patch_append(path, marker, old, new, helper):
     # Replace one block and append a helper, all at once (see write_group).
@@ -493,6 +514,29 @@ def cowrie_exec(path):
     return patch_append(path, "Huginn exec v1", EXEC_OLD, EXEC_NEW, EXEC_HELPER)
 
 
+def cowrie_goodbye(srcdir):
+    # Two files, all or none: the note in commands/bash.py and the line counter in shell/protocol.py.
+    import os
+    changes = {}
+    for rel, marker, old, new, helper in (("commands/bash.py", "Huginn goodbye v1", GOODBYE_OLD, GOODBYE_NEW, GOODBYE_HELPER),
+                                          ("shell/protocol.py", "Huginn goodbye count v1", GOODBYE_COUNT_OLD, GOODBYE_COUNT_NEW, "")):
+        path = os.path.join(srcdir, rel)
+        try:
+            s = open(path).read()
+        except OSError:
+            return 1
+        if marker in s:
+            continue
+        if s.count(old) != 1:
+            return 1
+        out = s.replace(old, new) + helper
+        compile(out, path, "exec")
+        changes[path] = (s, out)
+    if not changes:
+        return 3
+    return write_group(changes)
+
+
 def opencanary_ports(p):
     c = json.load(open(p))
     mods = {k[:-8] for k in c if k.endswith(".enabled")}
@@ -510,8 +554,8 @@ def opencanary_ports(p):
 
 if __name__ == "__main__":
     cmds = {"cowrie-free": cowrie_free, "cowrie-forward": cowrie_forward, "cowrie-ping": cowrie_ping,
-            "cowrie-upload": cowrie_upload, "cowrie-wget": cowrie_wget, "cowrie-exec": cowrie_exec,
+            "cowrie-upload": cowrie_upload, "cowrie-wget": cowrie_wget, "cowrie-exec": cowrie_exec, "cowrie-goodbye": cowrie_goodbye,
             "opencanary-http": opencanary_http, "opencanary-ports": opencanary_ports}
     if len(sys.argv) != 3 or sys.argv[1] not in cmds:
-        sys.exit("usage: patches.py {cowrie-free|cowrie-forward|cowrie-ping|cowrie-upload|cowrie-wget|cowrie-exec|opencanary-http|opencanary-ports} FILE")
+        sys.exit("usage: patches.py {cowrie-free|cowrie-forward|cowrie-ping|cowrie-upload|cowrie-wget|cowrie-exec|cowrie-goodbye|opencanary-http|opencanary-ports} FILE")
     sys.exit(cmds[sys.argv[1]](sys.argv[2]))

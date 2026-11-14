@@ -29,6 +29,14 @@ if [ "$rc" = 0 ] && (cd "$W/cowrie/src/cowrie" && python3 -m py_compile shell/se
 else
   echo "FAIL  Cowrie upload (patches.py exit $rc)"; FAIL=1
 fi
+# The goodbye patch changes two files at once (all or none).
+rc=0
+python3 "$HERE/honeypot/patches.py" cowrie-goodbye "$W/cowrie/src/cowrie" || rc=$?
+if [ "$rc" = 0 ] && (cd "$W/cowrie/src/cowrie" && python3 -m py_compile commands/bash.py shell/protocol.py); then
+  echo "ok    Cowrie goodbye (bash, protocol)"
+else
+  echo "FAIL  Cowrie goodbye (patches.py exit $rc)"; FAIL=1
+fi
 
 python3 -m pip download -q --no-deps --no-binary :none: -d "$W/oc" opencanary >/dev/null
 WHL=$(ls "$W"/oc/opencanary-*.whl 2>/dev/null | head -1 || true)

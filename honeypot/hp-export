@@ -107,7 +107,13 @@ if [ -d "$src" ]; then
   mark upload "$src/shell/server.py" "Huginn upload v1"
   mark wget "$src/commands/wget.py" "Huginn wget v1"
   mark exec "$src/shell/protocol.py" "Huginn exec v1"
+  # Two files, one patch: the note (bash.py) and the line counter (protocol.py) must both be there.
+  # Same order as mark(): a regular file that is not a symlink, and only then read it.
+  p="$src/shell/protocol.py"
+  if [ -f "$p" ] && [ ! -L "$p" ] && grep -qsF "Huginn goodbye count v1" "$p"; then mark goodbye "$src/commands/bash.py" "Huginn goodbye v1"; else echo "patch:goodbye missing"; fi
 fi
+# A choice, not protection: "ok" = the logout note is on. Huginn shows it and never alerts on it.
+if [ -f /etc/huginn-goodbye ] && [ ! -L /etc/huginn-goodbye ]; then echo "option:goodbye ok"; else echo "option:goodbye missing"; fi
 for f in "$(dirname "$OPENCANARY_LOG")"/oc-env/lib/python3*/site-packages/opencanary/modules/http.py; do
   [ -f "$f" ] && mark webreply "$f" "Huginn webreply"
   break
