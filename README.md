@@ -512,6 +512,8 @@ Cowrie and OpenCanary show what attackers *do*. [Suricata](https://suricata.io) 
 
 That is all. The script installs Debian's `suricata` package, writes Huginn's config, fetches the rules, starts it and checks that it runs. Huginn picks the alerts up with the next sync; there is nothing to change on the Huginn machine or in your router.
 
+After that, **Settings › Honeypot** has a button to turn Suricata off and on again. Like the logout note, it is a fixed command to the locked export key (`ids on` / `ids off`): it only starts or stops a Suricata that is already set up, and never installs or configures anything.
+
 - **It only listens.** Suricata reads a copy of the packets on the honeypot's own network card. It never blocks, changes or forwards anything, and needs no mirror port or router feature. Traffic to and from your admin SSH on this machine (every port sshd listens on, and with it Huginn's own fetches) is left out; an attacker who connects *from* that port number to a honeypot service is still watched.
 - **It does not run as root.** Suricata starts as root only to open the network card, then runs as the user `hp-suricata`, keeping only the capabilities packet capture needs (`NET_RAW`, `NET_ADMIN`, plus `SYS_NICE`), in a systemd sandbox that cannot see `/home` (where Cowrie lives). Its log folder stays root's: Suricata can only append to the two log files root made for it, so it cannot plant links or other files there for root to open.
 - **Only alerts are exported**, as a few fixed fields: time, address, port, protocol, rule number, severity, rule name and class. No payloads, flows or DNS. The honeypot's own fake replies also match rules (a planted `/etc/passwd` looks like a leak), so only alerts on traffic *to* the honeypot count.

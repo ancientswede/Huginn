@@ -3,7 +3,9 @@
 # Runs as a forced command in /root/.ssh/authorized_keys on the honeypot:
 #   restrict,command="/usr/local/bin/hp-export" ssh-ed25519 AAAA... huginn
 # No command: prints all logs in sections. "tty <sha256>": one Cowrie session recording as base64.
-# "goodbye on" / "goodbye off": the only change Huginn can make here, the optional logout note (Settings in Huginn).
+# "goodbye on" / "goodbye off": the optional logout note (Settings in Huginn).
+# "ids on" / "ids off": start or stop a Suricata that update-honeypot.sh --suricata-on already set up. Nothing is
+# installed or configured this way. These four commands are the only changes Huginn can make here.
 # "tty <sha256> <sha256> ...": up to 50 recordings, one line each: "<sha256> <base64>" or "<sha256> -" if gone.
 # Settings (optional) in /etc/default/hp-export:
 COWRIE_DIRS="/home/cowrie/cowrie"            # one or more Cowrie install dirs (several = several personas)
@@ -54,6 +56,26 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     if [ -f "$f" ] && [ ! -L "$f" ]; then now=on; else now=off; fi
     [ "$now" = "$want" ] || { echo "goodbye is still $now" >&2; exit 2; }
     echo "goodbye $now"
+    exit 0 ;;
+  "ids on"|"ids off")
+    # 0.44: Suricata on or off from Huginn's Settings. Only a Suricata that is installed, configured and has rules
+    # can be started; the answer is one line with the state now (start is checked, loading the rules goes on after).
+    f=/etc/huginn-honeypot/suricata
+    [ ! -L "$f" ] || { echo "refused: $f is a symlink" >&2; exit 2; }
+    if [ "$SSH_ORIGINAL_COMMAND" = "ids on" ]; then
+      if ! { command -v suricata >/dev/null && [ -f /etc/huginn-honeypot/suricata.yaml ] && [ -f /etc/systemd/system/suricata.service.d/huginn.conf ] \
+             && [ -s /var/lib/suricata/rules/suricata.rules ]; }; then
+        echo "Suricata is not set up on the honeypot: run ./update-honeypot.sh --suricata-on there once" >&2; exit 2
+      fi
+      install -m 644 -o root -g root /dev/null "$f" || { echo "could not create $f" >&2; exit 2; }
+      systemctl enable --now suricata hp-suricata-rules.timer >/dev/null 2>&1 || true
+      if systemctl is-active --quiet suricata; then echo "ids on"; else echo "Suricata did not start (see journalctl -u suricata on the honeypot)" >&2; exit 2; fi
+    else
+      rm -f "$f"
+      systemctl disable --now hp-suricata-rules.timer suricata >/dev/null 2>&1 || true
+      if systemctl is-active --quiet suricata; then echo "Suricata is still running" >&2; exit 2; fi
+      echo "ids off"
+    fi
     exit 0 ;;
   *) ;;  # any other command gets the normal export
 esac
@@ -157,6 +179,9 @@ echo "##STATUS"
 if [ -f "$SURICATA_FLAG" ]; then
   if systemctl is-active --quiet suricata; then echo "running:suricata ok"; else echo "running:suricata missing"; fi
 fi
+# A choice, not protection: "ok" = Suricata is set up here, so Huginn's Settings may turn it on.
+if command -v suricata >/dev/null && [ -f /etc/huginn-honeypot/suricata.yaml ] && [ -s /var/lib/suricata/rules/suricata.rules ]; then
+  echo "option:suricata ok"; else echo "option:suricata missing"; fi
 for u in cowrie cowrie-camera opencanary; do
   [ -f "/etc/systemd/system/$u.service" ] || continue
   d="/etc/systemd/system/$u.service.d"

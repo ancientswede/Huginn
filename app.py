@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.43.0"
+HUGINN_VERSION = "0.44.0"
 CHANGELOG = [
+    ("0.44.0", "2026-11-15", "Suricata can be turned on and off under Settings, Honeypot, once it is set up on the honeypot (update-honeypot.sh --suricata-on, which installs the package and the rules). The locked export key accepts exactly \"ids on\" or \"ids off\", which only start or stop a Suricata that is already set up, and checks that it really started or stopped. Update the honeypot side once for the switch to show."),
     ("0.43.0", "2026-11-15", "Optional Suricata IDS on the honeypot: one command (update-honeypot.sh --suricata-on, or install-honeypot.sh --suricata) installs it, fetches the free Emerging Threats Open rules and starts it, and Huginn names known attacks by rule and CVE. Nothing to set up in your router: Suricata only listens on the honeypot's own network card, never blocks anything, leaves your admin SSH out, drops root to its own user in a sandbox and is capped at 900 MB of memory. Only alerts on traffic to the honeypot are exported, as a few fixed fields. Each attacker page gets a card IDS alerts, Campaigns lists the rules with a page per rule and the addresses that tripped it, and Settings, Honeypot shows whether it runs and how old the rules are. An attack rule (severity 1) adds 3 to the score and tags the attacker ids-alert. Rules are updated daily, or from a downloaded file on a honeypot without internet (--suricata-rules), and are always tested with the installed Suricata first; the previous set is kept and comes back if Suricata does not start."),
     ("0.42.0", "2026-11-14", "Every number at the top of the Overview is a link to the list behind it: Took the bait opens the attackers who took the bait in the last 7 days, Sessions the attackers with the most sessions, Files captured the Files page, Time wasted the receipt, On blocklist the Blocklist. New this week links its attackers, new attackers, each new country, each malware family and the bait count too."),
     ("0.41.1", "2026-11-14", "Account: the changelog is as tall as the System card next to it and scrolls, instead of making the page very long. Settings, Logout message shows how often the note was shown, to how many addresses, in the last 7 days and when last (also in /metrics as events of kind goodbye)."),
@@ -1550,11 +1551,21 @@ def hp_ssh(command):
 
 
 def hp_goodbye_set(on):
-    # 0.41: ask the honeypot to turn the logout note on or off ("goodbye on|off" to the locked hp-export key). Returns
-    # (state, error). An honeypot older than 0.41 ignores the command and starts the whole export instead: only the first
-    # line is read, then the connection is closed, so that never costs more than a moment.
+    # 0.41: the logout note on or off ("goodbye on|off" to the locked hp-export key).
+    return hp_toggle("goodbye", on, "0.41")
+
+
+def hp_ids_set(on):
+    # 0.44: Suricata on or off ("ids on|off"). Only starts or stops a Suricata already set up on the honeypot.
+    return hp_toggle("ids", on, "0.44")
+
+
+def hp_toggle(word, on, since):
+    # Ask the honeypot to turn one thing on or off ("<word> on|off" to the locked hp-export key). Returns (state, error).
+    # An honeypot older than `since` ignores the command and starts the whole export instead: only the first line is
+    # read, then the connection is closed, so that never costs more than a moment.
     try:
-        p = subprocess.Popen(hp_ssh("goodbye on" if on else "goodbye off"), stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(hp_ssh("%s %s" % (word, "on" if on else "off")), stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as e:
         return None, "could not start ssh: %s" % str(e)[:100]
@@ -1577,11 +1588,11 @@ def hp_goodbye_set(on):
         except subprocess.TimeoutExpired:
             err = b""
     line = first.split(b"\n", 1)[0].decode("ascii", "replace").strip()
-    if line in ("goodbye on", "goodbye off"):
+    if line in ("%s on" % word, "%s off" % word):
         state = line.split()[1] == "on"
         return (state, None) if state == bool(on) else (None, "the honeypot reports it is still %s" % ("on" if state else "off"))
     if line.startswith("##") or len(first) >= 64:
-        return None, "the honeypot does not know this yet: run update-honeypot.sh there once (Huginn 0.41 or later)"
+        return None, "the honeypot does not know this yet: run update-honeypot.sh there once (Huginn %s or later)" % since
     return None, (err.decode("utf-8", "replace").strip()[:150] or "no answer from the honeypot")
 
 
@@ -4979,7 +4990,8 @@ def v_help():
         row("Hits", "How many times the rule matched. Counted once per alert, also when the honeypot sends the same alert again."),
         row("Only seen by Suricata", "An address that tripped a rule without touching any honeypot service. It is listed on the rule's page, "
             "but has no attacker page."),
-        row("Settings, Honeypot", "Whether Suricata is on and running, how old its rules are, and the last 7 days. Rules are updated daily when the "
+        row("Settings, Honeypot", "Whether Suricata is on and running, how old its rules are, and the last 7 days, with a button to turn it on or off "
+            "once it is set up on the honeypot. Rules are updated daily when the "
             "honeypot has internet, otherwise with <span class=mono>--suricata-rules FILE</span>. A stopped Suricata is alerted like any other honeypot service."),
     ]
     overview = [
@@ -6001,7 +6013,8 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "gnbusy": ("greynoise", "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own."),
                "gndel": ("greynoise", "GreyNoise key removed."), "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
-               "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off.")}
+               "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
+               "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
 SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
@@ -6170,18 +6183,28 @@ def honeypot_card():
 
 
 def ids_card():
-    # Suricata on the honeypot (optional, read only here): turned on with update-honeypot.sh, since it installs a package.
+    # Suricata on the honeypot. Set up once there (update-honeypot.sh --suricata-on installs the package and the rules);
+    # after that it can be turned on and off here ("ids on|off" to the locked hp-export key).
     con = db()
     try:
         st = json.loads(get_meta(con, "hp_ids", "{}") or "{}")
     except ValueError:
         st = {}
     items, _at = protection_status(con)
-    running = (items or {}).get("running:suricata")
+    items = items or {}
+    running = items.get("running:suricata")
+    ready = items.get("option:suricata")           # installed, configured and with rules (hp-export 0.44)
     week = con.execute("SELECT COUNT(DISTINCT sid), COUNT(DISTINCT ip), COALESCE(SUM(n),0) FROM ids WHERE last>=?", (time.time() - 7 * 86400,)).fetchone()
+    button = ""
+    form = lambda on, label: ('<form method=post action="/settings/ids"><input type=hidden name=on value=%s><button%s>%s</button></form>'
+                              % ("1" if on else "0", "" if on else ' class="btn-s"', label))
     if not st.get("on"):
-        badge, info = sp_status("Off"), ('<p class="sp-help">On the honeypot: <span class=mono>./update-honeypot.sh --suricata-on</span> '
-                                         '(about 500 MB of memory; without internet there, see README).</p>')
+        badge = sp_status("Off")
+        if ready:
+            info, button = "", form(True, "Turn on Suricata")
+        else:
+            info = ('<p class="sp-help">Set it up once on the honeypot: <span class=mono>./update-honeypot.sh --suricata-on</span> '
+                    '(installs Suricata and its rules, about 500 MB of memory; without internet there, see README). After that it can be turned on and off here.</p>')
     else:
         badge = sp_status("Not running", "warn") if running is False else sp_status("On", "on")
         rules = st.get("rules")
@@ -6192,8 +6215,10 @@ def ids_card():
                      'Usually one flood; it clears when eve.json rotates.</p>' % (num(st["dropped"]), num(20000)))
         if isinstance(rules, (int, float)) and time.time() - rules > 14 * 86400:
             info += '<p class="sp-help">The rules are over two weeks old. Without internet on the honeypot: ./update-honeypot.sh --suricata-rules FILE.</p>'
+        button = form(False, "Turn off Suricata")
     return ('<div class="sp-panel" id="suricata"><div class="sp-ph"><h3>Suricata IDS</h3>%s</div>'
-            '<p>Names known attacks by rule and CVE (Emerging Threats Open). Listens only; never blocks traffic.</p>%s</div>' % (badge, info))
+            '<p>Names known attacks by rule and CVE (Emerging Threats Open). Listens only; never blocks traffic.</p>%s'
+            '%s</div>' % (badge, info, ('<div class="sp-act">%s</div>' % button) if button else ""))
 
 
 def key_form(provider, label, saved, ph_new, invalid=False):
@@ -7112,6 +7137,27 @@ class Handler(BaseHTTPRequestHandler):
                 set_meta(con, "hp_status", json.dumps({"at": time.time(), "items": items}))
             log("info", "goodbye_on" if state else "goodbye_off")
             return self.redirect(settings_url(("byeon" if state else "byeoff")))
+        if path == "/settings/ids":
+            want = self.form().get("on") == "1"
+            state, err = hp_ids_set(want)
+            if err:
+                log("warning", "ids_set_failed", error=err)
+                return self.send(502, v_settings(at="honeypot", err="Could not change Suricata: %s" % err))
+            items, _at = protection_status(con)
+            if items is not None:
+                if state:
+                    items["running:suricata"] = True        # starting; the next sync reports whether it really runs
+                else:
+                    items.pop("running:suricata", None)
+                set_meta(con, "hp_status", json.dumps({"at": time.time(), "items": items}))
+            try:
+                st = json.loads(get_meta(con, "hp_ids", "{}") or "{}")
+            except ValueError:
+                st = {}
+            st["on"] = bool(state)
+            set_meta(con, "hp_ids", json.dumps(st))
+            log("info", "ids_on" if state else "ids_off")
+            return self.redirect(settings_url(("idson" if state else "idsoff")))
         if path == "/settings/metrics/token":
             set_meta(con, "metrics_token", secrets.token_urlsafe(32))
             log("info", "metrics_token_new")
