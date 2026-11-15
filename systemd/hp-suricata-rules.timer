@@ -1,0 +1,10 @@
+[Unit]
+Description=Huginn honeypot: new Suricata rules once a day
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

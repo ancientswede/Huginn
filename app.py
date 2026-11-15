@@ -5,8 +5,9 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.42.0"
+HUGINN_VERSION = "0.43.0"
 CHANGELOG = [
+    ("0.43.0", "2026-11-15", "Optional Suricata IDS on the honeypot: one command (update-honeypot.sh --suricata-on, or install-honeypot.sh --suricata) installs it, fetches the free Emerging Threats Open rules and starts it, and Huginn names known attacks by rule and CVE. Nothing to set up in your router: Suricata only listens on the honeypot's own network card, never blocks anything, leaves your admin SSH out, drops root to its own user in a sandbox and is capped at 900 MB of memory. Only alerts on traffic to the honeypot are exported, as a few fixed fields. Each attacker page gets a card IDS alerts, Campaigns lists the rules with a page per rule and the addresses that tripped it, and Settings, Honeypot shows whether it runs and how old the rules are. An attack rule (severity 1) adds 3 to the score and tags the attacker ids-alert. Rules are updated daily, or from a downloaded file on a honeypot without internet (--suricata-rules), and are always tested with the installed Suricata first; the previous set is kept and comes back if Suricata does not start."),
     ("0.42.0", "2026-11-14", "Every number at the top of the Overview is a link to the list behind it: Took the bait opens the attackers who took the bait in the last 7 days, Sessions the attackers with the most sessions, Files captured the Files page, Time wasted the receipt, On blocklist the Blocklist. New this week links its attackers, new attackers, each new country, each malware family and the bait count too."),
     ("0.41.1", "2026-11-14", "Account: the changelog is as tall as the System card next to it and scrolls, instead of making the page very long. Settings, Logout message shows how often the note was shown, to how many addresses, in the last 7 days and when last (also in /metrics as events of kind goodbye)."),
     ("0.41.0", "2026-11-14", "The goodbye on logout can be turned on and off in Settings (card Goodbye on logout), no need to log in to the honeypot. It is the only thing Huginn can change there: the locked export key accepts exactly \"goodbye on\" or \"goodbye off\" and nothing else. Update the honeypot once (update-honeypot.sh) for the button to work. Settings is rebuilt: a menu of sections, one Save button per part that only saves that part, status badges (On, Off, Not configured, Update required) and shorter texts that state the free and keyed lookup limits instead of guessing your traffic. The footer and Settings › About link to Buy me a coffee."),
@@ -328,6 +329,12 @@ CREATE TABLE IF NOT EXISTS vt(sha TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS capped_seen(h TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
+CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
+  sig TEXT, cat TEXT, PRIMARY KEY(ip, sid, day, proto, port));
+CREATE INDEX IF NOT EXISTS ids_sid ON ids(sid, last);
+CREATE INDEX IF NOT EXISTS ids_last ON ids(last);
+CREATE TABLE IF NOT EXISTS ids_seen(h TEXT PRIMARY KEY, ts REAL);
+CREATE INDEX IF NOT EXISTS ids_seen_ts ON ids_seen(ts);
 """
 
 
@@ -873,7 +880,8 @@ PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAP
 
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
-    files, personas, bait, identities, mails, status = [], [], {}, [], [], []
+    files, personas, bait, identities, mails, status, ids_lines = [], [], {}, [], [], [], []
+    ids_meta_lines = []
     seen = set()
     # Only "\n" ends a line. str.splitlines() also breaks on characters such as U+2028, which an attacker can send.
     for line in text.split("\n"):
@@ -897,6 +905,12 @@ def parse_export(text, skip):
             continue
         if section == "STATUS":
             status.append(line)
+            continue
+        if section == "IDS":
+            if line.startswith("rules ") or line.startswith("dropped "):
+                ids_meta_lines.append(line)    # metadata: never takes a place in the 20000-alert window
+            else:
+                ids_lines.append(line)
             continue
         if section == "BAIT" and line.startswith("{"):
             try:
@@ -926,8 +940,11 @@ def parse_export(text, skip):
                     mails.append((h, r[6]) + m)
     parse_export.files = files
     parse_export.mails = mails
+    parse_export.ids, ids_rules = parse_ids(ids_lines[-20000:] + ids_meta_lines[-2:], skip, hashes)
+    ids_dropped = max([int(x[8:]) for x in ids_meta_lines if x.startswith("dropped ") and x[8:].isdigit() and len(x) < 20] or [0])
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
+                         "has_ids": "IDS" in seen, "ids_rules": ids_rules, "ids_dropped": ids_dropped,
                          "status": parse_status(status[:100]) if "STATUS" in seen else None,
                          "warnings": sorted(x[5:] for x in seen if x.startswith("WARN "))[:10]}
     return rows, hashes
@@ -939,6 +956,76 @@ STATUS_LINE = re.compile(r"^(sandbox|limits|running|patch|option):([a-z0-9-]{1,2
 def parse_status(lines):
     # The honeypot's own report of its protection (hp-export ##STATUS). Untrusted: only the exact expected words get through.
     return {m.group(1) + ":" + m.group(2): m.group(3) == "ok" for m in map(STATUS_LINE.match, lines) if m}
+
+
+IDS_TEXT = re.compile(r"[\x20-\x7e]{1,240}")
+IDS_PROTO = re.compile(r"[A-Za-z0-9-]{1,12}")
+IDS_MAX_AGE = 9 * 86400          # older alerts are ignored: ids_seen remembers 10 days, and eve.json holds about a week
+
+
+def parse_ids(lines, skip, hashes):
+    # Suricata alerts from hp-export ##IDS (optional). The honeypot already cut them down to a few fields; here every one
+    # is checked again, because they hold attacker-chosen traffic matched by rules. Returns (alerts, rules file time).
+    out, rules, oldest = [], None, time.time() - IDS_MAX_AGE
+    for line in lines:
+        if line.startswith("rules "):
+            v = line[6:]
+            rules = int(v) if v.isdigit() and len(v) <= 11 else rules
+            continue
+        if not line.startswith("{"):
+            continue
+        h = "ids:" + hashlib.sha1(line.encode("utf-8", "replace")).hexdigest()
+        hashes.add(h)
+        if h in skip:
+            continue
+        try:
+            e = json.loads(line)
+            t = str(e["t"])
+            if re.search(r"[+-]\d{4}$", t):                    # Suricata writes +0000; older Pythons want +00:00
+                t = t[:-2] + ":" + t[-2:]
+            ts = iso_ts(t)
+            ip = norm_ip(e.get("ip"))
+            sid, sev = int(e["sid"]), int(e.get("sev") or 3)
+            sig, cat, proto, port = e.get("sig"), e.get("cat") or "", e.get("proto") or "", e.get("port")
+        except (ValueError, KeyError, TypeError, OverflowError):
+            continue
+        if not ip or not oldest <= ts <= time.time() + 86400 or not 0 < sid < 2 ** 31 or not isinstance(sig, str) or not IDS_TEXT.fullmatch(sig):
+            continue
+        cat = cat if isinstance(cat, str) and IDS_TEXT.fullmatch(cat) else ""
+        proto = proto.upper() if isinstance(proto, str) and IDS_PROTO.fullmatch(proto) else ""
+        port = port if isinstance(port, int) and not isinstance(port, bool) and 0 <= port <= 65535 else 0     # 0: none (ICMP)
+        out.append((h, ts, ip, sid, sev if 1 <= sev <= 4 else 3, sig, cat[:100], proto, port))
+    return out, rules
+
+
+def store_ids(con, alerts):
+    # One row per IP, rule, UTC day, protocol and port with a count: a scanner can trip the same rule thousands of times. ids_seen knows
+    # which alert lines were counted, because the export sends the newest ones again on every sync.
+    if not alerts:
+        return 0
+    new, touched = 0, set()
+    with con:
+        con.execute("BEGIN IMMEDIATE")
+        for h, ts, ip, sid, sev, sig, cat, proto, port in alerts:
+            if con.execute("SELECT 1 FROM ids_seen WHERE h=?", (h,)).fetchone():
+                continue
+            con.execute("INSERT INTO ids_seen(h, ts) VALUES(?,?)", (h, ts))
+            # The worst severity stays (a rule update must not take back an attack already seen); the text is the newest.
+            con.execute("INSERT INTO ids(ip, sid, day, proto, port, n, first, last, sev, sig, cat) VALUES(?,?,?,?,?,1,?,?,?,?,?) "
+                        "ON CONFLICT(ip, sid, day, proto, port) DO UPDATE SET n=n+1, first=MIN(first, excluded.first), "
+                        "sev=MIN(sev, excluded.sev), sig=CASE WHEN excluded.last>=last THEN excluded.sig ELSE sig END, "
+                        "cat=CASE WHEN excluded.last>=last THEN excluded.cat ELSE cat END, last=MAX(last, excluded.last)",
+                        (ip, sid, utc_day(ts), proto, port, ts, ts, sev, sig, cat))
+            new += 1
+            touched.add(ip)
+        # Only addresses Huginn already knows get a new score; one that only tripped a rule is listed under Campaigns.
+        for ip in touched:
+            if con.execute("SELECT 1 FROM ips WHERE ip=?", (ip,)).fetchone():
+                try:
+                    recompute_ip(con, ip)
+                except (ValueError, TypeError, OverflowError, sqlite3.Error) as e:
+                    log("error", "recompute", repr(e), key=ip)
+    return new
 
 
 IDENTITY_LINE = re.compile(r"^([0-9]{9,11}) ([a-z0-9-]{1,32}) (nas|router) ([A-Za-z0-9 !+._-]{1,48})$")
@@ -959,6 +1046,10 @@ def apply_honeypot_meta(con, meta):
             con.execute("DELETE FROM web_identities WHERE ts NOT IN (SELECT ts FROM web_identities ORDER BY ts DESC LIMIT 2000)")
     if meta.get("status") is not None:
         set_meta(con, "hp_status", json.dumps({"at": time.time(), "items": meta["status"]}))
+    # Suricata on the honeypot: on (the section is there) or not, and when its rules were last updated.
+    if "has_ids" in meta:
+        set_meta(con, "hp_ids", json.dumps({"on": bool(meta["has_ids"]), "rules": meta.get("ids_rules"), "at": time.time(),
+                                            "dropped": meta.get("ids_dropped") or 0}))
     if meta.get("has_personas"):
         set_meta(con, "hp_personas", json.dumps({str(k): v for k, v in meta["personas"].items()}))
     if meta.get("has_bait"):
@@ -1703,11 +1794,11 @@ def sshole_password(proto, password):
     return proto == "ssh" and SSHOLE_MIN <= len((password or "").encode("utf-8", "surrogatepass")) <= SSHOLE_MAX
 
 
-def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False, web=""):
+def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False, web="", ids=False):
     # The one place that defines the score: (label, points), zero points left out. web: "exploit", "probe" and/or "robots".
     parts = [("seen", 1), ("SSHole probe", 10 if sshole else 0), ("took bait", 20 if took else 0), ("read bait", 5 if read else 0),
              ("web exploit", 8 if "exploit" in web else 0), ("web probe", 3 if "probe" in web and "exploit" not in web else 0),
-             ("robots.txt trap", 5 if "robots" in web else 0),
+             ("robots.txt trap", 5 if "robots" in web else 0), ("IDS alert", 3 if ids else 0),
              ("login attempts", 2 if lo + lf else 0), ("brute force", 2 if lo + lf >= 10 else 0), ("commands", min(10, cmds // 2)),
              ("files", 15 if files else 0), ("proxy", 10 if tcpip else 0), ("exploit", 10 if expl else 0),
              ("decoy services", 3 * len(csvcs)), ("repeat visits", min(5, sess // 20))]
@@ -1717,11 +1808,12 @@ def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=
 # The same scoring in words, for the Blocklist page. tests/test_polish.py checks that every part of score_parts is named here.
 SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per command (max 10), +15 files, +10 proxy, +10 exploit, "
               "+10 SSHole probe, +20 took bait, +5 read bait, +8 web exploit, +3 web probe, +5 robots.txt trap, "
+              "+3 IDS alert (Suricata rule of severity 1, an attack), "
               "+3 per decoy service, +1 per 20 repeat visits (max 5).")
 
 
-def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web=""):
-    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web))
+def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False):
+    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids))
     tags = []
     if took:
         tags.append("took-bait")
@@ -1745,6 +1837,8 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("web-probe")
     if "robots" in web:
         tags.append("robots-trap")
+    if ids:
+        tags.append("ids-alert")
     if len(set(protos) | set(csvcs)) >= 2:
         tags.append("multi-service")
     if tarpit_s >= 60:
@@ -1777,7 +1871,10 @@ def recompute_ip(con, ip):
                     % ",".join("'%s'" % x for x in sorted(WEB_BAIT_REPLIES)), (ip,)).fetchone()
     web = " ".join(k for k, v in zip(("exploit", "probe", "robots"), w[:3]) if v)
     read = read or bool(w[3])
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web)
+    # Suricata (optional): a rule of severity 1 on traffic from this address. ET Open gives 1 to attacks (exploits, privilege
+    # gain, trojans, web application attacks); 2 is mostly scanning and recon, which nearly every attacker does.
+    ids = con.execute("SELECT 1 FROM ids WHERE ip=? AND sev=1 LIMIT 1", (ip,)).fetchone() is not None
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -2016,6 +2113,7 @@ def retention(con):
         # Cap state is only needed while the export can send a day again; the rows that dropped something stay as the count.
         con.execute("DELETE FROM capped WHERE dropped=0 AND day < ?", (utc_day(time.time() - 14 * 86400),))
         con.execute("DELETE FROM capped_seen WHERE ts < ?", (time.time() - 3 * 86400,))
+        con.execute("DELETE FROM ids_seen WHERE ts < ?", (time.time() - IDS_MAX_AGE - 86400,))
     if RETENTION_DAYS == 0:          # keep the whole history
         con.execute("PRAGMA optimize")
         return
@@ -2023,7 +2121,9 @@ def retention(con):
     with con:                         # counted-only decoy hits follow the same history limit as stored ones
         gone_ips = [r[0] for r in con.execute("SELECT DISTINCT ip FROM capped WHERE day < ? AND dropped > 0", (cutoff_day,))]
         con.execute("DELETE FROM capped WHERE day < ?", (cutoff_day,))
-        for ip in gone_ips:
+        gone_ips += [r[0] for r in con.execute("SELECT DISTINCT ip FROM ids WHERE day < ?", (cutoff_day,))]
+        con.execute("DELETE FROM ids WHERE day < ?", (cutoff_day,))
+        for ip in set(gone_ips):
             recompute_ip(con, ip)
     cutoff = time.time() - RETENTION_DAYS * 86400
     with con:
@@ -2388,6 +2488,7 @@ def collector_loop():
             n = store(con, rows)
             store_files(con, parse_export.files)
             store_mails(con, parse_export.mails)
+            store_ids(con, parse_export.ids)
             classify_web(con)
             note_sync(con, t0)
             skip = hashes  # only set once everything is stored
@@ -2900,7 +3001,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 # What each attacker tag means: the tooltip on every tag and the Help page read this one table.
@@ -2922,6 +3023,7 @@ TAG_HELP = {
     "web-exploit": "A web request that matched an exploit rule, often for a known CVE.",
     "web-probe": "A web request looking for something specific, such as admin pages or config files, but no exploit.",
     "robots-trap": "Visited a path that only the web trap's robots.txt mentions: a crawler that reads robots.txt to find hidden places.",
+    "ids-alert": "Suricata on the honeypot matched a rule of severity 1 on traffic from this address: an attack such as an exploit, not just a scan.",
     "block": "You flagged this attacker: always on the blocklist.",
     "allow": "You flagged this attacker: never on the blocklist.",
 }
@@ -3906,7 +4008,8 @@ def score_html(r):
     parts = sorted(score_parts(r["sessions"] or 0, r["logins_ok"] or 0, r["logins_fail"] or 0, r["cmds"] or 0, r["files"] or 0, r["tcpip"] or 0,
                                r["exploits"] or 0, [c for c in (r["canary_svcs"] or "").split(",") if c],
                                "took-bait" in have, "read-bait" in have, "sshole-probe" in have,
-                               " ".join(k for k, t in (("exploit", "web-exploit"), ("probe", "web-probe"), ("robots", "robots-trap")) if t in have)), key=lambda p: -p[1])
+                               " ".join(k for k, t in (("exploit", "web-exploit"), ("probe", "web-probe"), ("robots", "robots-trap")) if t in have),
+                               "ids-alert" in have), key=lambda p: -p[1])
     if sum(v for _k, v in parts) != r["score"]:         # scored by an older version: do not show numbers that do not add up
         return '<div class="sleg muted">Breakdown unavailable</div>'
     segs = "".join('<i class="g%d%s" title="%s: %d"></i>' % (min(v, 60), " hot" if k in ("took bait", "read bait", "SSHole probe", "files", "exploit") else "", esc(k), v) for k, v in parts)
@@ -4098,6 +4201,29 @@ def ip_timeline(con, ip, days=30, steps_max=40):
                    % (esc(when), pcls, plabel, esc(text), (' <span class="tl-c">%s</span>' % chips) if chips else ""))
     return ('<div class="card span2"><h3>Timeline <span class=muted>last %d days%s</span></h3><ol class="tl">%s</ol></div>'
             % (days, (", latest %d steps (%s earlier)" % (steps_max, num(more))) if more else "", "".join(lis)))
+
+
+IDS_SEV_WORDS = {1: "high", 2: "medium", 3: "low", 4: "info"}
+
+
+def ids_sev(sev):
+    return '<span class="sev s%d" title="Suricata severity %d">%s</span>' % (sev or 3, sev or 3, IDS_SEV_WORDS.get(sev, "?"))
+
+
+def ids_link(sid, sig, sev):
+    # The rule name, linking to the rule's own page under Campaigns. Severity 1 (attacks) red, like web exploits.
+    cls = {1: "t-red", 2: "t-orange", 3: "t-yellow"}.get(sev, "t-grey")
+    return '<a class="tag %s" href="/campaign/ids/%d" title="Suricata rule %d">%s</a>' % (cls, sid, sid, esc(clean(sig, 160)))
+
+
+def ids_ports(ports):
+    # "TCP/80", or just the protocol when there is no port (ICMP is stored with port 0)
+    out = sorted({re.sub(r"/0$", "", p) for p in (ports or "").split(",") if re.fullmatch(r"[A-Z0-9-]{1,12}/\d{1,5}", p)})
+    return ", ".join(out[:4]) + (" …" if len(out) > 4 else "")
+
+
+def ids_cves(sig):
+    return sorted(set(re.findall(r"CVE[-_](\d{4})[-_](\d{3,7})", sig or "")))
 
 
 def v_ip(ip, qs=None):
@@ -4311,6 +4437,16 @@ def v_ip(ip, qs=None):
         can_html += ('<div class="card span2"><h3>Web attacks <span class=muted>rules from Krawl</span></h3><div class="scroll"><table class=wide><thead><tr>'
                      '<th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>' % wrows)
 
+    # Suricata (optional): known attacks by rule, worst first. Rule names come from ET Open, not from the attacker.
+    ia = con.execute("SELECT sid, MIN(sev) sev, MAX(sig) sig, MAX(cat) cat, SUM(n) n, MAX(last) l, GROUP_CONCAT(DISTINCT proto || '/' || port) ports "
+                     "FROM ids WHERE ip=? GROUP BY sid ORDER BY sev, n DESC LIMIT 60", (ip,)).fetchall()
+    if ia:
+        irows = "".join("<tr><td>%s</td><td data-h>%s</td><td class=num>%s</td><td class='mono nowrap' data-h>%s</td><td class=num>%s</td><td class=nowrap>%s</td></tr>"
+                        % (ids_link(x["sid"], x["sig"], x["sev"]), esc(x["cat"] or ""), ids_sev(x["sev"]), esc(ids_ports(x["ports"])), num(x["n"]), esc(ago(x["l"])))
+                        for x in ia)
+        can_html += ('<div class="card span2"><h3>IDS alerts <span class=muted>Suricata, ET Open rules</span></h3><div class="scroll"><table class=wide><thead><tr>'
+                     '<th>Rule</th><th data-h>Class</th><th class=num>Severity</th><th data-h>Port</th><th class=num>Hits</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>' % irows)
+
     # Mail sent to the relay trap: every recipient and the start of the message (attacker text, escaped, never a link).
     mails = con.execute("SELECT e.ts, e.a, m.mail_from, m.subject, m.rcpts, m.helo, m.size, m.sample FROM mails m JOIN events e ON e.h = m.h "
                         "WHERE e.ip=? ORDER BY e.ts DESC LIMIT 50", (ip,)).fetchall()
@@ -4347,6 +4483,9 @@ def export_ip(ip):
         "sessions": [{k: s[k] for k in s.keys() if k not in ("start", "end")} | {"start": iso(s["start"]), "end": iso(s["end"]),
                       "persona": PERSONA.get(s["port"] or 0)} for s in sess],
         "events": [{"time": iso(x["ts"]), "source": x["src"], "kind": x["kind"], "session": x["session"], "a": x["a"], "b": x["b"]} for x in evs],
+        "ids_alerts": [{"day": x["day"], "sid": x["sid"], "severity": x["sev"], "signature": x["sig"], "class": x["cat"], "proto": x["proto"],
+                        "port": x["port"], "hits": x["n"], "first": iso(x["first"]), "last": iso(x["last"])}
+                       for x in con.execute("SELECT * FROM ids WHERE ip=? ORDER BY first", (ip,))],
     }
 
 
@@ -4798,7 +4937,7 @@ def v_help():
     tag = lambda t, cls="": '<span class="tag %s">%s</span>' % (cls or TAG_CLASS.get(t, ""), esc(t))
     personas = sorted(set(PERSONA.values()))
     tags = [row(tag(t), esc(TAG_HELP[t])) for t in ("shell", "dropper", "proxy", "exploit", "bruteforce", "human-like", "took-bait", "read-bait",
-                                                    "sshole-probe", "web-exploit", "web-probe", "robots-trap", "multi-service", "tarpitted",
+                                                    "sshole-probe", "web-exploit", "web-probe", "robots-trap", "ids-alert", "multi-service", "tarpitted",
                                                     "research", "block", "allow")]
     if personas:
         tags.append(row(" ".join(tag(p) for p in personas), "Persona: which fake machine a session hit. Set by the installer (HUGINN_PERSONAS)."))
@@ -4829,6 +4968,20 @@ def v_help():
         row("MalwareBazaar", "abuse.ch's malware database: family names and tags for known files, by hash."),
         row("Keys", "VirusTotal and MalwareBazaar keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
     ]
+    ids = [
+        row("What it is", "Optional. Suricata on the honeypot matches the traffic sent to it against the free Emerging Threats Open rules and names "
+            "known exploits, scanners and tools, often with the CVE. It only listens and never blocks. On the honeypot: "
+            "<span class=mono>./update-honeypot.sh --suricata-on</span>."),
+        row('<span class="tag t-red">ET EXPLOIT …</span>', "A rule that matched. Click it for the rule's page: what it is, a link to the CVE, and every address that tripped it."),
+        row('%s %s %s %s' % (ids_sev(1), ids_sev(2), ids_sev(3), ids_sev(4)),
+            "The rule's severity. High is an attack (exploit, privilege gain, trojan, web application attack): it adds 3 to the score and tags the "
+            "attacker ids-alert. Medium is mostly scanning and recon, low and info only describe; they are shown, not scored."),
+        row("Hits", "How many times the rule matched. Counted once per alert, also when the honeypot sends the same alert again."),
+        row("Only seen by Suricata", "An address that tripped a rule without touching any honeypot service. It is listed on the rule's page, "
+            "but has no attacker page."),
+        row("Settings, Honeypot", "Whether Suricata is on and running, how old its rules are, and the last 7 days. Rules are updated daily when the "
+            "honeypot has internet, otherwise with <span class=mono>--suricata-rules FILE</span>. A stopped Suricata is alerted like any other honeypot service."),
+    ]
     overview = [
         row("Time wasted", "Attacker time spent stuck in the tarpit plus time in fake shells. <i>stuck now</i>: tarpit connections still open."),
         row("Orange line under a bar", "No sync from the honeypot during that time: missing data, not a quiet period. Hover the bar for how long."),
@@ -4846,8 +4999,9 @@ def v_help():
             '<h2>Attacker tags</h2><div class="card">%s</div>'
             '<h2>Score</h2><div class="card"><p>Every attacker gets points for what it did. The score sorts the Attackers list and decides the blocklist.</p><p class=mono>%s</p></div>'
             '<h2>Sessions</h2><div class="card">%s</div><h2>Files</h2><div class="card">%s</div>'
-            '<h2>Lookups</h2><div class="card">%s</div><h2>Overview and pages</h2><div class="card">%s</div><h2>Blocklist</h2><div class="card">%s</div>'
-            % (table(tags), esc(SCORE_HELP), table(sessions), table(files), table(lookups), table(overview), table(block)))
+            '<h2>Lookups</h2><div class="card">%s</div><h2>IDS alerts</h2><div class="card">%s</div>'
+            '<h2>Overview and pages</h2><div class="card">%s</div><h2>Blocklist</h2><div class="card">%s</div>'
+            % (table(tags), esc(SCORE_HELP), table(sessions), table(files), table(lookups), table(ids), table(overview), table(block)))
     return page("Help", body, "/help")
 
 
@@ -5235,6 +5389,18 @@ def v_campaigns(qs=None):
                      % (web_tag("exploit" if w["x"] else "probe", w["type"], w["cve"]), esc((web_rule_info(w["type"]) or [""] * 7)[6]),
                         num(w["sev"]), num(w["nip"]), num(w["n"]), esc(ago(w["l"]))) for w in wa)
 
+    # IDS rules (Suricata, optional): the rules that matched most addresses, attacks before information.
+    ir = con.execute("SELECT sid, MIN(sev) sev, MAX(sig) sig, MAX(cat) cat, COUNT(DISTINCT ip) nip, SUM(n) n, MAX(last) l FROM ids "
+                     "GROUP BY sid ORDER BY sev, nip DESC, n DESC LIMIT 60").fetchall()
+    irows = "".join("<tr><td>%s</td><td class=trunc data-h>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num data-h>%s</td><td class=nowrap>%s</td></tr>"
+                    % (ids_link(x["sid"], x["sig"], x["sev"]), esc(x["cat"] or ""), ids_sev(x["sev"]), num(x["nip"]), num(x["n"]), esc(ago(x["l"]))) for x in ir)
+    try:
+        ids_on = json.loads(get_meta(con, "hp_ids", "{}") or "{}").get("on")
+    except (ValueError, AttributeError):
+        ids_on = False
+    ids_html = ('<table class="wide"><thead><tr><th>Rule</th><th data-h>Class</th><th class=num>Severity</th><th class=num>IPs</th><th class=num data-h>Hits</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % irows
+                if irows else none_yet("No IDS alerts yet" if ids_on else "Suricata is off. On the honeypot: ./update-honeypot.sh --suricata-on"))
+
     # Mail clients: the name a bot gives in HELO/EHLO is often its own and stays the same across many addresses.
     hl = con.execute("SELECT LOWER(SUBSTR(b, 6)) name, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM events "
                      "WHERE kind='canary' AND src='traps' AND b LIKE 'HELO %' GROUP BY name ORDER BY nip DESC, n DESC LIMIT 40").fetchall()
@@ -5266,15 +5432,17 @@ def v_campaigns(qs=None):
             % (num(dr["n"] or 0), num(dr["d"] or 0), num((dr["n"] or 0) - (dr["d"] or 0)), dr["s"] or 0.0,
                num(len(mt)), num(len(mip)), sum(x[1] for x in mt) / float(len(mt) or 1),
                sum(x[0] for x in mt) / float(len(mt) or 1), sum(x[2] for x in mt) / float(len(mt) or 1)))
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), IDS rule (Suricata), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
             '<div class="cgrid"><section class="cs-wide"><h2>Command scripts</h2><div class="card">%s</div></section><section><h2>SSH clients (HASSH)</h2><div class="card">%s</div></section>'
             '<section class="cs-wide"><h2>Web attacks</h2><div class="card">%s</div></section><section><h2>Mail clients (HELO)</h2><div class="card">%s</div></section>'
+            '<section class="cs-wide"><h2>IDS alerts</h2><div class="card">%s</div></section>'
             '<section><h2>Proxy use</h2><div class="card">%s%s</div></section><section><h2>Slow replies</h2><div class="card">%s</div></section></div>'
             % (stabs + ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>IPs 7d</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows
                         if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet")),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
                '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
                '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
+               ids_html,
                psum, '<table class="wide"><thead><tr><th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % prows if prows else none_yet("No proxy checks answered yet"), slow))
     return page("Campaigns", body, "/campaigns")
 
@@ -5283,6 +5451,8 @@ def v_campaign(kind, val):
     con = db()
     if kind == "web":
         return v_campaign_web(con, val)
+    if kind == "ids":
+        return v_campaign_ids(con, int(val))
     if not re.fullmatch(r"[0-9a-f]{8,64}", val or ""):
         return None
     if kind == "script":
@@ -5313,6 +5483,31 @@ def v_campaign(kind, val):
                       num(i["n"]), esc(ago(i["l"]))) for i in ips)
     body = ('<h1 class=mono>%s</h1><div class="grid"><div class="span2">%s</div><div class="card span2"><h3>IPs <span class=muted>%s</span></h3>'
             '<table class="wide"><thead><tr><th>IP</th><th>CC</th><th>Network</th><th class=num>Count</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>'
+            % (esc(title), detail, num(len(ips)), rows))
+    return page(title, body, "/campaigns")
+
+
+def v_campaign_ids(con, sid):
+    # One Suricata rule: what it is (from ET Open) and every address that tripped it. Known attackers link to their page.
+    ips = con.execute("SELECT ip, SUM(n) n, MAX(last) l, GROUP_CONCAT(DISTINCT proto || '/' || port) ports FROM ids WHERE sid=? "
+                      "GROUP BY ip ORDER BY l DESC LIMIT 500", (sid,)).fetchall()
+    if not ips:
+        return None
+    r = con.execute("SELECT sig, cat, MIN(sev) sev, SUM(n) n, MIN(first) f FROM ids WHERE sid=?", (sid,)).fetchone()
+    cves = ["CVE-%s-%s" % c for c in ids_cves(r["sig"])]
+    detail = ('<div class="card"><h3>%s</h3><p>%s · severity %s · rule %d · first %s · %s hits</p>%s'
+              '<p class="muted small">Rule from Emerging Threats Open, matched by Suricata on the honeypot.</p></div>'
+              % (esc(clean(r["sig"], 240)), esc(r["cat"] or "no class"), ids_sev(r["sev"]), sid, esc(fmt_ts(r["f"])), num(r["n"]),
+                 ("<p>%s</p>" % " · ".join(ext("https://nvd.nist.gov/vuln/detail/" + c, c) for c in cves)) if cves else ""))
+    known = {x[0] for x in con.execute("SELECT ip FROM ips WHERE ip IN (%s)" % ",".join("?" * len(ips)), [i["ip"] for i in ips])}
+    en = {x["ip"]: x for x in con.execute("SELECT ip, cc, org FROM enrich WHERE ip IN (%s)" % ",".join("?" * len(ips)), [i["ip"] for i in ips])}
+    rows = "".join("<tr><td>%s</td><td>%s</td><td class=trunc data-h>%s</td><td class='mono nowrap' data-h>%s</td><td class=num>%s</td><td>%s</td></tr>"
+                   % (ip_link(i["ip"]) if i["ip"] in known else '<span class=mono title="Only seen by Suricata">%s</span>' % esc(i["ip"]),
+                      cc_html(en[i["ip"]]["cc"] if i["ip"] in en else None), esc(en[i["ip"]]["org"] or "" if i["ip"] in en else ""),
+                      esc(ids_ports(i["ports"])), num(i["n"]), esc(ago(i["l"]))) for i in ips)
+    title = "IDS rule %d" % sid
+    body = ('<h1>%s</h1><div class="grid"><div class="span2">%s</div><div class="card span2"><h3>IPs <span class=muted>%s</span></h3>'
+            '<table class="wide"><thead><tr><th>IP</th><th>CC</th><th data-h>Network</th><th data-h>Port</th><th class=num>Hits</th><th>Last</th></tr></thead><tbody>%s</tbody></table></div></div>'
             % (esc(title), detail, num(len(ips)), rows))
     return page(title, body, "/campaigns")
 
@@ -5921,7 +6116,7 @@ def v_settings(ok="", err="", at=""):
            "Uses saved settings." if NTFY_URL else "Available when the ntfy URL is configured. Uses saved settings.",
            "" if NTFY_URL else " disabled")))
 
-    honeypot = section("honeypot", flash("honeypot") + honeypot_card())
+    honeypot = section("honeypot", flash("honeypot") + honeypot_card() + ids_card())
     lookups = section("lookups", lookups_card(flash, at, err))
     metrics = section("metrics", flash("metrics") + metrics_card())
     about = section("about", (
@@ -5972,6 +6167,33 @@ def honeypot_card():
             '  You typed 9 lines. All of it is logged, along with your address.\n  Say hi to the rest of the botnet.</pre>'
             '<p class="sp-help">Sent after the session is logged. Not sent on a plain disconnect.</p></details>'
             '%s<div class="sp-act">%s<span class="sp-help">%s</span></div></div>' % (badge, goodbye_stats(con), button, esc(help_)))
+
+
+def ids_card():
+    # Suricata on the honeypot (optional, read only here): turned on with update-honeypot.sh, since it installs a package.
+    con = db()
+    try:
+        st = json.loads(get_meta(con, "hp_ids", "{}") or "{}")
+    except ValueError:
+        st = {}
+    items, _at = protection_status(con)
+    running = (items or {}).get("running:suricata")
+    week = con.execute("SELECT COUNT(DISTINCT sid), COUNT(DISTINCT ip), COALESCE(SUM(n),0) FROM ids WHERE last>=?", (time.time() - 7 * 86400,)).fetchone()
+    if not st.get("on"):
+        badge, info = sp_status("Off"), ('<p class="sp-help">On the honeypot: <span class=mono>./update-honeypot.sh --suricata-on</span> '
+                                         '(about 500 MB of memory; without internet there, see README).</p>')
+    else:
+        badge = sp_status("Not running", "warn") if running is False else sp_status("On", "on")
+        rules = st.get("rules")
+        info = '<p class="sp-usage">%s · last 7 days: %s rules matched, %s IPs, %s hits</p>' % (
+            ("rules updated %s" % ago(rules)) if isinstance(rules, (int, float)) else "no rules yet", num(week[0]), num(week[1]), num(week[2]))
+        if isinstance(st.get("dropped"), int) and st["dropped"] > 0:
+            info += ('<p class="sp-help">The honeypot holds %s more alerts than one sync takes (%s): the oldest of them were not counted. '
+                     'Usually one flood; it clears when eve.json rotates.</p>' % (num(st["dropped"]), num(20000)))
+        if isinstance(rules, (int, float)) and time.time() - rules > 14 * 86400:
+            info += '<p class="sp-help">The rules are over two weeks old. Without internet on the honeypot: ./update-honeypot.sh --suricata-rules FILE.</p>'
+    return ('<div class="sp-panel" id="suricata"><div class="sp-ph"><h3>Suricata IDS</h3>%s</div>'
+            '<p>Names known attacks by rule and CVE (Emerging Threats Open). Listens only; never blocks traffic.</p>%s</div>' % (badge, info))
 
 
 def key_form(provider, label, saved, ph_new, invalid=False):
@@ -6161,6 +6383,7 @@ tbody tr:hover{background:var(--panel2)}tr:last-child td{border-bottom:0}
 .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:500;border:1px solid currentColor;margin:1px 2px 1px 0;color:var(--muted)}
 .t-red{color:var(--red)}.t-orange{color:var(--orange)}.t-yellow{color:var(--yellow)}.t-blue{color:var(--blue)}.t-purple{color:var(--purple)}
 .t-teal{color:var(--teal)}.t-grey{color:var(--grey)}.t-green{color:var(--green)}
+.sev{font-size:12px;font-weight:600}.sev.s1{color:var(--red)}.sev.s2{color:var(--orange)}.sev.s3,.sev.s4{color:var(--muted)}
 .bars{display:flex;align-items:flex-end;gap:4px;width:100%;height:108px}.bars-60{height:78px}
 .bcol{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
 .bval{font-size:11px;line-height:1;color:var(--muted);margin-bottom:4px;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -6746,7 +6969,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(cred_check(db(), m.group(1))), "application/json")
         if path == "/campaigns":
             return self.send(200, v_campaigns(qs))
-        m = re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path) or re.fullmatch(r"/campaign/(web)/([a-z0-9_]{1,60})", path)
+        m = (re.fullmatch(r"/campaign/(script|hassh|file)/([0-9a-f]{8,64})", path) or re.fullmatch(r"/campaign/(web)/([a-z0-9_]{1,60})", path)
+             or re.fullmatch(r"/campaign/(ids)/([1-9][0-9]{0,9})", path))
         if m:
             out = v_campaign(m.group(1), m.group(2))
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1>"))
@@ -7153,6 +7377,7 @@ def ingest_once():
     n = store(con, rows)
     store_files(con, parse_export.files)
     store_mails(con, parse_export.mails)
+    store_ids(con, parse_export.ids)
     while classify_web(con, budget=60.0):
         pass
     note_sync(con, t0)

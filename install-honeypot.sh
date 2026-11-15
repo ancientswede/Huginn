@@ -23,6 +23,7 @@ WITH_CAMERA=ask
 WITH_CANARY=ask
 WITH_TARPIT=ask
 WITH_TRAPS=ask
+WITH_SURICATA=ask
 COWRIE_REF=""
 YES=0
 
@@ -44,6 +45,7 @@ Usage: $0 [options]
   --opencanary | --no-opencanary
   --tarpit     | --no-tarpit       (endlessh on public port 2222)
   --traps      | --no-traps        (hp-traps: SMTP 25/587, POP3 110, IMAP 143, PostgreSQL 5432, SOCKS5 1080)
+  --suricata   | --no-suricata     (Suricata IDS: names known attacks by rule and CVE; about 500 MB of memory)
   --cowrie-ref REF      git branch/tag of Cowrie to install (default: its default branch)
   --yes                 no questions: optional parts default to yes, admin-port check is automatic
 EOF
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
     --opencanary) WITH_CANARY=yes ;; --no-opencanary) WITH_CANARY=no ;;
     --tarpit) WITH_TARPIT=yes ;; --no-tarpit) WITH_TARPIT=no ;;
     --traps) WITH_TRAPS=yes ;; --no-traps) WITH_TRAPS=no ;;
+    --suricata) WITH_SURICATA=yes ;; --no-suricata) WITH_SURICATA=no ;;
     --cowrie-ref) COWRIE_REF="$2"; shift ;;
     --yes|-y) YES=1 ;;
     -h|--help) usage ;;
@@ -109,7 +112,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh systemd/hp-traps.service; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -137,6 +140,10 @@ decide WITH_CAMERA "Let Telnet (port 23) pretend to be an IP camera (a second, s
 decide WITH_CANARY "Install OpenCanary (fake FTP, HTTP/HTTPS, MySQL, Redis, VNC)?"
 decide WITH_TARPIT "Install endlessh (SSH tarpit on public port 2222)?"
 decide WITH_TRAPS  "Install hp-traps (fake SMTP relay, POP3, IMAP, PostgreSQL, SOCKS5)?"
+# Suricata needs memory and a rules download, so it is the one optional part that is off unless asked for.
+if [ "$WITH_SURICATA" = ask ]; then
+  if [ "$YES" = 0 ] && ask "Install Suricata IDS (names known attacks by rule and CVE; about 500 MB of memory)?" no; then WITH_SURICATA=yes; else WITH_SURICATA=no; fi
+fi
 
 # ------------------------------------------------------------------ packages
 say "Installing packages"
@@ -538,13 +545,17 @@ chmod 755 /usr/local/sbin/hp-add-huginn-key
 bash "$HERE/honeypot/setup-housekeeping.sh"
 bash "$HERE/honeypot/setup-sandbox.sh"
 bash "$HERE/honeypot/setup-identity.sh" || warn "web identity not set up: run hp-identity set synology later"
+if [ "$WITH_SURICATA" = yes ]; then
+  say "Suricata IDS"
+  bash "$HERE/honeypot/setup-suricata.sh" on || warn "Suricata not set up (the honeypot works without it): ./update-honeypot.sh --suricata-on later"
+fi
 SECTIONS=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || true)
 [ "$SECTIONS" -ge 7 ] && ok "hp-export works ($SECTIONS sections)" || warn "hp-export printed $SECTIONS sections (expected 7)"
 
 # ------------------------------------------------------------------ summary
 say "Done"
 sleep 3
-for s in cowrie $( [ -f /etc/systemd/system/cowrie-camera.service ] && echo cowrie-camera ) $( [ "$WITH_TARPIT" = yes ] && echo endlessh ) $( [ "$WITH_CANARY" = yes ] && echo opencanary ) $( [ "$WITH_TRAPS" = yes ] && echo hp-traps ); do
+for s in cowrie $( [ -f /etc/systemd/system/cowrie-camera.service ] && echo cowrie-camera ) $( [ "$WITH_TARPIT" = yes ] && echo endlessh ) $( [ "$WITH_CANARY" = yes ] && echo opencanary ) $( [ "$WITH_TRAPS" = yes ] && echo hp-traps ) $( [ -f /etc/huginn-honeypot/suricata ] && echo suricata ); do
   printf '    %-14s %s\n' "$s" "$(systemctl is-active "$s")"
 done
 if [ -s "$P/personas" ]; then

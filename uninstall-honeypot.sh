@@ -87,6 +87,22 @@ if [ "$PURGE" = 1 ] && grep -qs "Written by Huginn" /etc/endlessh/config; then
   ok "removed the endlessh package"
 fi
 rm -rf /etc/systemd/system/hp-traps.service.d
+# Suricata (setup-suricata.sh): Huginn's config and timer go; the package goes with --purge.
+systemctl disable --now hp-suricata-rules.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/hp-suricata-rules.service /etc/systemd/system/hp-suricata-rules.timer /usr/local/sbin/hp-suricata
+if [ -f /etc/systemd/system/suricata.service.d/huginn.conf ]; then
+  systemctl disable --now suricata >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/suricata.service.d/huginn.conf
+  rmdir /etc/systemd/system/suricata.service.d 2>/dev/null || true
+  if [ "$PURGE" = 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq suricata suricata-update >/dev/null 2>&1 || true
+    rm -rf /var/lib/suricata /var/log/suricata
+    userdel hp-suricata >/dev/null 2>&1 || true
+    ok "removed Suricata, its user, rules and logs"
+  else
+    ok "stopped Suricata (the package stays; --purge removes it)"
+  fi
+fi
 systemctl disable --now hp-logclean.timer >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/hp-identity.service /etc/systemd/system/hp-identity.timer /usr/local/sbin/hp-identity /etc/default/hp-identity
 rm -rf /usr/local/share/hp-identity /var/lib/hp-identity

@@ -115,8 +115,9 @@ Replies to connections that were made *to* the honeypot still work, because the 
 - **Engagement:** sessions that got in, day by day: what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it, to see whether a change to the honeypot kept attackers busier. Also the terminal sizes clients asked for: a bot that asks tends to use one fixed size.
 - **Help:** what every attacker tag, session and file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it.
 - **Search:** commands, file hashes and names, addresses found inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history.
-- **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack and mail client name (HELO), so one botnet shows up as one group. **Proxy use** lists what bots fetch through the fake SSH proxy, with a 7-day count of proxy sessions and requests per session to compare before and after a change. **Slow replies** shows how many slow robots exports were sent in full (the client stayed until the last byte) and how long mail sessions lasted.
+- **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack, IDS rule and mail client name (HELO), so one botnet shows up as one group. **Proxy use** lists what bots fetch through the fake SSH proxy, with a 7-day count of proxy sessions and requests per session to compare before and after a change. **Slow replies** shows how many slow robots exports were sent in full (the client stayed until the last byte) and how long mail sessions lasted.
 - **Web attacks:** every request to the web trap is matched against about 3,100 rules from [Krawl](https://github.com/BlessedRebuS/Krawl): CVE exploits (with a link to the CVE), path traversal, webshells, `.env`/`.git` hunting, scanners and probes for exposed MCP servers. Exploits tag the attacker `web-exploit`, probes `web-probe`. A plain GET of a path counts as a probe: it only asks whether the path is there.
+- **IDS alerts (optional):** turn on [Suricata](https://suricata.io) on the honeypot with one command and Huginn names known attacks by rule and CVE, from the free [Emerging Threats Open](https://rules.emergingthreats.net) rules: exploits against routers, cameras and web apps, scanners, brute force tools. Each attacker page lists the rules it tripped, Campaigns groups them with a page per rule, and an attack rule tags the attacker `ids-alert`. Nothing to set up in your router: Suricata runs on the honeypot and only listens. See [Suricata IDS](#suricata-ids-optional).
 - **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up by its hash on [MalwareBazaar](https://bazaar.abuse.ch) (family and tags) and [VirusTotal](https://www.virustotal.com) (how many engines flag it, or *novel* if nobody has seen it). Only the hash is sent; the keys are pasted on the Settings page.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
   - **Is my password in here?** Check whether attackers have tried one of your own passwords. The check runs in your browser: only the first 4 characters of the password's SHA-256 hash go to Huginn (the same idea as Have I Been Pwned), so the password itself never leaves your machine.
@@ -168,7 +169,7 @@ You need **two machines**, VMs or LXC containers. That is on purpose: the honeyp
 | | Honeypot | Huginn |
 |---|---|---|
 | OS | Debian 12 or 13 | Debian 12 or 13 |
-| CPU / RAM / disk | 1 core, 1–2 GB, 8 GB | 1 core, 512 MB–1 GB, 8 GB |
+| CPU / RAM / disk | 1 core, 1–2 GB (2 GB with Suricata), 8 GB | 1 core, 512 MB–1 GB, 8 GB |
 | Network | **isolated**: own VLAN (best) or blocked from your LAN by the hypervisor firewall, see [How to isolate](#how-to-isolate-the-honeypot); internet ports forwarded to it | your normal LAN |
 | Reaches | the internet while installing | the honeypot's admin SSH port |
 
@@ -189,7 +190,7 @@ apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git &
 ./install-honeypot.sh
 ```
 
-The script asks before each optional part: OpenCanary, the endlessh tarpit and hp-traps. Then it:
+The script asks before each optional part: OpenCanary, the endlessh tarpit, hp-traps and the Suricata IDS (the only one that defaults to no). Then it:
 - Asks which port your own admin SSH should move to (suggests 22022, any free port above 1024 works), and asks you to prove you can log in there **before** port 22 goes to the honeypot, so you cannot lock yourself out.
 - Asks what SSH should pretend to be (a **server** or a **file server**) and whether Telnet should be an **IP camera**. Each install gets its own random hostname, network, hardware and planted bait (see [Personas and bait](#personas-and-bait)).
 - Installs Cowrie and redirects the public ports to the honeypot services.
@@ -394,6 +395,7 @@ cd Huginn && git pull
 ./update-honeypot.sh                          # hp-export, hp-fileinfo, hp-traps
 ./update-honeypot.sh --cowrie --opencanary    # also upgrade Cowrie and OpenCanary and re-apply Huginn's patches
 ./update-honeypot.sh --goodbye-on             # optional logout note (see Personas and bait); --goodbye-off turns it off
+./update-honeypot.sh --suricata-on            # optional Suricata IDS (see Suricata IDS); --suricata-off turns it off
 ```
 
 - `update-huginn.sh` keeps the last three backups (code + a consistent copy of the database) in `/opt/huginn/backups/`, and lists what is new since your version.
@@ -500,6 +502,36 @@ hp-identity set mikrotik      # change now (or: set random)
 
 Huginn only reads the history (through `hp-export`) and shows it on **Personas**: hits per day for each device, since each one runs for a different time. It cannot change the identity: nothing ever connects to the honeypot to control it.
 
+## Suricata IDS (optional)
+
+Cowrie and OpenCanary show what attackers *do*. [Suricata](https://suricata.io) adds what their traffic *is*: it matches every packet to the honeypot against the [Emerging Threats Open](https://rules.emergingthreats.net) rules (about 45,000, free) and names known exploits, scanners and tools, often with the CVE.
+
+```bash
+./update-honeypot.sh --suricata-on      # on the honeypot, from the repository folder (or install-honeypot.sh --suricata)
+```
+
+That is all. The script installs Debian's `suricata` package, writes Huginn's config, fetches the rules, starts it and checks that it runs. Huginn picks the alerts up with the next sync; there is nothing to change on the Huginn machine or in your router.
+
+- **It only listens.** Suricata reads a copy of the packets on the honeypot's own network card. It never blocks, changes or forwards anything, and needs no mirror port or router feature. Traffic to and from your admin SSH on this machine (every port sshd listens on, and with it Huginn's own fetches) is left out; an attacker who connects *from* that port number to a honeypot service is still watched.
+- **It does not run as root.** Suricata starts as root only to open the network card, then runs as the user `hp-suricata`, keeping only the capabilities packet capture needs (`NET_RAW`, `NET_ADMIN`, plus `SYS_NICE`), in a systemd sandbox that cannot see `/home` (where Cowrie lives). Its log folder stays root's: Suricata can only append to the two log files root made for it, so it cannot plant links or other files there for root to open.
+- **Only alerts are exported**, as a few fixed fields: time, address, port, protocol, rule number, severity, rule name and class. No payloads, flows or DNS. The honeypot's own fake replies also match rules (a planted `/etc/passwd` looks like a leak), so only alerts on traffic *to* the honeypot count.
+- **Where it shows:** the attacker page (card **IDS alerts**), **Campaigns > IDS alerts** with a page per rule and the addresses that tripped it, and **Settings > Honeypot** (on or off, running, how old the rules are, last 7 days). Addresses that only tripped a rule, without touching a service, are listed on the rule's page but get no attacker page of their own.
+- **Score:** a rule of severity 1 (attacks: exploits, privilege gain, trojans, web application attacks) adds 3 and tags the attacker `ids-alert`. Severity 2 (mostly scans and recon, which nearly every attacker does), 3 and 4 are shown but not scored.
+- **Memory:** about 500 MB with the rules loaded, capped at 900 MB by systemd so it cannot starve Cowrie. Give the honeypot 2 GB. Rule groups that are only IP reputation lists (CINS, DShield, Spamhaus DROP, Tor and so on) are left out: they cost memory and say nothing about what the address did. Edit `/etc/huginn-honeypot/suricata-disable.conf` to change that.
+- **Rules are updated once a day** by a timer (`hp-suricata-rules.timer`), which needs internet on the honeypot. New rules are fetched into a staging folder with a memory limit of their own, tested with the installed Suricata, and only then swapped in as a whole folder; the previous set is kept, and if Suricata does not start with the new rules it goes back to the old ones. One run at a time (a lock), so a manual update and the timer cannot overlap.
+- **A flood is reported, not hidden.** Each sync takes the newest 20,000 alerts to the honeypot. If eve.json holds more since the last rotation, Settings says how many were not counted. **No internet there** (recommended, see [Requirements](#requirements)): install the packages while you set the honeypot up, or copy them over, then download the rules on another machine and load them:
+  ```bash
+  # on a machine with internet (the version must match: suricata -V on the honeypot)
+  curl -LO https://rules.emergingthreats.net/open/suricata-7.0.10/emerging.rules.tar.gz
+  scp -P 22022 emerging.rules.tar.gz root@honeypot:
+  # on the honeypot
+  ./update-honeypot.sh --suricata-rules ~/emerging.rules.tar.gz
+  ```
+  The archive is checked first (size, number of files, no paths outside it, only plain files), then tested like the daily update. Settings shows a note when the rules are over two weeks old.
+- **Off again:** `./update-honeypot.sh --suricata-off` stops it (the package and rules stay). `uninstall-honeypot.sh --purge` removes the package too. The alerts already in Huginn stay, like all other history.
+
+Suricata parses hostile traffic on the honeypot. That is the machine that is already assumed to be broken into one day, which is why it sits on an isolated network, and why Suricata drops root and runs sandboxed.
+
 ## Configuration
 
 All settings are environment variables in `/opt/huginn/.env`. See [`.env.example`](.env.example).
@@ -541,6 +573,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Attacker data is untrusted.** Everything attackers typed is escaped. The UI has a strict Content-Security-Policy (no inline scripts).
 - **Logins:** one password (scrypt), HttpOnly SameSite=Strict cookies, at most 5 failed logins per 15 minutes per IP, same-origin checks on every form.
 - **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.
+- **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
 - **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported.
 - **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service.
 - **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
@@ -625,6 +658,7 @@ app.py import FILE...        # import full cowrie.json* / opencanary.log* files
 
 ./update-huginn.sh [--rollback]          # update / go back (Huginn machine)
 ./update-honeypot.sh [--cowrie] [--opencanary]   # update the honeypot side
+./update-honeypot.sh --suricata-on | --suricata-off | --suricata-rules FILE   # optional Suricata IDS
 ./uninstall-huginn.sh [--purge]                  # remove Huginn (keeps the data unless --purge)
 ./uninstall-honeypot.sh [--purge] [--restore-ssh]   # remove the honeypot side
 ```

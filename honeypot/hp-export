@@ -14,6 +14,8 @@ FILEINFO_USER="cowrie"                         # unprivileged user that may read
 PERSONAS_FILE="/etc/huginn-honeypot/personas"  # "internal port=persona" per line (written by install-honeypot.sh)
 BAIT_FILE="/etc/huginn-honeypot/bait.json"     # the fake credentials planted in the personas
 IDENTITY_HISTORY="/var/lib/hp-identity/history"  # what the web trap has pretended to be (written by hp-identity)
+SURICATA_FLAG="/etc/huginn-honeypot/suricata"    # Suricata is on (honeypot/setup-suricata.sh)
+SURICATA_EVE="/var/log/suricata/eve.json"
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
 FIRST_COWRIE="${COWRIE_DIRS%% *}"
 export HP_DOWNLOAD_DIRS="${HP_DOWNLOAD_DIRS:-$FIRST_COWRIE/var/lib/cowrie/downloads}"
@@ -105,9 +107,56 @@ catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000 | keep
 if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
 if [ -r "$IDENTITY_HISTORY" ]; then echo "##IDENTITY"; tail -n 500 "$IDENTITY_HISTORY" | grep -E '^[0-9]{9,11} [a-z0-9-]{1,32} (nas|router) [A-Za-z0-9 !+._-]{1,48}$' || true; fi
 if [ -r "$BAIT_FILE" ]; then echo "##BAIT"; head -c 20000 "$BAIT_FILE" | tr -d '\n'; echo; fi
+# Optional Suricata alerts (update-honeypot.sh --suricata-on). Only alerts on traffic TO this machine, rewritten as a few
+# fixed fields: the honeypot's own fake replies (a planted /etc/passwd...) also match rules, but they are not the attacker.
+if [ -f "$SURICATA_FLAG" ]; then
+  echo "##IDS"
+  # Filtered first, then the newest 20000: the honeypot's own reply alerts must not push real ones out of the window
+  # (only absurd line lengths are dropped before the filter, no byte budget). "h" identifies the original line, so two
+  # alerts that look the same here (two connections, same second) both count. "dropped N": more than fit since the
+  # oldest line in eve.json, so Huginn can say that some were not counted.
+  catfiles "$SURICATA_EVE*" | LC_ALL=C awk 'length($0) <= 16384' | python3 -I -c '
+import collections, hashlib, ipaddress, json, sys
+own = set()
+for a in sys.argv[1].split():
+    try:
+        own.add(ipaddress.ip_address(a))
+    except ValueError:
+        pass
+def addr(s):
+    try:
+        return ipaddress.ip_address(s)
+    except (ValueError, TypeError):
+        return None
+out, total = collections.deque(maxlen=20000), 0
+for line in sys.stdin.buffer:
+    if b"alert" not in line:
+        continue
+    try:
+        e = json.loads(line)
+        a = e["alert"]
+        if e.get("event_type") != "alert" or addr(e.get("dest_ip")) not in own or addr(e.get("src_ip")) in own:
+            continue
+        total += 1
+        out.append(json.dumps({"t": e["timestamp"], "ip": e["src_ip"], "port": e.get("dest_port"), "proto": e.get("proto"),
+                          "sid": a["signature_id"], "rev": a.get("rev"), "sev": a.get("severity"),
+                          "sig": a.get("signature"), "cat": a.get("category"),
+                          "h": hashlib.sha1(line.rstrip(b"\n")).hexdigest()[:20]}, ensure_ascii=True))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        continue
+sys.stdout.write("".join(x + "\n" for x in out))
+if total > len(out):
+    print("dropped %d" % (total - len(out)))
+' "$(hostname -I 2>/dev/null)"
+  r=/var/lib/suricata/rules/suricata.rules
+  [ -f "$r" ] && [ ! -L "$r" ] && echo "rules $(stat -c %Y "$r")"
+fi
 # What protects the honeypot, as fixed words only: Huginn shows it and alerts when something is missing (a drop-in removed
 # because a service would not start with it, a patch that no longer fits after a Cowrie upgrade, a service that stopped).
 echo "##STATUS"
+if [ -f "$SURICATA_FLAG" ]; then
+  if systemctl is-active --quiet suricata; then echo "running:suricata ok"; else echo "running:suricata missing"; fi
+fi
 for u in cowrie cowrie-camera opencanary; do
   [ -f "/etc/systemd/system/$u.service" ] || continue
   d="/etc/systemd/system/$u.service.d"

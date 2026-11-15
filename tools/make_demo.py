@@ -250,6 +250,23 @@ for i, (ago_days, ident, kind, label, per_day) in enumerate(WEB_IDENTITIES):
 
 app.store(con, rows)
 app.apply_honeypot_meta(con, {"identities": app.parse_identities(web_lines)})
+# 13. Suricata IDS (0.43): made-up alerts from ET Open style rules, on some attackers and a few addresses only Suricata saw
+IDS_RULES = [(2025883, 1, "ET EXPLOIT MVPower DVR Shell UCE", "Attempted Administrator Privilege Gain", 80, 0.10),
+             (2030092, 1, "ET WEB_SPECIFIC_APPS MVPower CCTV DVR /shell JAWS Webserver Unauthenticated Remote Command Execution (CVE-2016-20016)", "Web Application Attack", 80, 0.10),
+             (2049400, 2, "ET WEB_SERVER /etc/passwd Detected in URI", "Attempted Information Leak", 80, 0.08),
+             (2001219, 2, "ET SCAN Potential SSH Scan", "Attempted Information Leak", 22, 0.30),
+             (2010937, 3, "ET SCAN Suspicious inbound to mySQL port 3306", "Potentially Bad Traffic", 3306, 0.12),
+             (2002911, 3, "ET SCAN Potential VNC Scan 5900-5920", "Attempted Information Leak", 5900, 0.10),
+             (2031502, 3, "ET INFO Request to Hidden Environment File - Inbound", "Misc activity", 80, 0.12)]
+ids_alerts, n_ids = [], 0
+for ip in list(ips) + ["192.0.2.%d" % (200 + k) for k in range(6)]:
+    for sid, sev, sig, cat, port, p in IDS_RULES:
+        if R.random() < (p if ip in ips else 0.35):
+            for _ in range(R.randint(1, 4)):
+                n_ids += 1
+                ids_alerts.append(("ids:demo%d" % n_ids, rnd_ts(6), ip, sid, sev, sig, cat, "TCP", port))
+app.store_ids(con, ids_alerts)
+app.set_meta(con, "hp_ids", json.dumps({"on": True, "rules": NOW - 9 * 3600, "at": NOW}))
 app.store_files(con, [{"sha": f["sha"], "src": "redir" if "script" in f["type"] else "download", "size": f["size"], "type": f["type"],
                        "arch": f["arch"], "packed": f["packed"], "iocs": f["iocs"], "mtime": NOW - R.uniform(0, 5) * 86400, "family": f.get("family", "")} for f in FILES])
 with con:
@@ -324,7 +341,7 @@ def link(m):
         target = "ip/%s.html" % path[4:]
     elif path.startswith("/replay/"):
         target = "replay/%s.html" % path[8:]
-    elif re.fullmatch(r"/campaign/(script|hassh|file)/[0-9a-f]+", path):
+    elif re.fullmatch(r"/campaign/(script|hassh|file)/[0-9a-f]+", path) or re.fullmatch(r"/campaign/ids/[0-9]+", path):
         target = path[1:] + ".html"
     elif path == "/engagement" and not qs.get("v"):
         target = "engagement.html" if qs.get("days", "14") == "14" else "engagement-%s.html" % qs.get("days")
@@ -392,6 +409,10 @@ for kind, sql in (("script", "SELECT DISTINCT cmdhash FROM sessions WHERE cmdhas
         out = app.v_campaign(kind, v)
         if out:
             save("campaign/%s/%s.html" % (kind, v), fix(out))
+for (sid,) in con.execute("SELECT DISTINCT sid FROM ids"):
+    out = app.v_campaign("ids", str(sid))
+    if out:
+        save("campaign/ids/%d.html" % sid, fix(out))
 save("files.html", fix(app.v_files()))
 save("help.html", fix(app.v_help()))
 for n in app.ENG_RANGES:

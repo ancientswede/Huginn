@@ -1,0 +1,10 @@
+[Unit]
+Description=Huginn honeypot: new ET Open rules for Suricata, tested before use (needs internet; see README for a honeypot without)
+ConditionPathExists=/etc/huginn-honeypot/suricata
+
+[Service]
+Type=oneshot
+Nice=15
+# Fetches into a staging folder with its own memory limit, tests the rules with the installed Suricata, keeps the
+# previous set, restarts Suricata (a reload would hold old and new rules at once) and goes back if it does not start.
+ExecStart=/usr/local/sbin/hp-suricata update

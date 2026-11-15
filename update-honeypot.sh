@@ -4,6 +4,8 @@
 #   cd Huginn && git pull && ./update-honeypot.sh                  hp-export, hp-fileinfo, hp-traps
 #   ./update-honeypot.sh --cowrie --opencanary                     ...and upgrade Cowrie / OpenCanary too
 #   ./update-honeypot.sh --goodbye-on | --goodbye-off              only turn the logout note on or off (nothing else changes)
+#   ./update-honeypot.sh --suricata-on | --suricata-off            only turn the Suricata IDS on or off (about 500 MB of memory)
+#   ./update-honeypot.sh --suricata-rules emerging.rules.tar.gz    load ET Open rules downloaded elsewhere (no internet here)
 #
 # Configs, personas, bait, logs and keys are never replaced. Huginn's small patches to Cowrie and
 # OpenCanary are put back after an upgrade. Run as root. Your admin SSH port is not touched.
@@ -13,15 +15,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 UP_COWRIE=0
 UP_CANARY=0
 GOODBYE=""
-for a in "$@"; do
-  case "$a" in
+SURICATA=""
+SURICATA_RULES=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --cowrie) UP_COWRIE=1 ;;
     --opencanary) UP_CANARY=1 ;;
     --goodbye-on) GOODBYE=on ;;
     --goodbye-off) GOODBYE=off ;;
-    -h|--help) sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "Unknown option: $a"; exit 2 ;;
+    --suricata-on) SURICATA=on ;;
+    --suricata-off) SURICATA=off ;;
+    --suricata-rules) SURICATA=rules; SURICATA_RULES="${2:-}"; [ $# -ge 2 ] && shift ;;
+    -h|--help) sed -n 2,12p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "Unknown option: $1"; exit 2 ;;
   esac
+  shift
 done
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -45,9 +53,20 @@ if [ -n "$GOODBYE" ]; then
   exit 0
 fi
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
+
+# Suricata (honeypot/setup-suricata.sh): only this when asked for. hp-export is updated first, so Huginn gets the alerts.
+if [ -n "$SURICATA" ]; then
+  cmp -s "$HERE/honeypot/hp-export" /usr/local/bin/hp-export || install -m 755 "$HERE/honeypot/hp-export" /usr/local/bin/hp-export
+  case "$SURICATA" in
+    on) bash "$HERE/honeypot/setup-suricata.sh" on ;;
+    off) bash "$HERE/honeypot/setup-suricata.sh" off ;;
+    rules) bash "$HERE/honeypot/setup-suricata.sh" rules "$SURICATA_RULES" ;;
+  esac
+  exit 0
+fi
 
 COWRIE_DIRS="/home/cowrie/cowrie"
 [ -r /etc/default/hp-export ] && . /etc/default/hp-export
@@ -193,6 +212,11 @@ if [ "$UP_COWRIE" = 0 ] && [ -f "$FWD" ]; then
   if [ "$CHANGED" = 1 ]; then
     for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
   fi
+fi
+
+if [ -f /etc/huginn-honeypot/suricata ]; then
+  say "Suricata"
+  bash "$HERE/honeypot/setup-suricata.sh" refresh || { warn "Suricata needs a look (the rest of the update is done)"; FAILED=1; }
 fi
 
 say "Web identity"
