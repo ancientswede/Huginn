@@ -267,6 +267,9 @@ for ip in list(ips) + ["192.0.2.%d" % (200 + k) for k in range(6)]:
                 ids_alerts.append(("ids:demo%d" % n_ids, rnd_ts(6), ip, sid, sev, sig, cat, "TCP", port))
 app.store_ids(con, ids_alerts)
 app.set_meta(con, "hp_ids", json.dumps({"on": True, "rules": NOW - 9 * 3600, "at": NOW}))
+# The honeypot's own report (hp-export ##STATUS), so Settings shows the switches instead of "not reported".
+app.set_meta(con, "hp_status", json.dumps({"at": NOW, "items": {"patch:goodbye": True, "option:goodbye": False, "option:suricata": True,
+                                                               "running:suricata": True}}))
 app.store_files(con, [{"sha": f["sha"], "src": "redir" if "script" in f["type"] else "download", "size": f["size"], "type": f["type"],
                        "arch": f["arch"], "packed": f["packed"], "iocs": f["iocs"], "mtime": NOW - R.uniform(0, 5) * 86400, "family": f.get("family", "")} for f in FILES])
 with con:
