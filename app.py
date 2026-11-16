@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.44.0"
+HUGINN_VERSION = "0.45.0"
 CHANGELOG = [
+    ("0.45.0", "2026-11-16", "Attackers that come back: \"returned\" for an address seen again after 7 or more quiet days (change it under Settings, Views & defaults), "
+               "\"stepped-up\" (+5) when it then gets further than ever before, for example only knocked first and later ran commands, "
+               "left files or used the honeypot as a proxy. The attacker page says when it came back and what it did before and since, "
+               "both tags can be filtered on, and a new ntfy alert (on by default) tells you once per return. Stored attackers are "
+               "checked once at start. From a LinkedIn comment: a home connection is worth most as a proxy, and the first checks are "
+               "often followed later by specific tasks."),
     ("0.44.0", "2026-11-15", "Suricata can be turned on and off under Settings, Honeypot, once it is set up on the honeypot (update-honeypot.sh --suricata-on, which installs the package and the rules). The locked export key accepts exactly \"ids on\" or \"ids off\", which only start or stop a Suricata that is already set up, and checks that it really started or stopped. Update the honeypot side once for the switch to show."),
     ("0.43.0", "2026-11-15", "Optional Suricata IDS on the honeypot: one command (update-honeypot.sh --suricata-on, or install-honeypot.sh --suricata) installs it, fetches the free Emerging Threats Open rules and starts it, and Huginn names known attacks by rule and CVE. Nothing to set up in your router: Suricata only listens on the honeypot's own network card, never blocks anything, leaves your admin SSH out, drops root to its own user in a sandbox and is capped at 900 MB of memory. Only alerts on traffic to the honeypot are exported, as a few fixed fields. Each attacker page gets a card IDS alerts, Campaigns lists the rules with a page per rule and the addresses that tripped it, and Settings, Honeypot shows whether it runs and how old the rules are. An attack rule (severity 1) adds 3 to the score and tags the attacker ids-alert. Rules are updated daily, or from a downloaded file on a honeypot without internet (--suricata-rules), and are always tested with the installed Suricata first; the previous set is kept and comes back if Suricata does not start."),
     ("0.42.0", "2026-11-14", "Every number at the top of the Overview is a link to the list behind it: Took the bait opens the attackers who took the bait in the last 7 days, Sessions the attackers with the most sessions, Files captured the Files page, Time wasted the receipt, On blocklist the Blocklist. New this week links its attackers, new attackers, each new country, each malware family and the bait count too."),
@@ -133,6 +139,15 @@ try:
     DECOY_CAP = max(0, int(os.environ.get("HUGINN_DECOY_CAP", "2000")))
 except ValueError:
     DECOY_CAP = 2000
+# An attacker seen again after this many quiet UTC days (nothing at all from it) gets "returned"; one that then gets further
+# than it ever did before (say only knocked, then ran commands) also gets "stepped-up". 0.45, from a LinkedIn comment:
+# a home connection is worth most as a proxy, and the checks are often followed later by "specific tasks".
+# Set under Settings, Views & defaults; this is only the starting value before anything is saved there.
+RETURN_CHOICES = (3, 5, 7, 14, 30)
+try:
+    RETURN_DAYS = max(1, int(os.environ.get("HUGINN_RETURN_DAYS", "7")))
+except ValueError:
+    RETURN_DAYS = 7
 ENRICH = os.environ.get("HUGINN_ENRICH", "1") == "1"
 ENRICH_TTL = 14 * 86400
 # Your own public IPs / domain names: replaced with "[self]" in everything stored (attackers often echo the target address).
@@ -400,6 +415,9 @@ def init_db():
     # One time only, all or nothing: script campaigns are grouped by the shape of their commands since 0.19.
     if DECOY_CAP > 0 and not get_meta(con, "decoy_cap_v1"):
         trim_decoys(con)
+    # 0.45: "returned" and "stepped-up" for attackers already stored (Settings also runs this when the quiet days change).
+    if get_meta(con, "returned_days") != str(return_days(con)):
+        recheck_returned(con)
     if not get_meta(con, "cmdhash_shapes"):
         with con:
             for (sid,) in con.execute("SELECT session FROM sessions WHERE cmdhash IS NOT NULL").fetchall():
@@ -1805,14 +1823,14 @@ def sshole_password(proto, password):
     return proto == "ssh" and SSHOLE_MIN <= len((password or "").encode("utf-8", "surrogatepass")) <= SSHOLE_MAX
 
 
-def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False, web="", ids=False):
+def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=False, sshole=False, web="", ids=False, stepped=False):
     # The one place that defines the score: (label, points), zero points left out. web: "exploit", "probe" and/or "robots".
     parts = [("seen", 1), ("SSHole probe", 10 if sshole else 0), ("took bait", 20 if took else 0), ("read bait", 5 if read else 0),
              ("web exploit", 8 if "exploit" in web else 0), ("web probe", 3 if "probe" in web and "exploit" not in web else 0),
              ("robots.txt trap", 5 if "robots" in web else 0), ("IDS alert", 3 if ids else 0),
              ("login attempts", 2 if lo + lf else 0), ("brute force", 2 if lo + lf >= 10 else 0), ("commands", min(10, cmds // 2)),
              ("files", 15 if files else 0), ("proxy", 10 if tcpip else 0), ("exploit", 10 if expl else 0),
-             ("decoy services", 3 * len(csvcs)), ("repeat visits", min(5, sess // 20))]
+             ("decoy services", 3 * len(csvcs)), ("repeat visits", min(5, sess // 20)), ("stepped up", 5 if stepped else 0)]
     return [(k, v) for k, v in parts if v]
 
 
@@ -1820,11 +1838,15 @@ def score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took=False, read=
 SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per command (max 10), +15 files, +10 proxy, +10 exploit, "
               "+10 SSHole probe, +20 took bait, +5 read bait, +8 web exploit, +3 web probe, +5 robots.txt trap, "
               "+3 IDS alert (Suricata rule of severity 1, an attack), "
-              "+3 per decoy service, +1 per 20 repeat visits (max 5).")
+              "+3 per decoy service, +1 per 20 repeat visits (max 5), "
+              "+5 stepped up (came back after a quiet spell and got further than before).")
 
 
-def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False):
-    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids))
+def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False,
+                   back=None):
+    # back: return_info() of the IP, or None.
+    stepped = bool(back and back[3] > back[2] and back[3] >= 3)
+    s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids, stepped))
     tags = []
     if took:
         tags.append("took-bait")
@@ -1854,7 +1876,53 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("multi-service")
     if tarpit_s >= 60:
         tags.append("tarpitted")
+    if back:
+        tags.append("returned")
+    if stepped:
+        tags.append("stepped-up")
     return s, ",".join(tags)
+
+
+# How far an attacker got, from the sums of its sessions (logins_ok, cmds, tcpip, files, sessions). No sessions at all = 0.
+WORK_LEVELS = ("only decoys", "connected", "logged in", "ran commands", "left files or used it as a proxy")
+
+
+def work_level(r):
+    lo, cmds, tcpip, files, n = r
+    return 4 if files or tcpip else 3 if cmds else 2 if lo else 1 if n else 0
+
+
+def return_days(con):
+    return return_days_saved(settings(con))
+
+
+def recheck_returned(con):
+    # "returned" and "stepped-up" for every stored attacker that can have come back, with the quiet days set now. Runs once
+    # after an upgrade and whenever the setting changes (about half a second on two weeks of real data).
+    n = return_days(con)
+    with con:
+        for (ip,) in con.execute("SELECT ip FROM ips WHERE last - first > ? OR (',' || tags || ',') LIKE '%,returned,%'", (n * 86400,)).fetchall():
+            recompute_ip(con, ip)
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('returned_days',?)", (str(n),))
+
+
+def return_info(con, ip, n=None):
+    # The latest time this IP came back after n (the setting) or more quiet UTC days, as (quiet days, start of the day it came
+    # back, level before, level after), or None. Any activity counts as being there: a session, a decoy service or the tarpit.
+    n = return_days(con) if n is None else n
+    days = sorted({d for (d,) in con.execute(
+        "SELECT CAST(start/86400 AS INTEGER) FROM sessions WHERE ip=? AND start IS NOT NULL "
+        "UNION SELECT CAST(ts/86400 AS INTEGER) FROM events WHERE ip=? AND kind IN ('canary','tarpit')", (ip, ip)) if d is not None})
+    back = None
+    for a, b in zip(days, days[1:]):
+        if b - a - 1 >= n:
+            back = (b - a - 1, b * 86400.0)
+    if not back:
+        return None
+    q = ("SELECT COALESCE(SUM(logins_ok),0), COALESCE(SUM(cmds),0), COALESCE(SUM(tcpip),0), COALESCE(SUM(files),0), COUNT(*) "
+         "FROM sessions WHERE ip=? AND start %s ?")
+    return (back[0], back[1], work_level(con.execute(q % "<", (ip, back[1])).fetchone()),
+            work_level(con.execute(q % ">=", (ip, back[1])).fetchone()))
 
 
 def recompute_ip(con, ip):
@@ -1885,7 +1953,9 @@ def recompute_ip(con, ip):
     # Suricata (optional): a rule of severity 1 on traffic from this address. ET Open gives 1 to attacks (exploits, privilege
     # gain, trojans, web application attacks); 2 is mostly scanning and recon, which nearly every attacker does.
     ids = con.execute("SELECT 1 FROM ids WHERE ip=? AND sev=1 LIMIT 1", (ip,)).fetchone() is not None
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids)
+    rd = return_days(con)
+    back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 else None
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -2582,6 +2652,24 @@ def human_like(con, sid):
     return human_gaps([r[0] for r in con.execute("SELECT ts FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid,))])
 
 
+def returned_news(con, since):
+    # Attackers that came back and got further than before, not told yet: [(ip, level after)]. One alert per IP and return.
+    try:
+        told = json.loads(get_meta(con, "ntfy_returned", "{}") or "{}")
+    except ValueError:
+        told = {}
+    out = []
+    for (ip,) in con.execute("SELECT ip FROM ips WHERE last>? AND (',' || tags || ',') LIKE '%,stepped-up,%' ORDER BY score DESC LIMIT 200", (since,)):
+        back = return_info(con, ip)
+        if back and back[3] > back[2] and told.get(ip) != back[1]:
+            told[ip] = back[1]
+            out.append((ip, back[3]))
+    if out:
+        keep = sorted(told.items(), key=lambda kv: kv[1])[-2000:]       # bounded: the oldest returns are forgotten first
+        set_meta(con, "ntfy_returned", json.dumps(dict(keep)))
+    return out
+
+
 def notify(con):
     # At most one ntfy summary per hour, only if something notable happened since the last one: bait, new files, human-like sessions, exploits (also web exploits).
     st = settings(con)
@@ -2632,6 +2720,12 @@ def notify(con):
     sshole = con.execute("SELECT COUNT(DISTINCT e.ip) FROM events e WHERE e.ts>? AND %s" % SSHOLE_SQL, (last,)).fetchone()[0]
     if sshole and "exploit" in ev:
         lines.append("SSHole probes from %d IP(s)" % sshole)
+    if "returned" in ev:
+        stepped = returned_news(con, last)
+        if stepped:
+            prio = 4
+            lines.append("Came back and got further: " + ", ".join("%s (%s)" % (ip, WORK_LEVELS[lv]) for ip, lv in stepped[:5])
+                         + (" +%d" % (len(stepped) - 5) if len(stepped) > 5 else ""))
     set_meta(con, "ntfy_last", now)
     if not lines:
         return
@@ -3012,7 +3106,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 # What each attacker tag means: the tooltip on every tag and the Help page read this one table.
@@ -3035,6 +3129,9 @@ TAG_HELP = {
     "web-probe": "A web request looking for something specific, such as admin pages or config files, but no exploit.",
     "robots-trap": "Visited a path that only the web trap's robots.txt mentions: a crawler that reads robots.txt to find hidden places.",
     "ids-alert": "Suricata on the honeypot matched a rule of severity 1 on traffic from this address: an attack such as an exploit, not just a scan.",
+    "returned": "Came back after a quiet spell with nothing at all from this address (7 days unless changed under Settings).",
+    "stepped-up": "Came back after a quiet spell and got further than ever before, for example only knocked first and then ran "
+                  "commands, left files or used the honeypot as a proxy.",
     "block": "You flagged this attacker: always on the blocklist.",
     "allow": "You flagged this attacker: never on the blocklist.",
 }
@@ -3069,7 +3166,7 @@ def cc_html(cc):
     return '<span class="cc">%s</span>' % esc(cc) if cc else '<span class="cc muted">··</span>'
 
 
-HOT_TAGS = {"took-bait", "read-bait", "dropper", "exploit", "sshole-probe"}     # rare finds: these get the warm colour
+HOT_TAGS = {"took-bait", "read-bait", "dropper", "exploit", "sshole-probe", "stepped-up"}     # rare finds: these get the warm colour
 
 
 def tags_row(tags, cols):
@@ -3205,9 +3302,10 @@ def kv(rows):
 
 SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
                     "cards": ["hero", "chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
-                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "weekly"], "v": 3,
+                    "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "returned", "weekly"], "v": 4,
                     "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
-                    "hide_cc": [], "hide_asn": [], "overview": "cards"}
+                    "hide_cc": [], "hide_asn": [], "overview": "cards",
+                    "return_days": RETURN_DAYS}
 # Optional columns of the Attackers list: key -> (header, sort key, css class)
 IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "ASN", None, ""), ("rdns", "Reverse DNS", None, ""),
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
@@ -3220,7 +3318,8 @@ ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d
            "green": ("#2e8b57", "#e6f4ec", "#5fc28a", "#17302a"), "orange": ("#c46a12", "#fbefe3", "#f0a050", "#352616"),
            "red": ("#c73a3a", "#fbe9e9", "#f07070", "#3a1d1f"), "teal": ("#178a8a", "#e3f4f4", "#4cc6c6", "#15302f")}
 NOTIFY_EVENTS = [("bait", "Someone took or read the bait"), ("files", "New files captured"),
-                 ("human", "Human-like sessions"), ("exploit", "Exploit attempts"), ("weekly", "Weekly summary (Sunday evening)")]
+                 ("human", "Human-like sessions"), ("exploit", "Exploit attempts"),
+                 ("returned", "An attacker came back after a quiet spell and got further than before"), ("weekly", "Weekly summary (Sunday evening)")]
 THEMES = ["auto", "light", "dark"]
 
 
@@ -3238,7 +3337,9 @@ def settings(con=None):
         out["notify_events"] = list(out["notify_events"]) + (["weekly"] if "weekly" not in out["notify_events"] else [])
     if saved and saved.get("v", 1) < 3 and "hero" not in out["cards"]:
         out["cards"] = ["hero"] + list(out["cards"])                  # 0.15: the banner, once
-    out["v"] = 3
+    if saved and saved.get("v", 1) < 4 and "returned" not in out["notify_events"]:
+        out["notify_events"] = list(out["notify_events"]) + ["returned"]   # 0.45: the new alert, once
+    out["v"] = 4
     return out
 
 
@@ -3932,7 +4033,7 @@ def v_ips(qs, mobile=False):
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "research", "block", "allow"]]), esc(sort),
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "research", "block", "allow"]]), esc(sort),
                ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "",
                '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
     pager, pager_top = "", ""
@@ -4020,10 +4121,10 @@ def score_html(r):
                                r["exploits"] or 0, [c for c in (r["canary_svcs"] or "").split(",") if c],
                                "took-bait" in have, "read-bait" in have, "sshole-probe" in have,
                                " ".join(k for k, t in (("exploit", "web-exploit"), ("probe", "web-probe"), ("robots", "robots-trap")) if t in have),
-                               "ids-alert" in have), key=lambda p: -p[1])
+                               "ids-alert" in have, "stepped-up" in have), key=lambda p: -p[1])
     if sum(v for _k, v in parts) != r["score"]:         # scored by an older version: do not show numbers that do not add up
         return '<div class="sleg muted">Breakdown unavailable</div>'
-    segs = "".join('<i class="g%d%s" title="%s: %d"></i>' % (min(v, 60), " hot" if k in ("took bait", "read bait", "SSHole probe", "files", "exploit") else "", esc(k), v) for k, v in parts)
+    segs = "".join('<i class="g%d%s" title="%s: %d"></i>' % (min(v, 60), " hot" if k in ("took bait", "read bait", "SSHole probe", "files", "exploit", "stepped up") else "", esc(k), v) for k, v in parts)
     return '<div class="sbar" role="img" aria-label="Score breakdown">%s</div><div class="sleg muted">%s</div>' % (
         segs, esc(" · ".join("%s %d" % p for p in parts)))
 
@@ -4058,7 +4159,12 @@ def ip_story(con, r):
     if r["tarpit_s"]:
         bits.append("spent %s in the tarpit" % dur(r["tarpit_s"]))
     text = ", ".join(bits) if bits else "connected, nothing more"
-    return text[0].upper() + text[1:] + "."
+    text = text[0].upper() + text[1:] + "."
+    back = return_info(con, r["ip"]) if "returned" in tags else None
+    if back:
+        text += " Came back on %s after %s quiet days" % (time.strftime("%Y-%m-%d", time.gmtime(back[1])), num(back[0]))
+        text += (": %s before, %s since." % (WORK_LEVELS[back[2]], WORK_LEVELS[back[3]]) if "stepped-up" in tags else ".")
+    return text
 
 
 # MITRE ATT&CK techniques recognised in commands (0.31). Simple patterns on one command line each, so no regex can
@@ -4949,7 +5055,7 @@ def v_help():
     personas = sorted(set(PERSONA.values()))
     tags = [row(tag(t), esc(TAG_HELP[t])) for t in ("shell", "dropper", "proxy", "exploit", "bruteforce", "human-like", "took-bait", "read-bait",
                                                     "sshole-probe", "web-exploit", "web-probe", "robots-trap", "ids-alert", "multi-service", "tarpitted",
-                                                    "research", "block", "allow")]
+                                                    "returned", "stepped-up", "research", "block", "allow")]
     if personas:
         tags.append(row(" ".join(tag(p) for p in personas), "Persona: which fake machine a session hit. Set by the installer (HUGINN_PERSONAS)."))
     sessions = [
@@ -6099,6 +6205,9 @@ def v_settings(ok="", err="", at=""):
         '<div class="sp-sub"><h3>Attacker columns</h3><div class="sp-grid">%s</div></div>'
         '<div class="sp-sub"><h3>Default ranges</h3>%s%s%s'
         '<p class="sp-help">Blocklist defaults apply to the Overview count, Blocklist page and feeds without parameters.</p></div>'
+        '<div class="sp-sub"><h3>Attackers that come back</h3>%s'
+        '<p class="sp-help">An address seen again after this many days with nothing at all from it is tagged returned, and stepped-up '
+        'if it then gets further than before (for example ran commands after only knocking). Saving checks every stored attacker again.</p></div>'
         '<div class="sp-sub"><h3>Hidden countries &amp; networks</h3><label class="sp-label" for="sp-hidden">Country codes and AS numbers</label>'
         '<input id="sp-hidden" name=hidden_nets class="sp-wide" maxlength=500 placeholder="e.g. CN, RU, AS14061" value="%s">'
         '<p class="sp-help">Hidden from Overview and Attackers. Still recorded and blocklisted.</p></div>%s</form>'
@@ -6107,6 +6216,8 @@ def v_settings(ok="", err="", at=""):
            select("sp-ipsdays", "Attackers time range", "ips_days", [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
            select("sp-blmin", "Minimum blocklist score", "bl_min", [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
            select("sp-bldays", "Blocklist time range", "bl_days", [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
+           select("sp-retdays", "Quiet days before returned", "return_days",
+                  [(d, "%d days" % d) for d in sorted(set(RETURN_CHOICES) | {return_days_saved(st)})]),
            hidden, save("views", "Save views & defaults"))))
 
     if not NTFY_URL:
@@ -6316,11 +6427,23 @@ def save_settings(f, lists):
             elif re.fullmatch(r"(AS)?\d{1,10}", tok):
                 asn.append(tok.lstrip("AS"))
         st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
+        if (f.get("return_days") or "").isdigit() and (int(f["return_days"]) in RETURN_CHOICES or int(f["return_days"]) == RETURN_DAYS):
+            st["return_days"] = int(f["return_days"])
     if every or scope == "notifications":
         st["notify"] = f.get("notify") == "1"
         st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
-    set_meta(db(), "settings", json.dumps(st))
+    con = db()
+    set_meta(con, "settings", json.dumps(st))
+    if get_meta(con, "returned_days") != str(return_days(con)):
+        recheck_returned(con)
     return True
+
+
+def return_days_saved(st):
+    try:
+        return max(1, min(365, int(st.get("return_days", RETURN_DAYS))))
+    except (TypeError, ValueError):
+        return RETURN_DAYS
 
 
 def v_login(err=""):
