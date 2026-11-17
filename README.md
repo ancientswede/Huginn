@@ -107,6 +107,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - country, network, reverse DNS, open ports and known CVEs (from Shodan InternetDB)
   - whether [GreyNoise](https://viz.greynoise.io) knows it as a mass scanner, and a benign one (research scanners stay off the blocklist unless they logged in or ran something)
   - whether [Project Honey Pot](https://www.projecthoneypot.org) lists it as a web spammer, e-mail harvester or suspicious visitor, with its threat score and when it was last seen there (optional, free key)
+  - its netblock: the announced network block it comes from, the AS and owner behind it, registry and allocation date ([Team Cymru](https://www.team-cymru.com/ip-asn-mapping), no key), how many attackers came from the same block, and a list of the busiest blocks on Campaigns
   - every password they tried
   - every session as a terminal log, plus a **replay** that plays the session back exactly as they saw it
   - files they dropped, decoy services they touched and time spent in the tarpit
@@ -562,6 +563,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_HTTPBL_KEY` | – | Project Honey Pot http:BL access key (12 letters): is an attacker a known web spammer, e-mail harvester or suspicious visitor? One DNS question per IPv4 address. Can also be pasted on the Settings page (Lookups), where it is tested on Project Honey Pot's test address and never shown again. Free key at [projecthoneypot.org](https://www.projecthoneypot.org) |
 | `HUGINN_HTTPBL_DNS` | system | DNS server for http:BL: `system` or an IPv4 address such as `1.1.1.1`. Pi-hole and many routers drop answers in 127.0.0.0/8 (DNS rebinding protection), and http:BL always answers there, so a public server is often needed. Can be changed on the Settings page |
 | `HUGINN_HTTPBL_DAILY` | `300` | Most http:BL lookups a day, top attackers first, each again after a week; `0` = off |
+| `HUGINN_NETBLOCK_DAILY` | `5000` | Most netblock lookups a day (Team Cymru IP-to-ASN over DNS, no key): the announced block, its AS, owner, registry and allocation date, each address again after 30 days; `0` = off. Turn it off or pick a DNS server on the Settings page (Lookups). The question is plain DNS, so the address can be read on the way |
 | `HUGINN_METRICS_TOKEN` | – | Turns on `/metrics` with this bearer token (16+ characters). Otherwise turn metrics on in Settings |
 | `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line, for log tools such as Grafana Loki, Graylog or Elasticsearch |
 | `HUGINN_LOG_LEVEL` | `warning` / `info` | `debug`, `info`, `warning` or `error`; the default is `info` with JSON logs |
@@ -583,7 +585,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.
 - **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
 - **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported.
-- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver.
+- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. Netblock lookups (Team Cymru) are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there.
 - **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
 
 **Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.

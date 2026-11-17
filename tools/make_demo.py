@@ -6,7 +6,7 @@
 # Every attacker address, network and AS number comes from the ranges reserved for documentation
 # (RFC 5737, RFC 3849, RFC 5398), so none of it belongs to a real person or company.
 # The pages are rendered by Huginn itself and saved as plain HTML, so any static web host can serve them.
-import argparse, hashlib, html, json, os, random, re, shutil, sys, tempfile, time, urllib.parse
+import argparse, hashlib, html, ipaddress, json, os, random, re, shutil, sys, tempfile, time, urllib.parse
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -309,6 +309,23 @@ with con:
         h = ({"listed": True, "engine": False, "days": RB.randint(0, 40), "threat": RB.choice([12, 25, 33, 41, 57]),
               "types": RB.choice([["suspicious"], ["suspicious", "comment spammer"], ["harvester"]])} if x < 0.12 else {"listed": False})
         con.execute("INSERT OR REPLACE INTO httpbl(ip, checked, data) VALUES(?,?,?)", (ip, NOW, json.dumps(h)))
+    # Made-up netblocks (Team Cymru, 0.47): the block size depends only on the /16, so neighbours agree on their block.
+    RN = random.Random(47)
+    owners = {}
+    for ip, d in ips.items():
+        # The demo's addresses sit in a few documentation /24s, so its blocks are cut smaller (/25 to /28) than real ones.
+        if ":" in ip:
+            net = ipaddress.ip_network(ip + "/64", strict=False)
+        else:
+            half = int(ip.rsplit(".", 1)[1]) >> 7
+            plen = (25, 26, 27, 28)[(sum(map(int, ip.split(".")[:3])) + half) % 4]
+            net = ipaddress.ip_network("%s/%d" % (ip, plen), strict=False)
+        asn = str(d["asn"] or "64500")
+        owners.setdefault(asn, (d["org"], d["cc"]))
+        con.execute("INSERT OR REPLACE INTO netblock VALUES(?,?,?,?,?,?,?)", (ip, NOW, str(net), asn, d["cc"],
+                    RN.choice(["ripencc", "arin", "apnic", "lacnic", "afrinic"]), "%d-%02d-%02d" % (RN.randint(1998, 2025), RN.randint(1, 12), RN.randint(1, 28))))
+    for asn, (org, cc) in owners.items():
+        con.execute("INSERT OR REPLACE INTO asname VALUES(?,?,?)", (asn, NOW, "%s - %s, %s" % (re.sub(r"[^A-Z]", "", (org or "x").upper())[:12] or "NET", org, cc or "EU")))
 for ip in ips:
     with con:
         app.recompute_ip(con, ip)
@@ -332,6 +349,10 @@ def P(path):
 DEMO_TAGS = ("took-bait",)
 
 
+def net_file(prefix):
+    return re.sub(r"[^0-9a-fA-F.]", "_", prefix)
+
+
 def link(m):
     attr, q, url = m.group(1), m.group(2), m.group(3)
     if not url.startswith("/") or url.startswith("//"):
@@ -344,6 +365,8 @@ def link(m):
     elif path == "/ips":
         if qs.get("cc"):
             target = "ips-cc-%s.html" % qs["cc"].upper()
+        elif qs.get("net"):
+            target = "ips-net-%s.html" % net_file(qs["net"])
         elif qs.get("tag") in DEMO_TAGS:
             target = "ips-tag-%s.html" % qs["tag"]          # the Overview's clickable bait count (0.42)
         elif qs.get("p") and qs.get("p") != "0":
@@ -412,6 +435,8 @@ for tag in DEMO_TAGS:
     save("ips-tag-%s.html" % tag, fix(app.v_ips({"days": "7", "tag": tag})))
 for (cc,) in con.execute("SELECT DISTINCT cc FROM enrich WHERE cc IS NOT NULL"):
     save("ips-cc-%s.html" % cc, fix(app.v_ips({"days": "7", "cc": cc})))
+for (net,) in con.execute("SELECT DISTINCT prefix FROM netblock WHERE prefix IS NOT NULL"):
+    save("ips-net-%s.html" % net_file(net), fix(app.v_ips({"days": "all", "net": net})))
 for (ip,) in con.execute("SELECT ip FROM ips"):
     save("ip/%s.html" % ip, fix(app.v_ip(ip)))
 save("campaigns.html", fix(app.v_campaigns()))

@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.46.2"
+HUGINN_VERSION = "0.47.0"
 CHANGELOG = [
+    ("0.47.0", "2026-11-17", "Netblocks: every attacker is looked up with Team Cymru's free IP-to-ASN service (over DNS, no key): the announced "
+               "network block it comes from, the AS that announces it, owner, registry and the date the block was allocated. The attacker "
+               "page shows the block and how many attackers came from it, with a link to all of them. Attackers can be filtered by "
+               "block and get an optional Netblock column, Campaigns lists the blocks with more than one attacker (owner, how many are "
+               "active this week and how many came back), and the JSON export has it too. On by default, through the system resolver; "
+               "turn it off or pick a DNS server on Settings, Lookups. From a LinkedIn comment."),
     ("0.46.2", "2026-11-17", "Fixes from a code review. \"returned\" counts every day the address did something (commands, logins, a "
                "session that stayed open), not only the days a session started, so an attacker who never left is no longer "
                "\"back\". A new return alert can no longer be crowded out by 200 already told ones. The http:BL DNS client only "
@@ -214,6 +220,10 @@ HB_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_HTTPBL_DAILY", "300") or 
 # Which DNS server to ask: "system" (the normal resolver) or an IPv4 address. Pi-hole and many routers drop answers in
 # 127.0.0.0/8, which is all http:BL ever answers, so a public server is often needed. Changeable on the Settings page.
 HB_DNS = os.environ.get("HUGINN_HTTPBL_DNS", "").strip()
+# Netblocks (0.47): Team Cymru's free IP-to-ASN service over DNS, no key. One TXT question per attacker address gives the
+# announced block (prefix), its origin AS, country, registry and allocation date; one more per AS gives the owner's name.
+# On by default, through the system resolver; both can be changed on the Settings page.
+NB_DAILY = max(0, min(50000, int(os.environ.get("HUGINN_NETBLOCK_DAILY", "5000") or 0)))
 
 # Logging to stderr (journald): "text" (default) or "json", one object per line, for log tools such as Grafana Loki, Graylog or Elasticsearch.
 LOG_FORMAT = "json" if os.environ.get("HUGINN_LOG_FORMAT", "").strip().lower() == "json" else "text"
@@ -370,6 +380,9 @@ CREATE TABLE IF NOT EXISTS vt(sha TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS capped_seen(h TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS httpbl(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
+CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TEXT, asn TEXT, cc TEXT, registry TEXT, allocated TEXT);
+CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
+CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
   sig TEXT, cat TEXT, PRIMARY KEY(ip, sid, day, proto, port));
@@ -1617,16 +1630,18 @@ def dns_name(r, i):
         i += 1 + ln
 
 
-def dns_a(server, name, timeout=3, port=53):
-    # A minimal DNS client for one A question over UDP: the four numbers of the A record for this name (following a CNAME
-    # chain inside the answer), or None for NXDOMAIN or no such record. Raises OSError when the server does not answer,
-    # answers with an error, a truncated or malformed reply.
+def dns_ask(server, name, qtype=1, timeout=3, port=53):
+    # A minimal DNS client for one question over UDP (A = 1 or TXT = 16): the records of that type for this name, following
+    # a CNAME chain inside the answer. A records come as four numbers, TXT records as one string (its parts joined). [] for
+    # NXDOMAIN or no such record. Raises OSError when the server does not answer, answers with an error, a truncated or
+    # malformed reply.
     tid = os.urandom(2)
     qname = b"".join(bytes([len(x)]) + x.encode("ascii") for x in name.split(".")) + b"\0"
-    question = qname + b"\x00\x01\x00\x01"
+    question = qname + qtype.to_bytes(2, "big") + b"\x00\x01"
     query = tid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
     want = name.lower().rstrip(".")
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+    fam = socket.AF_INET6 if ":" in server else socket.AF_INET
+    with socket.socket(fam, socket.SOCK_DGRAM) as sk:
         sk.connect((server, port))
         for _try in range(2):
             sk.send(query)
@@ -1637,7 +1652,7 @@ def dns_a(server, name, timeout=3, port=53):
                     break
                 sk.settimeout(left)
                 try:
-                    r = sk.recv(1500)
+                    r = sk.recv(4096)
                 except socket.timeout:
                     break
                 if len(r) < 12 or r[:2] != tid or not r[2] & 0x80 or int.from_bytes(r[4:6], "big") != 1:
@@ -1648,7 +1663,7 @@ def dns_a(server, name, timeout=3, port=53):
                     raise OSError("truncated DNS answer from %s" % server)
                 rcode = r[3] & 0x0F
                 if rcode == 3:
-                    return None
+                    return []
                 if rcode != 0:
                     raise OSError("DNS server %s answered with error code %d" % (server, rcode))
                 ancount = min(int.from_bytes(r[6:8], "big"), 64)
@@ -1661,22 +1676,54 @@ def dns_a(server, name, timeout=3, port=53):
                     i += 10
                     if i + rdlen > len(r):
                         raise OSError("short DNS answer")
-                    if rclass == 1 and rtype == 1 and rdlen == 4:
-                        recs.append((owner, "A", list(r[i:i + 4])))
+                    if rclass == 1 and rtype == 1 == qtype and rdlen == 4:
+                        recs.append((owner, "V", list(r[i:i + 4])))
+                    elif rclass == 1 and rtype == 16 == qtype:
+                        parts, j = [], i
+                        while j < i + rdlen:
+                            ln = r[j]
+                            if j + 1 + ln > i + rdlen:
+                                raise OSError("bad TXT record")
+                            parts.append(r[j + 1:j + 1 + ln])
+                            j += 1 + ln
+                        recs.append((owner, "V", b"".join(parts).decode("utf-8", "replace")))
                     elif rclass == 1 and rtype == 5:
                         recs.append((owner, "CNAME", dns_name(r, i)[0]))
                     i += rdlen
                 target = want
-                for _hop in range(9):                         # the record for the name asked, through at most 8 CNAMEs
-                    a = next((v for o, t, v in recs if o == target and t == "A"), None)
-                    if a is not None:
-                        return a
+                for _hop in range(9):                         # the records for the name asked, through at most 8 CNAMEs
+                    vals = [v for o, t, v in recs if o == target and t == "V"]
+                    if vals:
+                        return vals
                     c = next((v for o, t, v in recs if o == target and t == "CNAME"), None)
                     if c is None:
-                        return None
+                        return []
                     target = c
-                return None
+                return []
     raise OSError("no answer from DNS server %s" % server)
+
+
+def dns_a(server, name, timeout=3, port=53):
+    # The four numbers of the A record for this name, or None for NXDOMAIN or no such record (see dns_ask).
+    v = dns_ask(server, name, 1, timeout, port)
+    return v[0] if v else None
+
+
+def system_dns():
+    # The first name server in /etc/resolv.conf: the "system resolver" for questions the standard library cannot ask (TXT).
+    try:
+        with open("/etc/resolv.conf") as fh:
+            for line in fh:
+                p = line.split()
+                if len(p) >= 2 and p[0] == "nameserver":
+                    try:
+                        ipaddress.ip_address(p[1])
+                        return p[1]
+                    except ValueError:
+                        continue
+    except OSError:
+        pass
+    return None
 
 
 def hb_key(con=None):
@@ -1770,6 +1817,142 @@ def hb_lookup(con, limit=20):
         set_meta(con, "hb_error", "")
         done += 1
         time.sleep(0.2)
+    return done
+
+
+# ---------------------------------------------------------------- netblocks (Team Cymru, 0.47)
+NB_RECHECK = 30 * 86400          # blocks and owners change rarely
+NB_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def nb_on(con=None):
+    return (get_meta(con or db(), "nb_on", "1") or "1") == "1"
+
+
+def nb_dns(con=None):
+    v = get_meta(con or db(), "nb_dns", "") or "system"
+    return v if hb_dns_ok(v) else "system"
+
+
+def nb_server(choice):
+    # The address to ask: a chosen public server, or the first name server of the system.
+    if choice != "system":
+        return choice
+    s = system_dns()
+    if not s:
+        raise OSError("no name server in /etc/resolv.conf")
+    return s
+
+
+def nb_qname(ip):
+    a = ipaddress.ip_address(ip)
+    if a.version == 4:
+        return ".".join(reversed(a.exploded.split("."))) + ".origin.asn.cymru.com"
+    return ".".join(reversed(a.exploded.replace(":", ""))) + ".origin6.asn.cymru.com"
+
+
+def nb_parse(ip, txts):
+    # "13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11", one record per announced block that holds the address. The most specific
+    # block wins; the first AS when several announce it. Anything that does not fit is left out, so None = not routed.
+    a, best = ipaddress.ip_address(ip), None
+    for t in txts:
+        f = [x.strip() for x in str(t).split("|")]
+        if len(f) < 3:
+            continue
+        asns = [x for x in f[0].split() if re.fullmatch(r"\d{1,10}", x)]
+        try:
+            net = ipaddress.ip_network(f[1], strict=False)
+        except ValueError:
+            continue
+        if not asns or a not in net:
+            continue
+        cc = f[2].upper() if re.fullmatch(r"[A-Za-z]{2}", f[2]) else None
+        reg = f[3].lower() if len(f) > 3 and re.fullmatch(r"[A-Za-z]{2,12}", f[3]) else None
+        day = f[4] if len(f) > 4 and NB_DATE.fullmatch(f[4]) else None
+        if best is None or net.prefixlen > best[0].prefixlen:
+            best = (net, asns[0], cc, reg, day)
+    if best is None:
+        return None
+    return {"prefix": str(best[0]), "asn": best[1], "cc": best[2], "registry": best[3], "allocated": best[4]}
+
+
+def nb_asname(txts):
+    # "13335 | US | arin | 2010-07-14 | CLOUDFLARENET - Cloudflare, Inc., US": the owner is the last field.
+    for t in txts:
+        f = [x.strip() for x in str(t).split("|")]
+        if len(f) >= 5 and f[-1]:
+            return ext_text(f[-1], 120)
+    return None
+
+
+def nb_get(con, ip):
+    r = con.execute("SELECT n.*, a.name FROM netblock n LEFT JOIN asname a USING(asn) WHERE n.ip=?", (ip,)).fetchone()
+    return dict(r) if r else None
+
+
+def nb_url(prefix):
+    return "/ips?" + urllib.parse.urlencode({"net": prefix, "days": "all"})
+
+
+def nb_html(con, n):
+    if n is None:
+        return '<span class=muted>not looked up yet</span>' if nb_on(con) else "–"
+    if not n.get("prefix"):
+        return '<span class=muted>not routed</span>'
+    many = con.execute("SELECT COUNT(*) FROM netblock WHERE prefix=?", (n["prefix"],)).fetchone()[0]
+    return '<a class=mono href="%s">%s</a> <span class=muted>%s</span>' % (
+        esc(nb_url(n["prefix"])), esc(n["prefix"]), "only this attacker" if many <= 1 else "%s attackers in this block" % num(many))
+
+
+def nb_owner_html(n):
+    if not n or not n.get("prefix"):
+        return "–"
+    bits = [x for x in (("AS" + n["asn"]) if n.get("asn") else "", (n.get("registry") or "").upper(),
+                        ("allocated " + n["allocated"]) if n.get("allocated") else "") if x]
+    return '%s <span class=muted>%s</span>' % (esc(n.get("name") or "unknown owner"), esc(" · ".join(bits)))
+
+
+def nb_lookup(con, limit=50):
+    # Newest attackers first, each again after 30 days, then the names of new AS numbers. Stays under NB_DAILY.
+    if not nb_on(con) or not NB_DAILY or float(get_meta(con, "nb_wait_until", "0") or 0) > time.time():
+        return 0
+    left, _t, _u = day_budget(con, "nb_day", NB_DAILY)
+    if left <= 0:
+        return 0
+    now = time.time()
+    ips = [r[0] for r in con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN netblock n USING(ip) WHERE n.ip IS NULL OR n.checked<? "
+        "ORDER BY (n.ip IS NULL) DESC, i.last DESC LIMIT ?", (now - NB_RECHECK, min(limit, left)))]
+    done = 0
+    try:
+        server = nb_server(nb_dns(con))
+        for ip in ips:
+            if not sendable_ip(ip):
+                with con:
+                    con.execute("INSERT OR REPLACE INTO netblock(ip, checked) VALUES(?,?)", (ip, time.time()))
+                continue
+            day_spend(con, "nb_day")
+            n = nb_parse(ip, dns_ask(server, nb_qname(ip), 16)) or {}
+            with con:
+                con.execute("INSERT OR REPLACE INTO netblock VALUES(?,?,?,?,?,?,?)", (ip, time.time(), n.get("prefix"), n.get("asn"),
+                            n.get("cc"), n.get("registry"), n.get("allocated")))
+            done += 1
+            time.sleep(0.1)
+        left, _t, _u = day_budget(con, "nb_day", NB_DAILY)
+        asns = [r[0] for r in con.execute(
+            "SELECT DISTINCT n.asn FROM netblock n LEFT JOIN asname a USING(asn) WHERE n.asn IS NOT NULL AND (a.asn IS NULL OR a.checked<?) LIMIT ?",
+            (now - NB_RECHECK, min(20, left)))]
+        for asn in asns:
+            day_spend(con, "nb_day")
+            name = nb_asname(dns_ask(server, "AS%s.asn.cymru.com" % asn, 16))
+            with con:
+                con.execute("INSERT OR REPLACE INTO asname VALUES(?,?,?)", (asn, time.time(), name))
+            time.sleep(0.1)
+    except Exception as e:
+        set_meta(con, "nb_wait_until", time.time() + 3600)
+        set_meta(con, "nb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+        return done
+    set_meta(con, "nb_error", "")
     return done
 
 
@@ -3235,7 +3418,7 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
-        for f in (vt_lookup, gn_lookup, hb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+        for f in (vt_lookup, gn_lookup, hb_lookup, nb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
             try:
                 f(con)
             except Exception as e:
@@ -3555,7 +3738,7 @@ SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable",
                     "hide_cc": [], "hide_asn": [], "overview": "cards",
                     "return_days": RETURN_DAYS}
 # Optional columns of the Attackers list: key -> (header, sort key, css class)
-IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "ASN", None, ""), ("rdns", "Reverse DNS", None, ""),
+IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "ASN", None, ""), ("netblock", "Netblock", None, ""), ("rdns", "Reverse DNS", None, ""),
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
             ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
             ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
@@ -4187,7 +4370,7 @@ def time_wasted(con, since):
 
 
 IPS_SIZES = (25, 50, 100)
-IPS_PHONE_HIDE = {"network", "asn", "rdns", "first", "sessions", "logins", "files", "tarpit", "tags"}     # what a phone leaves out
+IPS_PHONE_HIDE = {"network", "asn", "netblock", "rdns", "first", "sessions", "logins", "files", "tarpit", "tags"}     # what a phone leaves out
 SORTS = {"score": "i.score DESC, i.last DESC", "last": "i.last DESC", "first": "i.first DESC",
          "sessions": "i.sessions DESC", "cmds": "i.cmds DESC", "logins": "(i.logins_ok+i.logins_fail) DESC"}
 
@@ -4199,6 +4382,10 @@ def v_ips(qs, mobile=False):
     tag = (qs.get("tag") or "").strip()[:30]
     ccf = (qs.get("cc") or "").strip().upper()
     ccf = ccf if re.fullmatch(r"[A-Z]{2}", ccf) else ""
+    try:
+        netf = str(ipaddress.ip_network((qs.get("net") or "").strip()[:50], strict=True)) if (qs.get("net") or "").strip() else ""
+    except ValueError:
+        netf = ""
     sort = qs.get("sort") if qs.get("sort") in SORTS else "last"
     try:
         pg = max(0, int(qs.get("p") or 0))
@@ -4216,12 +4403,15 @@ def v_ips(qs, mobile=False):
         where.append("i.last>=?")
         args.append(time.time() - d * 86400)
     if q:
-        where.append("(i.ip LIKE ? OR e.org LIKE ? OR e.isp LIKE ? OR e.cc=? OR e.rdns LIKE ? OR e.asn=?)")
+        where.append("(i.ip LIKE ? OR e.org LIKE ? OR e.isp LIKE ? OR e.cc=? OR e.rdns LIKE ? OR e.asn=? OR n.prefix=?)")
         like = "%" + q + "%"
-        args += [like, like, like, q.upper(), like, q.lstrip("ASas")]
+        args += [like, like, like, q.upper(), like, q.lstrip("ASas"), q]
     if ccf:
         where.append("e.cc=?")
         args.append(ccf)
+    if netf:
+        where.append("n.prefix=?")
+        args.append(netf)
     if tag == "research":
         where.append("e.research=1")
     elif tag in ("block", "allow"):
@@ -4236,20 +4426,20 @@ def v_ips(qs, mobile=False):
     hs, ha = hidden_sql(st)
     if hs:
         w0 = ("WHERE " + " AND ".join(where)) if where else ""
-        allc = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) " + w0, args).fetchone()[0]
+        allc = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) LEFT JOIN netblock n USING(ip) " + w0, args).fetchone()[0]
         if not show_hidden:
             where.append(hs[5:])
             args += ha
     w = ("WHERE " + " AND ".join(where)) if where else ""
-    total = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) " + w, args).fetchone()[0]
+    total = con.execute("SELECT COUNT(*) FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) LEFT JOIN netblock n USING(ip) " + w, args).fetchone()[0]
     if hs:
         nhidden = allc - total if not show_hidden else 0
     pg = min(pg, max(0, (total - 1) // size))          # a page past the end (a stale link, or a number SQLite cannot take) shows the last one
-    rows = con.execute("SELECT i.*, e.cc, e.org, e.rdns, e.asn, e.research, f.flag FROM ips i LEFT JOIN enrich e USING(ip) "
-                       "LEFT JOIN flags f USING(ip) %s ORDER BY %s LIMIT ? OFFSET ?" % (w, SORTS[sort]), args + [size, pg * size]).fetchall()
+    rows = con.execute("SELECT i.*, e.cc, e.org, e.rdns, e.asn, e.research, f.flag, n.prefix FROM ips i LEFT JOIN enrich e USING(ip) "
+                       "LEFT JOIN flags f USING(ip) LEFT JOIN netblock n USING(ip) %s ORDER BY %s LIMIT ? OFFSET ?" % (w, SORTS[sort]), args + [size, pg * size]).fetchall()
 
     def link(**kw):
-        p = {"q": q, "days": days, "tag": tag, "cc": ccf, "sort": sort, "hidden": "1" if show_hidden else "", "n": size if size != size_default else ""}
+        p = {"q": q, "days": days, "tag": tag, "cc": ccf, "net": netf, "sort": sort, "hidden": "1" if show_hidden else "", "n": size if size != size_default else ""}
         p.update(kw)
         return "/ips?" + urllib.parse.urlencode({k: v for k, v in p.items() if v not in ("", None)})
 
@@ -4263,6 +4453,7 @@ def v_ips(qs, mobile=False):
         "cc": lambda r: "<td>%s</td>" % cc_html(r["cc"]),
         "network": lambda r: "<td class=trunc title='%s'>%s</td>" % (esc(r["rdns"] or ""), esc(r["org"] or "")),
         "asn": lambda r: "<td class=mono>%s</td>" % (esc("AS" + r["asn"]) if r["asn"] else "–"),
+        "netblock": lambda r: ("<td class=mono><a href='%s'>%s</a></td>" % (esc(nb_url(r["prefix"])), esc(r["prefix"]))) if r["prefix"] else "<td>–</td>",
         "rdns": lambda r: "<td class='mono trunc'>%s</td>" % esc(r["rdns"] or "–"),
         "first": lambda r: "<td>%s</td>" % esc(fmt_ts(r["first"])),
         "last": lambda r: "<td>%s</td>" % esc(ago(r["last"])),
@@ -4278,11 +4469,12 @@ def v_ips(qs, mobile=False):
     trs = "".join("<tr><td>%s</td>%s</tr>%s" % (ip_link(r["ip"]), "".join(cell[c[0]](r).replace("<td", "<td" + dh(c[0]), 1) for c in cols),
                                                  tags_row(ip_tags(r), len(cols) + 1) if show_tags else "") for r in rows)
     opts = lambda cur, vals: "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(l)) for v, l in vals)
-    form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN">'
+    form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN, netblock">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
                opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "research", "block", "allow"]]), esc(sort),
-               ('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "",
+               (('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "")
+               + (('<input type=hidden name=net value="%s"><span class="chip on">Netblock %s <a href="%s" title="Remove netblock filter">×</a></span>' % (esc(netf), esc(netf), esc(link(net="", p=0)))) if netf else ""),
                '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
     pager, pager_top = "", ""
     if total > IPS_SIZES[0]:
@@ -4602,6 +4794,7 @@ def v_ip(ip, qs=None):
         return None
     e = con.execute("SELECT * FROM enrich WHERE ip=?", (ip,)).fetchone()
     f = con.execute("SELECT * FROM flags WHERE ip=?", (ip,)).fetchone()
+    nbr = nb_get(con, ip)
     now = time.time()
     tags = r["tags"] or ""
     if e and e["research"]:
@@ -4623,12 +4816,15 @@ def v_ip(ip, qs=None):
     if e:
         right = kv([("Country", "%s %s" % (cc_html(e["cc"]), esc(", ".join(x for x in (e["city"], e["country"]) if x)))),
                     ("ASN", esc("AS" + e["asn"]) if e["asn"] else "–"), ("Org", esc(e["org"] or "–")), ("ISP", esc(e["isp"] or "–")),
+                    ("Netblock", nb_html(con, nbr)), ("Block owner", nb_owner_html(nbr)),
                     ("Reverse DNS", '<span class=mono>%s</span>' % esc(e["rdns"] or "–")), ("Hostnames", esc(e["hostnames"] or "–")),
                     ("Open ports", esc(e["ports"] or "–")), ("Shodan tags", esc(e["tags"] or "–")),
                     ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))),
                     ("Project Honey Pot", hb_html(hb_get(con, ip))), ("Looked up", esc(ago(e["fetched"])))])
     else:
         right = '<p class=muted>Lookup pending (country, network, Shodan) — runs in the background.</p>'
+        if nbr:
+            right += kv([("Netblock", nb_html(con, nbr)), ("Block owner", nb_owner_html(nbr))])
 
     fl = f["flag"] if f else ""
     flag_form = ('<form class="flagform" method=post action="/ip/%s/flag"><label>Blocklist</label><select name=flag>'
@@ -4666,7 +4862,9 @@ def v_ip(ip, qs=None):
     relations = [("Same SSH client (HASSH)", same % ("hassh", "hassh", "hassh"), (ip, ip)),
                  ("Same command script", same % ("cmdhash", "cmdhash", "cmdhash"), (ip, ip)),
                  ("Same file", "SELECT DISTINCT ip FROM events WHERE kind='file' AND b IN (SELECT DISTINCT b FROM events WHERE ip=? AND kind='file' AND b IS NOT NULL) AND ip!=?", (ip, ip))]
-    if ":" not in ip:
+    if nbr and nbr.get("prefix"):
+        relations.append(("Same netblock %s" % nbr["prefix"], "SELECT ip FROM netblock WHERE prefix=? AND ip!=?", (nbr["prefix"], ip)))
+    if ":" not in ip and not (nbr and (nbr.get("prefix") or "").endswith("/24")):      # a /24 block is the same list
         relations.append(("Same /24 network", "SELECT ip FROM ips WHERE ip LIKE ? AND ip!=?", (".".join(ip.split(".")[:3]) + ".%", ip)))
     rel = []
     for label, sql, a in relations:
@@ -4841,6 +5039,7 @@ def export_ip(ip):
     iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ") if t else None
     evs = con.execute("SELECT ts, src, kind, session, a, b FROM events WHERE ip=? ORDER BY ts", (ip,)).fetchall()
     sess = con.execute("SELECT * FROM sessions WHERE ip=? ORDER BY start", (ip,)).fetchall()
+    nb = nb_get(con, ip)
     return {
         "ip": ip, "exported": iso(time.time()), "huginn_version": HUGINN_VERSION,
         "summary": {k: r[k] for k in r.keys() if k not in ("first", "last")} | {"first_seen": iso(r["first"]), "last_seen": iso(r["last"])},
@@ -4853,6 +5052,7 @@ def export_ip(ip):
                         "port": x["port"], "hits": x["n"], "first": iso(x["first"]), "last": iso(x["last"])}
                        for x in con.execute("SELECT * FROM ids WHERE ip=? ORDER BY first", (ip,))],
         "project_honeypot": hb_get(con, ip),
+        "netblock": ({k: v for k, v in nb.items() if k not in ("ip", "checked", "name")} | {"owner": nb.get("name"), "looked_up": iso(nb["checked"])}) if nb else None,
     }
 
 
@@ -5336,6 +5536,9 @@ def v_help():
         row("Project Honey Pot", "Whether the address is listed by Project Honey Pot (http:BL) as a web spammer, e-mail harvester or suspicious "
             "visitor, its threat (0 to 255, higher is worse) and how many days ago it was last seen there. Needs a free key. IPv4 only. "
             "Pi-hole and many routers drop its answers: pick a public DNS server next to the key."),
+        row("Netblock", "The announced network block the address belongs to (for example 45.148.10.0/24), from Team Cymru over DNS, and how many "
+            "attackers came from the same block. Click it for all of them. Block owner is the AS that announces it, its registry and the date "
+            "the block was allocated: a young block is often a fresh rented range. Campaigns lists the busiest blocks. No key needed; on by default."),
         row("Keys", "VirusTotal, MalwareBazaar and Project Honey Pot keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
     ]
     ids = [
@@ -5803,14 +6006,31 @@ def v_campaigns(qs=None):
             % (num(dr["n"] or 0), num(dr["d"] or 0), num((dr["n"] or 0) - (dr["d"] or 0)), dr["s"] or 0.0,
                num(len(mt)), num(len(mip)), sum(x[1] for x in mt) / float(len(mt) or 1),
                sum(x[0] for x in mt) / float(len(mt) or 1), sum(x[2] for x in mt) / float(len(mt) or 1)))
-    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack (rules from Krawl), IDS rule (Suricata), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
+    # Netblocks (0.47): announced blocks that hold more than one attacker, the busiest first.
+    nbs = con.execute("SELECT n.prefix, MAX(n.asn) asn, MAX(n.cc) cc, MAX(n.registry) reg, MAX(n.allocated) alloc, MAX(a.name) name, "
+                      "COUNT(*) nip, SUM(i.last>=?) nip7, SUM((','||COALESCE(i.tags,'')||',') LIKE '%,returned,%') ret, MAX(i.last) l "
+                      "FROM netblock n JOIN ips i USING(ip) LEFT JOIN asname a USING(asn) WHERE n.prefix IS NOT NULL "
+                      "GROUP BY n.prefix HAVING COUNT(*)>=2 ORDER BY nip DESC, l DESC LIMIT 40", (d7,)).fetchall()
+    nbrows = "".join("<tr><td class='mono nowrap'><a href='%s'>%s</a></td><td class=trunc data-h title='%s'>%s</td><td>%s</td><td class=num>%s</td>"
+                     "<td class=num>%s</td><td class='num' data-h>%s</td><td class=nowrap data-h>%s</td><td class=nowrap>%s</td></tr>"
+                     % (esc(nb_url(b["prefix"])), esc(b["prefix"]), esc("AS%s" % b["asn"] if b["asn"] else ""), esc(b["name"] or ("AS" + b["asn"] if b["asn"] else "–")),
+                        cc_html(b["cc"]), num(b["nip"]), (num(b["nip7"]) if b["nip7"] else '<span class=muted>–</span>'),
+                        (num(b["ret"]) if b["ret"] else '<span class=muted>–</span>'), esc(b["alloc"] or "–"), esc(ago(b["l"]))) for b in nbs)
+    nb_done = con.execute("SELECT COUNT(*) FROM netblock").fetchone()[0]
+    nb_html_t = ('<table class="wide"><thead><tr><th>Netblock</th><th data-h>Owner</th><th>CC</th><th class=num>IPs</th><th class=num>IPs 7d</th>'
+                 '<th class=num data-h>Returned</th><th data-h>Allocated</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % nbrows
+                 if nbrows else none_yet("No block with more than one attacker yet" if nb_done else
+                                         ("Netblocks are being looked up in the background" if nb_on(con) else "Netblock lookups are off (Settings, Lookups)")))
+    body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), netblock (the announced network they come from), web attack (rules from Krawl), IDS rule (Suricata), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
             '<div class="cgrid"><section class="cs-wide"><h2>Command scripts</h2><div class="card">%s</div></section><section><h2>SSH clients (HASSH)</h2><div class="card">%s</div></section>'
+            '<section class="cs-wide"><h2>Netblocks</h2><div class="card">%s</div></section>'
             '<section class="cs-wide"><h2>Web attacks</h2><div class="card">%s</div></section><section><h2>Mail clients (HELO)</h2><div class="card">%s</div></section>'
             '<section class="cs-wide"><h2>IDS alerts</h2><div class="card">%s</div></section>'
             '<section><h2>Proxy use</h2><div class="card">%s%s</div></section><section><h2>Slow replies</h2><div class="card">%s</div></section></div>'
             % (stabs + ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>IPs 7d</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows
                         if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet")),
                '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
+               nb_html_t,
                '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
                '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
                ids_html,
@@ -6118,13 +6338,14 @@ def metrics_text(con, now=None):
                 ("virustotal", "vt_day", VT_DAILY, bool(vt_key(con)), "vt_error", "vt_wait_until"),
                 ("greynoise", "gn_day", gn_daily(con), bool(gn_key(con)), "gn_error", "gn_wait_until"),
                 ("httpbl", "hb_day", HB_DAILY if hb_key(con) else 0, bool(hb_key(con)), "hb_error", "hb_wait_until"),
+                ("netblock", "nb_day", NB_DAILY if nb_on(con) else 0, False, "nb_error", "nb_wait_until"),
                 ("malwarebazaar", None, 0, bool(mb_key(con)), "mb_error", "mb_wait_until")):
             used = day_budget(con, budget, daily)[2] if budget else 0
             paused = float(get_meta(con, wait, "0") or 0) > now
             lk.append((svc, used, daily, key_set, 1 if (get_meta(con, err, "") or "").strip() else 0, paused))
         metric("lookups_used_today", "gauge", "Outside lookups made today (UTC).", [({"service": x[0]}, x[1]) for x in lk if x[0] != "malwarebazaar"])
         metric("lookups_daily_limit", "gauge", "Most lookups Huginn makes a day.", [({"service": x[0]}, x[2]) for x in lk if x[0] != "malwarebazaar"])
-        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk])
+        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk if x[0] != "netblock"])
         metric("lookup_error", "gauge", "1 if the last lookup failed.", [({"service": x[0]}, x[4]) for x in lk])
         metric("lookup_paused", "gauge", "1 while lookups are paused (allowance used up or refused key).", [({"service": x[0]}, 1 if x[5] else 0) for x in lk])
         size = sum(os.path.getsize(DB_PATH + x) for x in ("", "-wal") if os.path.exists(DB_PATH + x))
@@ -6373,11 +6594,13 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "gnbusy": ("greynoise", "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own."),
                "gndel": ("greynoise", "GreyNoise key removed."),
                "hb": ("httpbl", "Saved. Project Honey Pot answers through this DNS server. It cannot confirm the key itself: if no attacker is ever listed, check the key."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
+               "nbon": ("netblock", "Saved. Netblocks are looked up in the background, newest attackers first."),
+               "nboff": ("netblock", "Netblock lookups are off. What was already looked up stays."),
                "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
                "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
-SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "metrics", "about"}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
 COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
@@ -6416,7 +6639,7 @@ def v_settings(ok="", err="", at=""):
         top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
     elif err:
         # The error itself stands at its form further down; up here only where to find it.
-        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "honeypot": "Logout message",
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "honeypot": "Logout message",
                  "notifications": "Notifications"}
         top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
 
@@ -6672,7 +6895,27 @@ def lookups_card(flash=lambda s: "", at="", err=""):
               % (esc(src) + " · DNS " + esc(hb_dns_label(hb_dns(con))), num(used), num(HB_DAILY), num(h[0]), num(h[1]))) if src else "",
              lasterr("hb_error"), hb_form(con, saved, bool(err) and at == "httpbl"), remove_form("httpbl", saved),
              num(HB_DAILY)))
-    return vt + mb + gn + hb
+
+    on = nb_on(con)
+    _left, _t, used = day_budget(con, "nb_day", NB_DAILY)
+    nn = con.execute("SELECT COUNT(*), COUNT(DISTINCT prefix), (SELECT COUNT(*) FROM ips) FROM netblock").fetchone()
+    cur = nb_dns(con)
+    opts = list(HB_DNS_CHOICES) + ([] if cur in dict(HB_DNS_CHOICES) else [(cur, cur)])
+    nb = ('<div class="sp-panel" id="netblock"><div class="sp-ph"><h3>Netblocks</h3>%s</div>%s'
+          '<p>The announced network block each attacker comes from, its owner, registry and allocation date (Team Cymru, over DNS). '
+          'Sends IP addresses, no key needed.</p>%s%s'
+          '<form method=post action="/settings/netblock" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up netblocks</label>'
+          '<label for="sp-netblock-dns" class="sp-gap">DNS server</label><div class="sp-keyrow"><select id="sp-netblock-dns" name=dns>%s</select>'
+          '<button>Save</button></div></form>'
+          '<p class="sp-help">Each address is looked up again after 30 days. Up to %s lookups a day (HUGINN_NETBLOCK_DAILY). '
+          'DNS is not encrypted, so the address can be read on the way.</p></div>'
+          % (sp_status("On", "on") if on and NB_DAILY else sp_status("Off"), flash("netblock"),
+             ('<p class="sp-usage">DNS %s · %s / %s lookups today · %s of %s attackers looked up · %s blocks</p>'
+              % (esc(hb_dns_label(cur)), num(used), num(NB_DAILY), num(nn[0]), num(nn[2]), num(nn[1]))) if on else "",
+             lasterr("nb_error"), " checked" if on else "",
+             "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
+             num(NB_DAILY)))
+    return vt + mb + gn + hb + nb
 
 
 SETTINGS_SCOPES = ("appearance", "views", "notifications")
@@ -7574,6 +7817,19 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "hb_wait_until", "0")
             set_meta(con, "hb_error", "")
             return self.redirect(settings_url("hb"))
+        if path == "/settings/netblock":
+            f = self.form()
+            dns = (f.get("dns") or "").strip() or nb_dns(con)
+            if not hb_dns_ok(dns):
+                return self.send(400, v_settings(at="netblock", err="Choose a DNS server from the list."))
+            on = f.get("on") == "1"
+            if on and dns == "system" and not system_dns():
+                return self.send(400, v_settings(at="netblock", err="This system has no name server in /etc/resolv.conf. Choose a public DNS server."))
+            set_meta(con, "nb_on", "1" if on else "0")
+            set_meta(con, "nb_dns", dns)
+            set_meta(con, "nb_wait_until", "0")
+            set_meta(con, "nb_error", "")
+            return self.redirect(settings_url("nbon" if on else "nboff"))
         if path == "/settings/metrics":
             on = self.form().get("on") == "1"
             if on and not get_meta(con, "metrics_token"):
