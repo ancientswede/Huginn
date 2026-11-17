@@ -299,6 +299,16 @@ with con:
             continue
         g["last_seen"] = time.strftime("%Y-%m-%d", time.gmtime(NOW - R.uniform(0, 3) * 86400))
         con.execute("INSERT OR REPLACE INTO greynoise(ip, checked, data) VALUES(?,?,?)", (ip, NOW, json.dumps(app.gn_parse(g, ip))))
+    # Made-up Project Honey Pot (http:BL) answers: most SSH/telnet bots are not listed, a few are web spammers too.
+    # Own random stream, so the rest of the demo stays the same as before.
+    RB = random.Random(46)
+    for ip in ips:
+        if ":" in ip or RB.random() < 0.3:
+            continue
+        x = RB.random()
+        h = ({"listed": True, "engine": False, "days": RB.randint(0, 40), "threat": RB.choice([12, 25, 33, 41, 57]),
+              "types": RB.choice([["suspicious"], ["suspicious", "comment spammer"], ["harvester"]])} if x < 0.12 else {"listed": False})
+        con.execute("INSERT OR REPLACE INTO httpbl(ip, checked, data) VALUES(?,?,?)", (ip, NOW, json.dumps(h)))
 for ip in ips:
     with con:
         app.recompute_ip(con, ip)
@@ -445,6 +455,9 @@ _map = re.search(r"map=\{[^}]*\}", js)
 assert _map, "keyboard map not found in app.JS"
 js = js.replace(_map.group(0), re.sub(r"'/([a-z]*)'", lambda m: "'%s%s.html'" % (BASE, m.group(1) or "index"), _map.group(0)))
 js = js.replace("if(f)f.submit()", "if(f)(f.requestSubmit?f.requestSubmit():f.submit())")
+# The demo's own submit guard (below) stops every form first; the Settings background save must then do nothing.
+assert "main.addEventListener('submit',function(ev){var f=ev.target;" in js
+js = js.replace("main.addEventListener('submit',function(ev){var f=ev.target;", "main.addEventListener('submit',function(ev){if(ev.defaultPrevented)return;var f=ev.target;")
 js += r"""
 (function(){var order=['auto','light','dark'];function apply(t){var h=document.documentElement;if(t==='auto')h.removeAttribute('data-theme');else h.setAttribute('data-theme',t);
 var b=document.querySelector('.theme-btn');if(b){b.lastChild.textContent=t.charAt(0).toUpperCase()+t.slice(1);var i=b.querySelector('.ti');if(i)i.className='ti ti-'+t}}
