@@ -110,7 +110,7 @@ class StrictDns(unittest.TestCase):
 
 class Guards(unittest.TestCase):
     def test_dns_server_choices(self):
-        for v in ("system", "1.1.1.1", "127.0.0.53", "192.168.1.1"):
+        for v in ("system", "1.1.1.1", "127.0.0.53", "192.0.2.53"):
             self.assertTrue(app.hb_dns_ok(v), v)
         for v in ("224.0.0.251", "0.0.0.0", "255.255.255.255", "240.0.0.1", "1.1.1", "::1", "x"):
             self.assertFalse(app.hb_dns_ok(v), v)
