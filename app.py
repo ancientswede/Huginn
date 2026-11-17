@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.46.1"
+HUGINN_VERSION = "0.46.2"
 CHANGELOG = [
+    ("0.46.2", "2026-11-17", "Fixes from a code review. \"returned\" counts every day the address did something (commands, logins, a "
+               "session that stayed open), not only the days a session started, so an attacker who never left is no longer "
+               "\"back\". A new return alert can no longer be crowded out by 200 already told ones. The http:BL DNS client only "
+               "takes an answer that belongs to the question (owner name, CNAME chain, no truncated replies), never a multicast "
+               "server, and never writes the key into an error. Settings never sends a form twice: if the answer is lost it "
+               "says so instead, one save at a time per panel, and only the panel you saved is replaced."),
     ("0.46.1", "2026-11-17", "Project Honey Pot: choose which DNS server Huginn asks (Settings, Lookups): the system resolver, Cloudflare, "
                "Quad9 or Google. Pi-hole and many routers drop answers that start with 127 (DNS rebinding protection), and http:BL "
                "answers always do, so the key test failed with a message that blamed the key. It now says what is wrong. "
@@ -1560,13 +1566,15 @@ HB_DNS_CHOICES = (("system", "System resolver"), ("1.1.1.1", "Cloudflare (1.1.1.
 
 
 def hb_dns_ok(v):
+    # "system" or one IPv4 server. A local resolver (loopback, LAN) is fine; multicast, 0.0.0.0, broadcast and reserved
+    # addresses are not, since the question carries the key.
     if v == "system":
         return True
     try:
-        ipaddress.IPv4Address(v)
-        return True
+        a = ipaddress.IPv4Address(v)
     except ValueError:
         return False
+    return not (a.is_multicast or a.is_unspecified or a.is_reserved or a == ipaddress.IPv4Address("255.255.255.255"))
 
 
 def hb_dns(con=None):
@@ -1579,51 +1587,94 @@ def hb_dns_label(v):
     return dict(HB_DNS_CHOICES).get(v, v)
 
 
+def dns_name(r, i):
+    # A name in a DNS message at offset i: (lower-case name, offset after it). Compression pointers must point backwards,
+    # at most 16 hops; anything out of bounds raises OSError.
+    labels, hops, end, seen = [], 0, None, set()
+    while True:
+        if i >= len(r):
+            raise OSError("bad DNS name")
+        ln = r[i]
+        if ln & 0xC0 == 0xC0:
+            if i + 1 >= len(r):
+                raise OSError("bad DNS name")
+            ptr = ((ln & 0x3F) << 8) | r[i + 1]
+            if end is None:
+                end = i + 2
+            hops += 1
+            if hops > 16 or ptr >= i or ptr in seen:
+                raise OSError("bad DNS name")
+            seen.add(ptr)
+            i = ptr
+            continue
+        if ln & 0xC0:
+            raise OSError("bad DNS name")
+        if ln == 0:
+            return ".".join(labels).lower(), (end if end is not None else i + 1)
+        if i + 1 + ln > len(r):
+            raise OSError("bad DNS name")
+        labels.append(r[i + 1:i + 1 + ln].decode("ascii", "replace"))
+        i += 1 + ln
+
+
 def dns_a(server, name, timeout=3, port=53):
-    # A minimal DNS client for one A question over UDP: the four numbers of the first A answer, or None for
-    # NXDOMAIN or no answer. Raises OSError when the server does not answer or answers something else.
+    # A minimal DNS client for one A question over UDP: the four numbers of the A record for this name (following a CNAME
+    # chain inside the answer), or None for NXDOMAIN or no such record. Raises OSError when the server does not answer,
+    # answers with an error, a truncated or malformed reply.
     tid = os.urandom(2)
     qname = b"".join(bytes([len(x)]) + x.encode("ascii") for x in name.split(".")) + b"\0"
     question = qname + b"\x00\x01\x00\x01"
     query = tid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+    want = name.lower().rstrip(".")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
-        sk.settimeout(timeout)
         sk.connect((server, port))
         for _try in range(2):
             sk.send(query)
-            end = time.time() + timeout
-            while time.time() < end:
+            end = time.monotonic() + timeout
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                sk.settimeout(left)
                 try:
                     r = sk.recv(1500)
                 except socket.timeout:
                     break
-                if len(r) < 12 or r[:2] != tid or not r[2] & 0x80:
+                if len(r) < 12 or r[:2] != tid or not r[2] & 0x80 or int.from_bytes(r[4:6], "big") != 1:
                     continue                                  # not the answer to this question
                 if r[12:12 + len(question)].lower() != question.lower():
                     continue
+                if r[2] & 0x02:
+                    raise OSError("truncated DNS answer from %s" % server)
                 rcode = r[3] & 0x0F
                 if rcode == 3:
                     return None
                 if rcode != 0:
                     raise OSError("DNS server %s answered with error code %d" % (server, rcode))
-                ancount = int.from_bytes(r[6:8], "big")
-                i = 12 + len(question)
+                ancount = min(int.from_bytes(r[6:8], "big"), 64)
+                i, recs = 12 + len(question), []
                 for _a in range(ancount):
-                    while i < len(r):                         # skip the name: labels or a compression pointer
-                        ln = r[i]
-                        if ln & 0xC0 == 0xC0:
-                            i += 2
-                            break
-                        i += 1 + ln
-                        if ln == 0:
-                            break
+                    owner, i = dns_name(r, i)
                     if i + 10 > len(r):
                         raise OSError("short DNS answer")
                     rtype, rclass, rdlen = int.from_bytes(r[i:i + 2], "big"), int.from_bytes(r[i + 2:i + 4], "big"), int.from_bytes(r[i + 8:i + 10], "big")
                     i += 10
-                    if rtype == 1 and rclass == 1 and rdlen == 4 and i + 4 <= len(r):
-                        return list(r[i:i + 4])
+                    if i + rdlen > len(r):
+                        raise OSError("short DNS answer")
+                    if rclass == 1 and rtype == 1 and rdlen == 4:
+                        recs.append((owner, "A", list(r[i:i + 4])))
+                    elif rclass == 1 and rtype == 5:
+                        recs.append((owner, "CNAME", dns_name(r, i)[0]))
                     i += rdlen
+                target = want
+                for _hop in range(9):                         # the record for the name asked, through at most 8 CNAMEs
+                    a = next((v for o, t, v in recs if o == target and t == "A"), None)
+                    if a is not None:
+                        return a
+                    c = next((v for o, t, v in recs if o == target and t == "CNAME"), None)
+                    if c is None:
+                        return None
+                    target = c
                 return None
     raise OSError("no answer from DNS server %s" % server)
 
@@ -1712,7 +1763,7 @@ def hb_lookup(con, limit=20):
             h = hb_parse(hb_query(key, ip, hb_dns(con)))
         except Exception as e:
             set_meta(con, "hb_wait_until", time.time() + 3600)
-            set_meta(con, "hb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+            set_meta(con, "hb_error", "%s %s" % (fmt_ts(time.time()), str(e).replace(key, "<key>")[:120]))
             break
         with con:
             con.execute("INSERT OR REPLACE INTO httpbl(ip, checked, data) VALUES(?,?,?)", (ip, time.time(), json.dumps(h)))
@@ -2100,9 +2151,13 @@ def return_info(con, ip, n=None):
     # The latest time this IP came back after n (the setting) or more quiet UTC days, as (quiet days, start of the day it came
     # back, level before, level after), or None. Any activity counts as being there: a session, a decoy service or the tarpit.
     n = return_days(con) if n is None else n
-    days = sorted({d for (d,) in con.execute(
-        "SELECT CAST(start/86400 AS INTEGER) FROM sessions WHERE ip=? AND start IS NOT NULL "
-        "UNION SELECT CAST(ts/86400 AS INTEGER) FROM events WHERE ip=? AND kind IN ('canary','tarpit')", (ip, ip)) if d is not None})
+    # Every UTC day with any stored event (commands, logins, decoys, tarpit ...), plus every day a session was open.
+    days = {d for (d,) in con.execute("SELECT DISTINCT CAST(ts/86400 AS INTEGER) FROM events WHERE ip=?", (ip,)) if d is not None}
+    for a, b in con.execute("SELECT CAST(start/86400 AS INTEGER), CAST(COALESCE(end, start)/86400 AS INTEGER) FROM sessions "
+                            "WHERE ip=? AND start IS NOT NULL", (ip,)):
+        if a is not None:
+            days.update(range(a, max(a, min(b if b is not None else a, a + 366)) + 1))
+    days = sorted(days)
     back = None
     for a, b in zip(days, days[1:]):
         if b - a - 1 >= n:
@@ -2849,7 +2904,10 @@ def returned_news(con, since):
     except ValueError:
         told = {}
     out = []
-    for (ip,) in con.execute("SELECT ip FROM ips WHERE last>? AND (',' || tags || ',') LIKE '%,stepped-up,%' ORDER BY score DESC LIMIT 200", (since,)):
+    # Every stepped-up address active since then is checked (they are few); only the announcement is capped.
+    for (ip,) in con.execute("SELECT ip FROM ips WHERE last>? AND (',' || tags || ',') LIKE '%,stepped-up,%' ORDER BY score DESC", (since,)):
+        if len(out) >= 50:
+            break
         back = return_info(con, ip)
         if back and back[3] > back[2] and told.get(ip) != back[1]:
             told[ip] = back[1]
@@ -6895,20 +6953,29 @@ var hit=now.t>old.t?['Bait used','/ips?tag=took-bait&days=7&sort=last']:now.r>ol
 if(!hit)return;var a=document.createElement('a');a.className='raven-note';a.href=hit[1];a.textContent=hit[0];b.appendChild(a);b.classList.add('raven-on')})();
 document.documentElement.classList.add('js');document.querySelectorAll('select[data-autosubmit]').forEach(function(s){s.addEventListener('change',function(){s.form.submit()})});
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
-// Settings: save a form in the background and swap in only its own section, so the page keeps its place. Appearance
-// changes the whole page and still reloads; anything unexpected (a login page, a network error) falls back to a normal submit.
+// Settings: save a form in the background and swap in only its own panel (or section), so the page keeps its place.
+// Appearance changes the whole page and still reloads. A form is never sent twice: if the answer is lost, the panel says
+// so and a reload shows what was saved. One save at a time per panel; a lost session reloads the page (to the login).
 (function(){var main=document.querySelector('.sp-main');if(!main)return;
-main.addEventListener('submit',function(ev){var f=ev.target;if(!(f instanceof HTMLFormElement)||f.dataset.plain)return;
+function unit(f){var p=f.closest('.sp-panel[id]');return p||f.closest('.sp-sec')}
+main.addEventListener('submit',function(ev){var f=ev.target;if(!(f instanceof HTMLFormElement))return;
 var sc=f.querySelector('input[name=scope]');if(sc&&sc.value==='appearance')return;
-var sec=f.closest('.sp-sec');if(!sec||!sec.id||!window.fetch||!window.DOMParser)return;ev.preventDefault();
+var box=unit(f);if(!box||!box.id||!window.fetch||!window.DOMParser)return;ev.preventDefault();
+if(box.getAttribute('aria-busy')==='true')return;
 var btn=ev.submitter||f.querySelector('button'),body=new URLSearchParams(new FormData(f));if(ev.submitter&&ev.submitter.name)body.append(ev.submitter.name,ev.submitter.value);
-if(btn)btn.disabled=true;main.setAttribute('aria-busy','true');
-function plain(){f.dataset.plain='1';if(btn)btn.disabled=false;main.removeAttribute('aria-busy');f.submit()}
-fetch(f.action,{method:'POST',body:body,credentials:'same-origin',redirect:'follow'}).then(function(r){return r.text().then(function(t){return [r,t]})}).then(function(x){
-var doc=new DOMParser().parseFromString(x[1],'text/html'),fresh=doc.getElementById(sec.id);if(!fresh||!doc.querySelector('.sp-main')){plain();return}
-sec.innerHTML=fresh.innerHTML;main.removeAttribute('aria-busy');
-var msg=sec.querySelector('.sp-err[role=alert],.sp-ok[role=status]');if(msg){msg.setAttribute('tabindex','-1');msg.focus({preventScroll:true});
-var b=msg.getBoundingClientRect();if(b.top<0||b.bottom>innerHeight)msg.scrollIntoView({block:'center'})}}).catch(plain)})})();
+if(btn)btn.disabled=true;box.setAttribute('aria-busy','true');
+function done(){box.removeAttribute('aria-busy');if(btn)btn.disabled=false}
+function lost(){done();var p=box.querySelector('.sp-lost');if(!p){p=document.createElement('p');p.className='sp-err sp-lost';p.setAttribute('role','alert');box.insertBefore(p,box.firstChild.nextSibling)}
+p.textContent='No answer from Huginn, so it is not known whether this was saved. Reload the page to see.';p.setAttribute('tabindex','-1');p.focus()}
+fetch(f.action,{method:'POST',body:body,credentials:'same-origin',redirect:'follow'}).then(function(r){
+if(r.status===401||new URL(r.url,location.href).origin!==location.origin){location.reload();return null}
+return r.text()}).then(function(t){if(t===null)return;
+var doc=new DOMParser().parseFromString(t,'text/html'),fresh=doc.getElementById(box.id);if(!fresh||!doc.querySelector('.sp-main')){lost();return}
+box.innerHTML=fresh.innerHTML;box.removeAttribute('aria-busy');
+var msg=box.querySelector('.sp-err[role=alert],.sp-ok[role=status]')||doc.querySelector('.sp-ok[role=status],.sp-err[role=alert]');
+if(msg&&!box.contains(msg)){var c=msg.cloneNode(true);box.insertBefore(c,box.firstChild.nextSibling);msg=c}
+if(msg){msg.setAttribute('tabindex','-1');msg.focus({preventScroll:true});
+var b=msg.getBoundingClientRect();if(b.top<0||b.bottom>innerHeight)msg.scrollIntoView({block:'center'})}}).catch(lost)})})();
 """
 CSS += (".ov-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-bottom:12px}.ov-bar form{margin:0}.ov-bar .vtabs{margin-left:0}"
         ".ov-tabs button{padding:5px 14px;font-size:13px}.ov-f{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.ov-f .chips{margin:0}.ov-f .chip{padding:4px 12px}"

@@ -132,7 +132,7 @@ class SettingsDns(SettingsKey):
 
 class BackgroundSave(unittest.TestCase):
     def test_script_and_no_inline_style(self):
-        self.assertIn("sec.innerHTML=fresh.innerHTML", app.JS)
+        self.assertIn("box.innerHTML=fresh.innerHTML", app.JS)
         self.assertIn("value==='appearance'", app.JS)
         form = app.hb_form(app.connect(), False)
         self.assertNotIn("style=", form)            # the CSP blocks inline styles
