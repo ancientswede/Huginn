@@ -5,8 +5,11 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.47.0"
+HUGINN_VERSION = "0.47.1"
 CHANGELOG = [
+    ("0.47.1", "2026-11-17", "Campaigns has a tab per grouping (command scripts, SSH clients, netblocks, web attacks, IDS alerts, mail clients, "
+               "proxy use, slow replies) with how many rows each holds, instead of one long page to scroll. The tab you chose is "
+               "remembered and can be linked to (#c-netblocks). Without JavaScript the tabs jump to their section as before."),
     ("0.47.0", "2026-11-17", "Netblocks: every attacker is looked up with Team Cymru's free IP-to-ASN service (over DNS, no key): the announced "
                "network block it comes from, the AS that announces it, owner, registry and the date the block was allocated. The attacker "
                "page shows the block and how many attackers came from it, with a link to all of them. Attackers can be filtered by "
@@ -5950,7 +5953,7 @@ def v_campaigns(qs=None):
         srows += "<tr><td>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td><td>%s</td></tr>" % (
             script_cell(s["cmdhash"], full[:2], diff=diff, full=full), num(s["c"]), num(s["nip"]), (num(s["nip7"]) if s["nip7"] else '<span class=muted>–</span>'),
             num(s["n"]), esc(fmt_ts(s["f"])), esc(ago(s["l"])))
-    stabs = ('<div class="chips"><a class="chip%s" href="/campaigns">All time</a><a class="chip%s" href="/campaigns?active=1">Active, 7 days</a></div>'
+    stabs = ('<div class="chips"><a class="chip%s" href="/campaigns#c-scripts">All time</a><a class="chip%s" href="/campaigns?active=1#c-scripts">Active, 7 days</a></div>'
              % ("" if active else " on", " on" if active else ""))
     hs = con.execute("SELECT hassh, COUNT(*) n, COUNT(DISTINCT ip) nip, MAX(version) v, MAX(start) l FROM sessions WHERE hassh IS NOT NULL "
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
@@ -6021,20 +6024,26 @@ def v_campaigns(qs=None):
                  '<th class=num data-h>Returned</th><th data-h>Allocated</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % nbrows
                  if nbrows else none_yet("No block with more than one attacker yet" if nb_done else
                                          ("Netblocks are being looked up in the background" if nb_on(con) else "Netblock lookups are off (Settings, Lookups)")))
+    tbl = lambda head, rows: '<table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>' % (head, rows)
+    # 0.47.1: one tab per grouping instead of one long page. Each tab is a plain #link, so without JavaScript (and in the
+    # static demo) it jumps to the section; with it, only the chosen section shows and the choice is remembered.
+    tabs = [
+        ("scripts", "Command scripts", len(scripts), stabs + (tbl('<th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>IPs 7d</th><th class=num>Sessions</th><th>First</th><th>Last</th>', srows)
+                                                          if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet"))),
+        ("hassh", "SSH clients", len(hs), tbl('<th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th>', hrows) if hrows else none_yet("No SSH clients yet")),
+        ("netblocks", "Netblocks", len(nbs), nb_html_t),
+        ("web", "Web attacks", len(wa), tbl('<th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th>', warows) if warows else none_yet("No web attacks recognised yet")),
+        ("ids", "IDS alerts", len(ir), ids_html),
+        ("mail", "Mail clients", len(hl), tbl('<th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th>', hlrows) if hlrows else none_yet("No mail clients yet")),
+        ("proxy", "Proxy use", len(pr), psum + (tbl('<th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th>', prows) if prows else none_yet("No proxy checks answered yet"))),
+        ("slow", "Slow replies", None, slow),
+    ]
+    h2 = {"hassh": "SSH clients (HASSH)", "mail": "Mail clients (HELO)"}
+    bar = "".join('<a href="#c-%s" data-ctab="%s">%s%s</a>' % (k, k, esc(t), ('<span class=muted>%s</span>' % num(n)) if n else "") for k, t, n, _h in tabs)
+    secs = "".join('<section id="c-%s" class="ctab-pane" data-cpane="%s"><h2>%s</h2><div class="card">%s</div></section>' % (k, k, esc(h2.get(k, t)), h)
+                   for k, t, _n, h in tabs)
     body = ('<h1>Campaigns</h1><p class=muted>Attackers grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), netblock (the announced network they come from), web attack (rules from Krawl), IDS rule (Suricata), mail client name (HELO) and what they fetch through the fake SSH proxy.</p>'
-            '<div class="cgrid"><section class="cs-wide"><h2>Command scripts</h2><div class="card">%s</div></section><section><h2>SSH clients (HASSH)</h2><div class="card">%s</div></section>'
-            '<section class="cs-wide"><h2>Netblocks</h2><div class="card">%s</div></section>'
-            '<section class="cs-wide"><h2>Web attacks</h2><div class="card">%s</div></section><section><h2>Mail clients (HELO)</h2><div class="card">%s</div></section>'
-            '<section class="cs-wide"><h2>IDS alerts</h2><div class="card">%s</div></section>'
-            '<section><h2>Proxy use</h2><div class="card">%s%s</div></section><section><h2>Slow replies</h2><div class="card">%s</div></section></div>'
-            % (stabs + ('<table class="wide"><thead><tr><th>Script</th><th class=num>Cmds</th><th class=num>IPs</th><th class=num>IPs 7d</th><th class=num>Sessions</th><th>First</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % srows
-                        if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet")),
-               '<table class="wide"><thead><tr><th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hrows if hrows else none_yet("No SSH clients yet"),
-               nb_html_t,
-               '<table class="wide"><thead><tr><th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % warows if warows else none_yet("No web attacks recognised yet"),
-               '<table class="wide"><thead><tr><th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % hlrows if hlrows else none_yet("No mail clients yet"),
-               ids_html,
-               psum, '<table class="wide"><thead><tr><th>Request</th><th>Honeypot</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th></tr></thead><tbody>%s</tbody></table>' % prows if prows else none_yet("No proxy checks answered yet"), slow))
+            '<nav class="ctabs" aria-label="Campaign groupings">%s</nav><div class="cgrid ctab-wrap">%s</div>' % (bar, secs))
     return page("Campaigns", body, "/campaigns")
 
 
@@ -7171,6 +7180,13 @@ bt.addEventListener('click',function(){if(playing){playing=false;clearTimeout(ti
 document.getElementById('pRestart').addEventListener('click',function(){restart();if(playing){clearTimeout(timer);step()}});
 fetch(pl.dataset.src,{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){if(d.error){pl.textContent=d.error;return}
 fr=d.frames||[];pl.textContent=fr.length?'':'Empty recording.';if(fr.length){playing=true;bt.textContent='Pause';step()}}).catch(function(){pl.textContent='Could not load the recording.'})})();
+(function(){var nav=document.querySelector('.ctabs');if(!nav)return;var links=nav.querySelectorAll('[data-ctab]'),panes=document.querySelectorAll('[data-cpane]');
+function pick(k,push){var ok=false;panes.forEach(function(p){if(p.dataset.cpane===k)ok=true});if(!ok)k=links[0].dataset.ctab;
+panes.forEach(function(p){p.hidden=p.dataset.cpane!==k});links.forEach(function(a){if(a.dataset.ctab===k)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current')});
+try{localStorage.setItem('hgCtab',k)}catch(e){}if(push)try{history.replaceState(null,'','#c-'+k)}catch(e){}}
+document.body.classList.add('ctabs-js');
+links.forEach(function(a){a.addEventListener('click',function(ev){ev.preventDefault();pick(a.dataset.ctab,true)})});
+var h=(location.hash||'').replace('#c-',''),saved='';try{saved=localStorage.getItem('hgCtab')||''}catch(e){}pick(h||saved,false)})();
 (function(){var box=document.getElementById('wmap');if(!box)return;var card=box.closest('.card');var drawn=false;
 function view(v){card.querySelectorAll('[data-cview]').forEach(function(b){b.classList.toggle('on',b.dataset.cview===v)});
 card.querySelectorAll('[data-cpanel]').forEach(function(p){p.hidden=p.dataset.cpanel!==v});try{localStorage.setItem('hgCview',v)}catch(e){}if(v==='map')draw()}
@@ -7406,6 +7422,11 @@ CSS += (".sp nav.sp-nav{display:block;overflow:visible;gap:0}.sp nav.sp-nav a{wh
 CSS += (".cgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 14px}.cgrid h2{margin-top:18px}"
         "@media (min-width:1800px){.grid.ov{grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense}"
         ".cgrid{grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-flow:dense}.cgrid .cs-wide{grid-column:span 2}}")
+CSS += (".ctabs{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 4px;position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0}"
+        ".ctabs a{padding:6px 14px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--muted);text-decoration:none;white-space:nowrap}"
+        ".ctabs a:hover,.ctabs a:focus-visible{color:var(--accent)}.ctabs a span{margin-left:6px}.ctabs a[aria-current]{background:var(--accent2);color:var(--accent);border-color:var(--accent)}"
+        ".ctab-wrap .ctab-pane{scroll-margin-top:64px}.ctabs-js .ctab-wrap{grid-template-columns:minmax(0,1fr)}.ctabs-js .ctab-pane>h2{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.ctabs-js .ctab-pane>.card{margin-top:10px}"
+        "@media (max-width:1000px){.ctabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}.ctabs a{padding:9px 14px}}")
 # 0.30: folded sessions on the attacker page.
 CSS += (".sess-more{margin:2px 0 6px;border:1px dashed var(--line);border-radius:8px;padding:2px 8px}"
         ".sess-more>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:6px 2px}.sess-more .sess{margin-left:6px}")

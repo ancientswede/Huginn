@@ -215,3 +215,13 @@ class Pages(SettingsKey):
 
 
 del SettingsKey
+
+
+class CampaignTabs(unittest.TestCase):
+    def test_tabs_and_panes(self):
+        html = app.v_campaigns({})
+        for k in ("scripts", "hassh", "netblocks", "web", "ids", "mail", "proxy", "slow"):
+            self.assertIn('href="#c-%s" data-ctab="%s"' % (k, k), html)
+            self.assertIn('id="c-%s" class="ctab-pane" data-cpane="%s"' % (k, k), html)
+        self.assertIn("hgCtab", app.JS)
+        self.assertNotIn(" style=", html)
