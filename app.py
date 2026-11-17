@@ -5,8 +5,13 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.45.0"
+HUGINN_VERSION = "0.46.0"
 CHANGELOG = [
+    ("0.46.0", "2026-11-17", "Project Honey Pot (http:BL): with a free access key Huginn asks whether an attacker is a known web spammer, "
+               "e-mail harvester or suspicious visitor, how bad (threat 0 to 255) and how many days ago it was last seen there. "
+               "The answer is on the attacker page and in its JSON export. Paste the key on Settings, Lookups: it is tested on "
+               "Project Honey Pot's own test address and never shown again. IPv4 only, top attackers first, each again after a week, "
+               "at most 300 a day. From a LinkedIn comment."),
     ("0.45.0", "2026-11-16", "Attackers that come back: \"returned\" for an address seen again after 7 or more quiet days (change it under Settings, Views & defaults), "
                "\"stepped-up\" (+5) when it then gets further than ever before, for example only knocked first and later ran commands, "
                "left files or used the honeypot as a proxy. The attacker page says when it came back and what it did before and since, "
@@ -189,6 +194,11 @@ VT_DAILY = max(0, min(500, int(os.environ.get("HUGINN_VIRUSTOTAL_DAILY", "400") 
 # HUGINN_GREYNOISE_DAILY unset: 20 a day without a key, 40 with one (a key can also be saved on the Settings page).
 GN_KEY = os.environ.get("HUGINN_GREYNOISE_KEY", "")
 GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if os.environ.get("HUGINN_GREYNOISE_DAILY", "").strip() else -1
+# Optional: Project Honey Pot http:BL. One DNS question per attacker address: is it a known web spammer, e-mail harvester or
+# suspicious visitor, how bad and how recently? Needs a free access key (12 letters) from projecthoneypot.org, which can also
+# be pasted on the Settings page. The question goes through the normal DNS resolver, so key and address travel unencrypted.
+HB_KEY = os.environ.get("HUGINN_HTTPBL_KEY", "").strip()
+HB_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_HTTPBL_DAILY", "300") or 0)))
 
 # Logging to stderr (journald): "text" (default) or "json", one object per line, for log tools such as Grafana Loki, Graylog or Elasticsearch.
 LOG_FORMAT = "json" if os.environ.get("HUGINN_LOG_FORMAT", "").strip().lower() == "json" else "text"
@@ -344,6 +354,7 @@ CREATE INDEX IF NOT EXISTS wh_type ON webhits(type, ts);
 CREATE TABLE IF NOT EXISTS vt(sha TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS capped_seen(h TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
+CREATE TABLE IF NOT EXISTS httpbl(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
   sig TEXT, cat TEXT, PRIMARY KEY(ip, sid, day, proto, port));
@@ -1529,6 +1540,100 @@ def gn_lookup(con, limit=5):
         set_meta(con, "gn_error", "")
         done += 1
         time.sleep(1)
+    return done
+
+
+HB_KEY_RE = re.compile(r"[a-z]{12}")
+HB_TYPES = ((1, "suspicious"), (2, "harvester"), (4, "comment spammer"))
+HB_TEST_IP = "127.1.1.1"      # Project Honey Pot's own test address: always listed for a valid key, never for a wrong one
+
+
+def hb_key(con=None):
+    # A key saved on the Settings page wins over HUGINN_HTTPBL_KEY. It is never shown again once saved.
+    k = get_meta(con or db(), "hb_key", "") or ""
+    return k if HB_KEY_RE.fullmatch(k) else (HB_KEY if HB_KEY_RE.fullmatch(HB_KEY) else "")
+
+
+def hb_query(key, ip):
+    # The four numbers of the answer, or None when the address is not listed. Raises OSError when DNS itself fails.
+    name = "%s.%s.dnsbl.httpbl.org" % (key, ".".join(reversed(ip.split("."))))
+    try:
+        infos = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        if e.errno in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", -5)):
+            return None
+        raise
+    return [int(x) for x in infos[0][4][0].split(".")]
+
+
+def hb_parse(parts):
+    # 127.days.threat.type. Anything that does not start with 127 is a resolver making up an answer, never a listing.
+    if parts is None:
+        return {"listed": False}
+    if len(parts) != 4 or parts[0] != 127:
+        raise OSError("unexpected DNS answer (does the resolver rewrite unknown names?)")
+    days, threat, kind = parts[1], parts[2], parts[3]
+    if kind == 0:
+        return {"listed": True, "engine": True, "days": days, "threat": 0, "types": []}
+    return {"listed": True, "engine": False, "days": days, "threat": threat, "types": [n for b, n in HB_TYPES if kind & b]}
+
+
+def hb_test(key):
+    # "ok" when the test address answers, "bad" when it does not (wrong key), "error" when DNS fails.
+    try:
+        return "ok" if hb_query(key, HB_TEST_IP) else "bad"
+    except Exception:
+        return "error"
+
+
+def hb_get(con, ip):
+    r = con.execute("SELECT data FROM httpbl WHERE ip=?", (ip,)).fetchone()
+    try:
+        return json.loads(r[0]) if r and r[0] else None
+    except ValueError:
+        return None
+
+
+def hb_html(h):
+    if h is None:
+        return '<span class=muted>not checked yet</span>' if hb_key() and HB_DAILY else "–"
+    if not h.get("listed"):
+        return "not listed"
+    days = int(h.get("days") or 0)
+    seen = ' <span class=muted>last seen %s</span>' % ("today" if days == 0 else "1 day ago" if days == 1 else "%d days ago" % days)
+    if h.get("engine"):
+        return '<span class="tag t-grey">search engine</span>' + seen
+    types = h.get("types") or []
+    tags = "".join('<span class="tag %s">%s</span>' % ("t-orange" if t == "suspicious" else "t-red", esc(t)) for t in types if t in dict((n, 1) for _b, n in HB_TYPES))
+    return '%s <span class=mono>threat %d</span>%s' % (tags, int(h.get("threat") or 0), seen)
+
+
+def hb_lookup(con, limit=20):
+    # Top attackers first (highest score, active in 30 days, IPv4 only), each again after 7 days. Stays under HB_DAILY.
+    key = hb_key(con)
+    if not key or not HB_DAILY or float(get_meta(con, "hb_wait_until", "0") or 0) > time.time():
+        return 0
+    left, _t, _u = day_budget(con, "hb_day", HB_DAILY)
+    now = time.time()
+    ips = [r[0] for r in con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN httpbl h USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%:%' AND (h.ip IS NULL OR h.checked<?) "
+        "ORDER BY (h.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 7 * 86400, min(limit, left)))]
+    done = 0
+    for ip in ips:
+        if not sendable_ip(ip):
+            continue
+        day_spend(con, "hb_day")
+        try:
+            h = hb_parse(hb_query(key, ip))
+        except Exception as e:
+            set_meta(con, "hb_wait_until", time.time() + 3600)
+            set_meta(con, "hb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+            break
+        with con:
+            con.execute("INSERT OR REPLACE INTO httpbl(ip, checked, data) VALUES(?,?,?)", (ip, time.time(), json.dumps(h)))
+        set_meta(con, "hb_error", "")
+        done += 1
+        time.sleep(0.2)
     return done
 
 
@@ -2987,7 +3092,7 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
-        for f in (vt_lookup, gn_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+        for f in (vt_lookup, gn_lookup, hb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
             try:
                 f(con)
             except Exception as e:
@@ -4366,7 +4471,7 @@ def v_ip(ip, qs=None):
                         '<a href="/ip/%s/export.csv">Export CSV</a>' % esc(urllib.parse.quote(ip)),
                         ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
-                        ext("https://ipinfo.io/" + ip, "ipinfo")])
+                        ext("https://ipinfo.io/" + ip, "ipinfo"), ext("https://www.projecthoneypot.org/ip_" + ip, "Project Honey Pot")])
     left = kv([("First seen", esc(fmt_tss(r["first"]))), ("Last seen", "%s <span class=muted>(%s)</span>" % (esc(fmt_tss(r["last"])), esc(ago(r["last"])))),
                ("Sessions", num(r["sessions"])), ("Logins", "%s ok · %s failed" % (num(r["logins_ok"]), num(r["logins_fail"]))),
                ("Commands", num(r["cmds"])), ("Files", num(r["files"])), ("Proxy attempts", num(r["tcpip"])), ("Exploits", num(r["exploits"])),
@@ -4377,7 +4482,8 @@ def v_ip(ip, qs=None):
                     ("ASN", esc("AS" + e["asn"]) if e["asn"] else "–"), ("Org", esc(e["org"] or "–")), ("ISP", esc(e["isp"] or "–")),
                     ("Reverse DNS", '<span class=mono>%s</span>' % esc(e["rdns"] or "–")), ("Hostnames", esc(e["hostnames"] or "–")),
                     ("Open ports", esc(e["ports"] or "–")), ("Shodan tags", esc(e["tags"] or "–")),
-                    ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))), ("Looked up", esc(ago(e["fetched"])))])
+                    ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))),
+                    ("Project Honey Pot", hb_html(hb_get(con, ip))), ("Looked up", esc(ago(e["fetched"])))])
     else:
         right = '<p class=muted>Lookup pending (country, network, Shodan) — runs in the background.</p>'
 
@@ -4603,6 +4709,7 @@ def export_ip(ip):
         "ids_alerts": [{"day": x["day"], "sid": x["sid"], "severity": x["sev"], "signature": x["sig"], "class": x["cat"], "proto": x["proto"],
                         "port": x["port"], "hits": x["n"], "first": iso(x["first"]), "last": iso(x["last"])}
                        for x in con.execute("SELECT * FROM ids WHERE ip=? ORDER BY first", (ip,))],
+        "project_honeypot": hb_get(con, ip),
     }
 
 
@@ -5083,7 +5190,9 @@ def v_help():
         row('<span class="tag t-red">malicious scanner</span>', "GreyNoise has seen the address scanning the internet with bad intent."),
         row("not seen scanning the internet", "GreyNoise has no record of it: not a mass scanner, so more likely aimed or new."),
         row("MalwareBazaar", "abuse.ch's malware database: family names and tags for known files, by hash."),
-        row("Keys", "VirusTotal and MalwareBazaar keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
+        row("Project Honey Pot", "Whether the address is listed by Project Honey Pot (http:BL) as a web spammer, e-mail harvester or suspicious "
+            "visitor, its threat (0 to 255, higher is worse) and how many days ago it was last seen there. Needs a free key. IPv4 only."),
+        row("Keys", "VirusTotal, MalwareBazaar and Project Honey Pot keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
     ]
     ids = [
         row("What it is", "Optional. Suricata on the honeypot matches the traffic sent to it against the free Emerging Threats Open rules and names "
@@ -5864,6 +5973,7 @@ def metrics_text(con, now=None):
         for svc, budget, daily, key_set, err, wait in (
                 ("virustotal", "vt_day", VT_DAILY, bool(vt_key(con)), "vt_error", "vt_wait_until"),
                 ("greynoise", "gn_day", gn_daily(con), bool(gn_key(con)), "gn_error", "gn_wait_until"),
+                ("httpbl", "hb_day", HB_DAILY if hb_key(con) else 0, bool(hb_key(con)), "hb_error", "hb_wait_until"),
                 ("malwarebazaar", None, 0, bool(mb_key(con)), "mb_error", "mb_wait_until")):
             used = day_budget(con, budget, daily)[2] if budget else 0
             paused = float(get_meta(con, wait, "0") or 0) > now
@@ -6117,11 +6227,13 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "mbbusy": ("malwarebazaar", "MalwareBazaar key saved. abuse.ch is busy right now: lookups start on their own."),
                "mbdel": ("malwarebazaar", "MalwareBazaar key removed."), "gn": ("greynoise", "GreyNoise key saved. It works."),
                "gnbusy": ("greynoise", "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own."),
-               "gndel": ("greynoise", "GreyNoise key removed."), "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
+               "gndel": ("greynoise", "GreyNoise key removed."),
+               "hb": ("httpbl", "Project Honey Pot key saved. It works."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
+               "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
                "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
-SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "metrics", "about"}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
 COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
@@ -6160,7 +6272,7 @@ def v_settings(ok="", err="", at=""):
         top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
     elif err:
         # The error itself stands at its form further down; up here only where to find it.
-        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "honeypot": "Logout message",
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "honeypot": "Logout message",
                  "notifications": "Notifications"}
         top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
 
@@ -6386,7 +6498,22 @@ def lookups_card(flash=lambda s: "", at="", err=""):
               % ((esc(src) + " · ") if src else "", num(used), num(daily), num(g[0]), num(g[1]))) if daily else "",
              lasterr("gn_error"), key_form("greynoise", "API key (optional)", saved, "Paste key", bool(err) and at == "greynoise"), remove_form("greynoise", saved),
              num(GN_DAILY if GN_DAILY >= 0 else 20), num(GN_DAILY if GN_DAILY >= 0 else 40)))
-    return vt + mb + gn
+
+    saved = HB_KEY_RE.fullmatch(get_meta(con, "hb_key", "") or "") is not None
+    src = "Saved key" if saved else ("Environment key (HUGINN_HTTPBL_KEY)" if hb_key(con) else "")
+    _left, _t, used = day_budget(con, "hb_day", HB_DAILY)
+    h = con.execute("SELECT COUNT(*), COALESCE(SUM(data LIKE '%\"listed\": true%'),0) FROM httpbl").fetchone()
+    badge = sp_status("Off · No key") if not src else (sp_status("On", "on") if HB_DAILY else sp_status("Off"))
+    hb = ('<div class="sp-panel" id="httpbl"><div class="sp-ph"><h3>Project Honey Pot</h3>%s</div>%s'
+          '<p>Known web spammers, e-mail harvesters and suspicious visitors (http:BL). Sends IPv4 addresses, top attackers first.</p>%s%s%s%s'
+          '<p class="sp-help">Needs a free access key (12 letters) from projecthoneypot.org, under http:BL. Up to %s lookups a day '
+          '(HUGINN_HTTPBL_DAILY). The question goes through your normal DNS resolver, so the key and the address are not encrypted on the way.</p></div>'
+          % (badge, flash("httpbl"),
+             ('<p class="sp-usage">%s · %s / %s lookups today · %s addresses checked · %s listed</p>'
+              % (esc(src), num(used), num(HB_DAILY), num(h[0]), num(h[1]))) if src else "",
+             lasterr("hb_error"), key_form("httpbl", "Access key", saved, "Paste key", bool(err) and at == "httpbl"), remove_form("httpbl", saved),
+             num(HB_DAILY)))
+    return vt + mb + gn + hb
 
 
 SETTINGS_SCOPES = ("appearance", "views", "notifications")
@@ -7240,6 +7367,19 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "gn_wait_until", "0")      # a new key gets a fresh allowance
             set_meta(con, "gn_error", "")
             return self.redirect(settings_url(("gn" if res == "ok" else "gnbusy")))
+        if path == "/settings/httpbl":
+            key = (self.form().get("key") or "").strip().lower()
+            if not HB_KEY_RE.fullmatch(key):
+                return self.send(400, v_settings(at="httpbl", err="That does not look like an http:BL access key (12 letters)."))
+            res = hb_test(key)
+            if res == "bad":
+                return self.send(400, v_settings(at="httpbl", err="Project Honey Pot did not answer for that key. Nothing was saved."))
+            if res == "error":
+                return self.send(502, v_settings(at="httpbl", err="DNS lookup failed while testing the key. Nothing was saved, try again."))
+            set_meta(con, "hb_key", key)
+            set_meta(con, "hb_wait_until", "0")
+            set_meta(con, "hb_error", "")
+            return self.redirect(settings_url("hb"))
         if path == "/settings/metrics":
             on = self.form().get("on") == "1"
             if on and not get_meta(con, "metrics_token"):
@@ -7285,6 +7425,9 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "metrics_token", secrets.token_urlsafe(32))
             log("info", "metrics_token_new")
             return self.redirect(settings_url("mtok"))
+        if path == "/settings/httpbl/remove":
+            set_meta(con, "hb_key", "")
+            return self.redirect(settings_url("hbdel"))
         if path == "/settings/greynoise/remove":
             set_meta(con, "gn_key", "")
             return self.redirect(settings_url("gndel"))
