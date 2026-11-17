@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.46.0"
+HUGINN_VERSION = "0.46.1"
 CHANGELOG = [
+    ("0.46.1", "2026-11-17", "Project Honey Pot: choose which DNS server Huginn asks (Settings, Lookups): the system resolver, Cloudflare, "
+               "Quad9 or Google. Pi-hole and many routers drop answers that start with 127 (DNS rebinding protection), and http:BL "
+               "answers always do, so the key test failed with a message that blamed the key. It now says what is wrong. "
+               "Project Honey Pot cannot confirm a key itself, only that its answers get through. "
+               "Settings: Save no longer reloads the page; only the part you saved is updated, so you stay where you were "
+               "(Appearance still reloads, since it changes the whole page; without JavaScript it works as before)."),
     ("0.46.0", "2026-11-17", "Project Honey Pot (http:BL): with a free access key Huginn asks whether an attacker is a known web spammer, "
                "e-mail harvester or suspicious visitor, how bad (threat 0 to 255) and how many days ago it was last seen there. "
                "The answer is on the attacker page and in its JSON export. Paste the key on Settings, Lookups: it is tested on "
@@ -199,6 +205,9 @@ GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if 
 # be pasted on the Settings page. The question goes through the normal DNS resolver, so key and address travel unencrypted.
 HB_KEY = os.environ.get("HUGINN_HTTPBL_KEY", "").strip()
 HB_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_HTTPBL_DAILY", "300") or 0)))
+# Which DNS server to ask: "system" (the normal resolver) or an IPv4 address. Pi-hole and many routers drop answers in
+# 127.0.0.0/8, which is all http:BL ever answers, so a public server is often needed. Changeable on the Settings page.
+HB_DNS = os.environ.get("HUGINN_HTTPBL_DNS", "").strip()
 
 # Logging to stderr (journald): "text" (default) or "json", one object per line, for log tools such as Grafana Loki, Graylog or Elasticsearch.
 LOG_FORMAT = "json" if os.environ.get("HUGINN_LOG_FORMAT", "").strip().lower() == "json" else "text"
@@ -1545,7 +1554,78 @@ def gn_lookup(con, limit=5):
 
 HB_KEY_RE = re.compile(r"[a-z]{12}")
 HB_TYPES = ((1, "suspicious"), (2, "harvester"), (4, "comment spammer"))
-HB_TEST_IP = "127.1.1.1"      # Project Honey Pot's own test address: always listed for a valid key, never for a wrong one
+HB_TEST_IP = "127.1.1.1"      # Project Honey Pot's test address: always answers 127.1.1.1 (for any key), so it tests the DNS path only
+HB_DNS_CHOICES = (("system", "System resolver"), ("1.1.1.1", "Cloudflare (1.1.1.1)"), ("9.9.9.9", "Quad9 (9.9.9.9)"),
+                  ("8.8.8.8", "Google (8.8.8.8)"))
+
+
+def hb_dns_ok(v):
+    if v == "system":
+        return True
+    try:
+        ipaddress.IPv4Address(v)
+        return True
+    except ValueError:
+        return False
+
+
+def hb_dns(con=None):
+    # Saved on the Settings page, else HUGINN_HTTPBL_DNS, else the system resolver.
+    v = get_meta(con or db(), "hb_dns", "") or HB_DNS or "system"
+    return v if hb_dns_ok(v) else "system"
+
+
+def hb_dns_label(v):
+    return dict(HB_DNS_CHOICES).get(v, v)
+
+
+def dns_a(server, name, timeout=3, port=53):
+    # A minimal DNS client for one A question over UDP: the four numbers of the first A answer, or None for
+    # NXDOMAIN or no answer. Raises OSError when the server does not answer or answers something else.
+    tid = os.urandom(2)
+    qname = b"".join(bytes([len(x)]) + x.encode("ascii") for x in name.split(".")) + b"\0"
+    question = qname + b"\x00\x01\x00\x01"
+    query = tid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+        sk.settimeout(timeout)
+        sk.connect((server, port))
+        for _try in range(2):
+            sk.send(query)
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    r = sk.recv(1500)
+                except socket.timeout:
+                    break
+                if len(r) < 12 or r[:2] != tid or not r[2] & 0x80:
+                    continue                                  # not the answer to this question
+                if r[12:12 + len(question)].lower() != question.lower():
+                    continue
+                rcode = r[3] & 0x0F
+                if rcode == 3:
+                    return None
+                if rcode != 0:
+                    raise OSError("DNS server %s answered with error code %d" % (server, rcode))
+                ancount = int.from_bytes(r[6:8], "big")
+                i = 12 + len(question)
+                for _a in range(ancount):
+                    while i < len(r):                         # skip the name: labels or a compression pointer
+                        ln = r[i]
+                        if ln & 0xC0 == 0xC0:
+                            i += 2
+                            break
+                        i += 1 + ln
+                        if ln == 0:
+                            break
+                    if i + 10 > len(r):
+                        raise OSError("short DNS answer")
+                    rtype, rclass, rdlen = int.from_bytes(r[i:i + 2], "big"), int.from_bytes(r[i + 2:i + 4], "big"), int.from_bytes(r[i + 8:i + 10], "big")
+                    i += 10
+                    if rtype == 1 and rclass == 1 and rdlen == 4 and i + 4 <= len(r):
+                        return list(r[i:i + 4])
+                    i += rdlen
+                return None
+    raise OSError("no answer from DNS server %s" % server)
 
 
 def hb_key(con=None):
@@ -1554,9 +1634,11 @@ def hb_key(con=None):
     return k if HB_KEY_RE.fullmatch(k) else (HB_KEY if HB_KEY_RE.fullmatch(HB_KEY) else "")
 
 
-def hb_query(key, ip):
+def hb_query(key, ip, server="system"):
     # The four numbers of the answer, or None when the address is not listed. Raises OSError when DNS itself fails.
     name = "%s.%s.dnsbl.httpbl.org" % (key, ".".join(reversed(ip.split("."))))
+    if server != "system":
+        return dns_a(server, name)
     try:
         infos = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
     except socket.gaierror as e:
@@ -1578,12 +1660,15 @@ def hb_parse(parts):
     return {"listed": True, "engine": False, "days": days, "threat": threat, "types": [n for b, n in HB_TYPES if kind & b]}
 
 
-def hb_test(key):
-    # "ok" when the test address answers, "bad" when it does not (wrong key), "error" when DNS fails.
+def hb_test(key, server="system"):
+    # "ok" when the test address answers through this DNS server, "blocked" when the answer never arrives (a resolver
+    # with DNS rebinding protection drops it), "error" when DNS fails. The test address answers for any key, so this
+    # proves the path, not the key.
     try:
-        return "ok" if hb_query(key, HB_TEST_IP) else "bad"
+        parts = hb_query(key, HB_TEST_IP, server)
     except Exception:
         return "error"
+    return "ok" if parts and parts[0] == 127 else "blocked"
 
 
 def hb_get(con, ip):
@@ -1624,7 +1709,7 @@ def hb_lookup(con, limit=20):
             continue
         day_spend(con, "hb_day")
         try:
-            h = hb_parse(hb_query(key, ip))
+            h = hb_parse(hb_query(key, ip, hb_dns(con)))
         except Exception as e:
             set_meta(con, "hb_wait_until", time.time() + 3600)
             set_meta(con, "hb_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
@@ -5191,7 +5276,8 @@ def v_help():
         row("not seen scanning the internet", "GreyNoise has no record of it: not a mass scanner, so more likely aimed or new."),
         row("MalwareBazaar", "abuse.ch's malware database: family names and tags for known files, by hash."),
         row("Project Honey Pot", "Whether the address is listed by Project Honey Pot (http:BL) as a web spammer, e-mail harvester or suspicious "
-            "visitor, its threat (0 to 255, higher is worse) and how many days ago it was last seen there. Needs a free key. IPv4 only."),
+            "visitor, its threat (0 to 255, higher is worse) and how many days ago it was last seen there. Needs a free key. IPv4 only. "
+            "Pi-hole and many routers drop its answers: pick a public DNS server next to the key."),
         row("Keys", "VirusTotal, MalwareBazaar and Project Honey Pot keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
     ]
     ids = [
@@ -6228,7 +6314,7 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "mbdel": ("malwarebazaar", "MalwareBazaar key removed."), "gn": ("greynoise", "GreyNoise key saved. It works."),
                "gnbusy": ("greynoise", "GreyNoise key saved. GreyNoise is busy right now: lookups start on their own."),
                "gndel": ("greynoise", "GreyNoise key removed."),
-               "hb": ("httpbl", "Project Honey Pot key saved. It works."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
+               "hb": ("httpbl", "Saved. Project Honey Pot answers through this DNS server. It cannot confirm the key itself: if no attacker is ever listed, check the key."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
                "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
@@ -6452,6 +6538,20 @@ def key_form(provider, label, saved, ph_new, invalid=False):
             '<button>Save and test</button></div></form>' % (provider, provider, esc(label), provider, "Paste replacement key" if saved else ph_new, bad))
 
 
+def hb_form(con, saved, invalid=False):
+    # The Project Honey Pot form: which DNS server to ask, and the key (empty keeps a saved key, to change only the server).
+    cur = hb_dns(con)
+    opts = list(HB_DNS_CHOICES) + ([] if cur in dict(HB_DNS_CHOICES) else [(cur, cur)])
+    bad = ' aria-invalid=true aria-describedby="err-httpbl"' if invalid else ""
+    return ('<form method=post action="/settings/httpbl" class="sp-key"><label for="sp-httpbl-dns">DNS server</label>'
+            '<div class="sp-keyrow"><select id="sp-httpbl-dns" name=dns>%s</select></div>'
+            '<label for="sp-httpbl-key" class="sp-gap">Access key</label>'
+            '<div class="sp-keyrow"><input type=password id="sp-httpbl-key" name=key autocomplete=off spellcheck=false maxlength=128 placeholder="%s"%s>'
+            '<button>Save and test</button></div></form>'
+            % ("".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
+               "Leave empty to keep the saved key" if saved else "Paste key", bad))
+
+
 def remove_form(provider, saved):
     return ('<form method=post action="/settings/%s/remove" class="sp-remove"><button class="btn-s">Remove saved key</button></form>' % provider) if saved else ""
 
@@ -6507,11 +6607,12 @@ def lookups_card(flash=lambda s: "", at="", err=""):
     hb = ('<div class="sp-panel" id="httpbl"><div class="sp-ph"><h3>Project Honey Pot</h3>%s</div>%s'
           '<p>Known web spammers, e-mail harvesters and suspicious visitors (http:BL). Sends IPv4 addresses, top attackers first.</p>%s%s%s%s'
           '<p class="sp-help">Needs a free access key (12 letters) from projecthoneypot.org, under http:BL. Up to %s lookups a day '
-          '(HUGINN_HTTPBL_DAILY). The question goes through your normal DNS resolver, so the key and the address are not encrypted on the way.</p></div>'
+          '(HUGINN_HTTPBL_DAILY). Pi-hole and many routers drop its answers (DNS rebinding protection): then pick a public DNS server. '
+          'DNS is not encrypted, so the key and the address can be read on the way.</p></div>'
           % (badge, flash("httpbl"),
              ('<p class="sp-usage">%s · %s / %s lookups today · %s addresses checked · %s listed</p>'
-              % (esc(src), num(used), num(HB_DAILY), num(h[0]), num(h[1]))) if src else "",
-             lasterr("hb_error"), key_form("httpbl", "Access key", saved, "Paste key", bool(err) and at == "httpbl"), remove_form("httpbl", saved),
+              % (esc(src) + " · DNS " + esc(hb_dns_label(hb_dns(con))), num(used), num(HB_DAILY), num(h[0]), num(h[1]))) if src else "",
+             lasterr("hb_error"), hb_form(con, saved, bool(err) and at == "httpbl"), remove_form("httpbl", saved),
              num(HB_DAILY)))
     return vt + mb + gn + hb
 
@@ -6794,6 +6895,20 @@ var hit=now.t>old.t?['Bait used','/ips?tag=took-bait&days=7&sort=last']:now.r>ol
 if(!hit)return;var a=document.createElement('a');a.className='raven-note';a.href=hit[1];a.textContent=hit[0];b.appendChild(a);b.classList.add('raven-on')})();
 document.documentElement.classList.add('js');document.querySelectorAll('select[data-autosubmit]').forEach(function(s){s.addEventListener('change',function(){s.form.submit()})});
 if(location.hash){var d=document.getElementById(location.hash.slice(1));if(d&&d.tagName==='DETAILS'){d.open=true;d.classList.add('hl');d.scrollIntoView({block:'center'})}}
+// Settings: save a form in the background and swap in only its own section, so the page keeps its place. Appearance
+// changes the whole page and still reloads; anything unexpected (a login page, a network error) falls back to a normal submit.
+(function(){var main=document.querySelector('.sp-main');if(!main)return;
+main.addEventListener('submit',function(ev){var f=ev.target;if(!(f instanceof HTMLFormElement)||f.dataset.plain)return;
+var sc=f.querySelector('input[name=scope]');if(sc&&sc.value==='appearance')return;
+var sec=f.closest('.sp-sec');if(!sec||!sec.id||!window.fetch||!window.DOMParser)return;ev.preventDefault();
+var btn=ev.submitter||f.querySelector('button'),body=new URLSearchParams(new FormData(f));if(ev.submitter&&ev.submitter.name)body.append(ev.submitter.name,ev.submitter.value);
+if(btn)btn.disabled=true;main.setAttribute('aria-busy','true');
+function plain(){f.dataset.plain='1';if(btn)btn.disabled=false;main.removeAttribute('aria-busy');f.submit()}
+fetch(f.action,{method:'POST',body:body,credentials:'same-origin',redirect:'follow'}).then(function(r){return r.text().then(function(t){return [r,t]})}).then(function(x){
+var doc=new DOMParser().parseFromString(x[1],'text/html'),fresh=doc.getElementById(sec.id);if(!fresh||!doc.querySelector('.sp-main')){plain();return}
+sec.innerHTML=fresh.innerHTML;main.removeAttribute('aria-busy');
+var msg=sec.querySelector('.sp-err[role=alert],.sp-ok[role=status]');if(msg){msg.setAttribute('tabindex','-1');msg.focus({preventScroll:true});
+var b=msg.getBoundingClientRect();if(b.top<0||b.bottom>innerHeight)msg.scrollIntoView({block:'center'})}}).catch(plain)})})();
 """
 CSS += (".ov-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-bottom:12px}.ov-bar form{margin:0}.ov-bar .vtabs{margin-left:0}"
         ".ov-tabs button{padding:5px 14px;font-size:13px}.ov-f{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.ov-f .chips{margin:0}.ov-f .chip{padding:4px 12px}"
@@ -6954,7 +7069,7 @@ CSS += (".sp{--sp-pad:24px;--sp-row:16px;max-width:1360px;margin:0 auto}html[dat
         ".sp .sp-events{border:0;border-top:1px solid var(--line);margin:14px 0 0;padding:14px 0 0;min-width:0}.sp .sp-events legend{padding:0 10px 0 0;font-weight:600;font-size:13px}"
         ".sp .sp-test{border-top:1px solid var(--line);margin-top:18px;padding-top:18px;display:flex;align-items:center;justify-content:space-between;gap:16px}.sp .sp-test .sp-help{margin-top:4px}"
         ".sp .sp-act{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}.sp .sp-act .sp-help{margin:0}.sp .sp-act form{margin:0}"
-        ".sp .sp-key{margin-top:16px}.sp .sp-key label{display:block;font-weight:500;font-size:13px;margin-bottom:7px}.sp .sp-keyrow{display:flex;gap:10px}.sp .sp-keyrow input{flex:1;width:0;font-family:var(--mono,monospace)}"
+        ".sp .sp-key{margin-top:16px}.sp .sp-key label.sp-gap{margin-top:12px}.sp .sp-key label{display:block;font-weight:500;font-size:13px;margin-bottom:7px}.sp .sp-keyrow{display:flex;gap:10px}.sp .sp-keyrow input{flex:1;width:0;font-family:var(--mono,monospace)}"
         ".sp .sp-remove{margin-top:10px}.sp .sp-usage{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}"
         ".sp details{margin-top:14px}.sp summary{cursor:pointer;color:var(--accent);font-size:13px;padding:6px 0}"
         ".sp .sp-ok{color:var(--green);margin:0 0 12px}.sp .sp-err{color:var(--red);margin:0 0 12px}"
@@ -7368,15 +7483,27 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "gn_error", "")
             return self.redirect(settings_url(("gn" if res == "ok" else "gnbusy")))
         if path == "/settings/httpbl":
-            key = (self.form().get("key") or "").strip().lower()
+            f = self.form()
+            key = (f.get("key") or "").strip().lower()
+            dns = (f.get("dns") or "").strip() or hb_dns(con)
+            if not hb_dns_ok(dns):
+                return self.send(400, v_settings(at="httpbl", err="Choose a DNS server from the list."))
+            if not key:
+                key = hb_key(con)
+                if not key:
+                    return self.send(400, v_settings(at="httpbl", err="Paste the access key."))
             if not HB_KEY_RE.fullmatch(key):
-                return self.send(400, v_settings(at="httpbl", err="That does not look like an http:BL access key (12 letters)."))
-            res = hb_test(key)
-            if res == "bad":
-                return self.send(400, v_settings(at="httpbl", err="Project Honey Pot did not answer for that key. Nothing was saved."))
+                return self.send(400, v_settings(at="httpbl", err="That does not look like an http:BL access key (12 lower-case letters)."))
+            res = hb_test(key, dns)
+            if res == "blocked":
+                return self.send(400, v_settings(at="httpbl", err=(
+                    "Your DNS resolver dropped Project Honey Pot's answer. Pi-hole and many routers do this to stop DNS rebinding. "
+                    "Choose a public DNS server and try again. Nothing was saved.") if dns == "system" else (
+                    "No answer from Project Honey Pot through %s. Try another DNS server. Nothing was saved." % hb_dns_label(dns))))
             if res == "error":
-                return self.send(502, v_settings(at="httpbl", err="DNS lookup failed while testing the key. Nothing was saved, try again."))
+                return self.send(502, v_settings(at="httpbl", err="Could not reach the DNS server (%s). Nothing was saved, try again." % hb_dns_label(dns)))
             set_meta(con, "hb_key", key)
+            set_meta(con, "hb_dns", dns)
             set_meta(con, "hb_wait_until", "0")
             set_meta(con, "hb_error", "")
             return self.redirect(settings_url("hb"))

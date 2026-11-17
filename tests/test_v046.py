@@ -13,7 +13,7 @@ def clean(con):
     with con:
         con.execute("DELETE FROM httpbl")
         con.execute("DELETE FROM ips WHERE ip IN (?, ?)", (IP, "2001:db8::7"))
-        for k in ("hb_key", "hb_error", "hb_wait_until", "hb_day"):
+        for k in ("hb_key", "hb_dns", "hb_error", "hb_wait_until", "hb_day"):
             con.execute("DELETE FROM meta WHERE k=?", (k,))
 
 
@@ -70,7 +70,7 @@ class Parse(unittest.TestCase):
 
     def test_key_test(self):
         name = KEY + ".1.1.1.127.dnsbl.httpbl.org"
-        for answers, want in (({name: "127.1.1.1"}, "ok"), ({}, "bad"), ({name: socket.EAI_AGAIN}, "error")):
+        for answers, want in (({name: "127.1.1.1"}, "ok"), ({}, "blocked"), ({name: socket.EAI_AGAIN}, "error")):
             gai, asked = fake_dns(answers)
             with mock.patch.object(app.socket, "getaddrinfo", gai):
                 self.assertEqual(app.hb_test(KEY), want)
@@ -182,7 +182,7 @@ class SettingsKey(unittest.TestCase):
         self.assertEqual(r.getheader("Location"), "/settings?ok=hb#httpbl")
         self.assertEqual(app.get_meta(con, "hb_key"), KEY)
         _r, html = self.req("GET", "/settings?ok=hb#httpbl", headers={"Cookie": self.cookie})
-        self.assertIn("Project Honey Pot key saved. It works.", html)
+        self.assertIn("Project Honey Pot answers through this DNS server", html)
         self.assertIn("<h3>Project Honey Pot</h3>", html)
         self.assertNotIn(KEY, html)
         r, _ = self.req("POST", "/settings/httpbl/remove", "", self.hdr({"Cookie": self.cookie}))
@@ -194,7 +194,7 @@ class SettingsKey(unittest.TestCase):
         app.set_meta(con, "hb_key", "")
         r, html = self.post_key(KEY, {})
         self.assertEqual(r.status, 400)
-        self.assertIn("did not answer", html)
+        self.assertIn("dropped Project Honey Pot", html)
         r, _ = self.post_key("abc123", {})
         self.assertEqual(r.status, 400)
         r, _ = self.post_key(KEY, {KEY + ".1.1.1.127.dnsbl.httpbl.org": socket.EAI_AGAIN})
