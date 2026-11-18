@@ -324,6 +324,12 @@ with con:
         owners.setdefault(asn, (d["org"], d["cc"]))
         con.execute("INSERT OR REPLACE INTO netblock VALUES(?,?,?,?,?,?,?)", (ip, NOW, str(net), asn, d["cc"],
                     RN.choice(["ripencc", "arin", "apnic", "lacnic", "afrinic"]), "%d-%02d-%02d" % (RN.randint(1998, 2025), RN.randint(1, 12), RN.randint(1, 28))))
+    # Made-up Tor exits (0.48): a few attackers came through Tor. Recomputed below with the rest, which tags them.
+    RT = random.Random(48)
+    for ip in RT.sample(sorted(i for i in ips if ":" not in i), 9):
+        con.execute("INSERT OR REPLACE INTO tor(ip, first, last) VALUES(?,?,?)", (ip, NOW - RT.uniform(20, 200) * 86400, NOW - 3600))
+    app.set_meta(con, "tor_fetched", NOW - 5 * 3600)
+    app.set_meta(con, "tor_count", 1247)
     for asn, (org, cc) in owners.items():
         con.execute("INSERT OR REPLACE INTO asname VALUES(?,?,?)", (asn, NOW, "%s - %s, %s" % (re.sub(r"[^A-Z]", "", (org or "x").upper())[:12] or "NET", org, cc or "EU")))
 for ip in ips:

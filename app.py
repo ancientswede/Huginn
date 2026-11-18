@@ -5,8 +5,13 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.47.1"
+HUGINN_VERSION = "0.48.0"
 CHANGELOG = [
+    ("0.48.0", "2026-11-18", "Tor exit nodes: once a day Huginn downloads the Tor Project's list of exit addresses (nothing is sent) and tags "
+               "attackers that came through one \"tor\". Such an address is shared by many people, so it never counts as returned or "
+               "stepped-up, and it is left out of the blocklist and its feeds unless you choose otherwise on Settings, Lookups (or "
+               "tor=1 on a feed); Always block still wins. The tag can be filtered on, and the JSON export says when the address was "
+               "listed. On by default. From a LinkedIn comment."),
     ("0.47.1", "2026-11-17", "Campaigns has a tab per grouping (command scripts, SSH clients, netblocks, web attacks, IDS alerts, mail clients, "
                "proxy use, slow replies) with how many rows each holds, instead of one long page to scroll. The tab you chose is "
                "remembered and can be linked to (#c-netblocks). Without JavaScript the tabs jump to their section as before."),
@@ -386,6 +391,7 @@ CREATE TABLE IF NOT EXISTS httpbl(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TEXT, asn TEXT, cc TEXT, registry TEXT, allocated TEXT);
 CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
 CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
+CREATE TABLE IF NOT EXISTS tor(ip TEXT PRIMARY KEY, first REAL, last REAL);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
   sig TEXT, cat TEXT, PRIMARY KEY(ip, sid, day, proto, port));
@@ -1823,6 +1829,89 @@ def hb_lookup(con, limit=20):
     return done
 
 
+# ---------------------------------------------------------------- Tor exit nodes (0.48)
+# The Tor Project's list of exit addresses, fetched once a day. An attack from one of them came from someone using Tor, not
+# from the owner of the address: it is tagged "tor", never counts as coming back (the next visit is likely someone else),
+# and is left out of the blocklist unless chosen on Settings. A listing within TOR_WINDOW of the attack counts.
+TOR_URL = "https://check.torproject.org/torbulkexitlist"
+TOR_WINDOW = 30 * 86400
+TOR_KEEP = 365 * 86400
+
+
+def tor_tagging(con=None):
+    # Turned on on Settings (default). Tagging uses the stored list; downloading it also needs outside lookups (HUGINN_ENRICH).
+    return (get_meta(con or db(), "tor_on", "1") or "1") == "1"
+
+
+def tor_on(con=None):
+    return ENRICH and tor_tagging(con)
+
+
+def tor_bl(con=None):
+    # True: Tor exits may be on the blocklist like any other attacker.
+    return (get_meta(con or db(), "tor_bl", "0") or "0") == "1"
+
+
+def tor_parse(text):
+    out = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            a = ipaddress.ip_address(line)
+        except ValueError:
+            continue
+        if a.is_global:
+            out.add(str(a))
+    return out
+
+
+def tor_is(con, ip, first, last):
+    r = con.execute("SELECT first, last FROM tor WHERE ip=?", (ip,)).fetchone()
+    return bool(r and r[0] - TOR_WINDOW <= last and r[1] + TOR_WINDOW >= first)
+
+
+def tor_get(con, ip):
+    r = con.execute("SELECT first, last FROM tor WHERE ip=?", (ip,)).fetchone()
+    return {"first_listed": r[0], "last_listed": r[1]} if r else None
+
+
+def tor_refresh(con, force=False):
+    # Once a day (or at once when forced): fetch the list, note who is on it, and recompute every attacker whose Tor
+    # status may change. Returns how many addresses the list held, or None when nothing was fetched.
+    if not tor_on(con):
+        return None
+    now = time.time()
+    if not force and now - float(get_meta(con, "tor_fetched", "0") or 0) < 86400 - 600:
+        return None
+    if not force and float(get_meta(con, "tor_wait_until", "0") or 0) > now:
+        return None
+    try:
+        req = urllib.request.Request(TOR_URL, headers={"User-Agent": UA, "Accept": "text/plain"})
+        with api_urlopen(req, timeout=30) as r:
+            listed = tor_parse(r.read(4_000_000).decode("ascii", "replace"))
+        if len(listed) < 100:
+            raise OSError("the list held only %d addresses" % len(listed))
+    except Exception as e:
+        set_meta(con, "tor_wait_until", now + 3600)
+        set_meta(con, "tor_error", "%s %s" % (fmt_ts(now), str(e)[:120]))
+        return None
+    with con:
+        con.executemany("INSERT INTO tor(ip, first, last) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET last=excluded.last",
+                        [(ip, now, now) for ip in listed])
+        con.execute("DELETE FROM tor WHERE last < ?", (now - TOR_KEEP,))
+    affected = {r[0] for r in con.execute("SELECT i.ip FROM ips i JOIN tor t USING(ip)")}
+    affected |= {r[0] for r in con.execute("SELECT ip FROM ips WHERE (','||COALESCE(tags,'')||',') LIKE '%,tor,%'")}
+    with con:
+        for ip in affected:
+            recompute_ip(con, ip)
+    set_meta(con, "tor_fetched", now)
+    set_meta(con, "tor_count", len(listed))
+    set_meta(con, "tor_error", "")
+    return len(listed)
+
+
 # ---------------------------------------------------------------- netblocks (Team Cymru, 0.47)
 NB_RECHECK = 30 * 86400          # blocks and owners change rarely
 NB_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -2270,7 +2359,7 @@ SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per c
 
 
 def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False,
-                   back=None):
+                   back=None, tor=False):
     # back: return_info() of the IP, or None.
     stepped = bool(back and back[3] > back[2] and back[3] >= 3)
     s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids, stepped))
@@ -2307,6 +2396,8 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("returned")
     if stepped:
         tags.append("stepped-up")
+    if tor:
+        tags.append("tor")
     return s, ",".join(tags)
 
 
@@ -2385,8 +2476,10 @@ def recompute_ip(con, ip):
     # gain, trojans, web application attacks); 2 is mostly scanning and recon, which nearly every attacker does.
     ids = con.execute("SELECT 1 FROM ids WHERE ip=? AND sev=1 LIMIT 1", (ip,)).fetchone() is not None
     rd = return_days(con)
-    back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 else None
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back)
+    tor = tor_tagging(con) and tor_is(con, ip, min(firsts), max(lasts))
+    # A Tor exit is shared by many users: a later visit is most likely someone else, so it never counts as coming back.
+    back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 and not tor else None
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -3421,7 +3514,7 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
-        for f in (vt_lookup, gn_lookup, hb_lookup, nb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+        for f in (tor_refresh, vt_lookup, gn_lookup, hb_lookup, nb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
             try:
                 f(con)
             except Exception as e:
@@ -3540,7 +3633,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "tor": "t-purple", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 # What each attacker tag means: the tooltip on every tag and the Help page read this one table.
@@ -3566,6 +3659,8 @@ TAG_HELP = {
     "returned": "Came back after a quiet spell with nothing at all from this address (7 days unless changed under Settings).",
     "stepped-up": "Came back after a quiet spell and got further than ever before, for example only knocked first and then ran "
                   "commands, left files or used the honeypot as a proxy.",
+    "tor": "The address was a Tor exit node when it attacked (Tor Project's list): someone using Tor, not the owner of the address. "
+           "Never counted as coming back, and left out of the blocklist unless chosen on Settings.",
     "block": "You flagged this attacker: always on the blocklist.",
     "allow": "You flagged this attacker: never on the blocklist.",
 }
@@ -4475,7 +4570,7 @@ def v_ips(qs, mobile=False):
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN, netblock">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "research", "block", "allow"]]), esc(sort),
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "tor", "research", "block", "allow"]]), esc(sort),
                (('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "")
                + (('<input type=hidden name=net value="%s"><span class="chip on">Netblock %s <a href="%s" title="Remove netblock filter">×</a></span>' % (esc(netf), esc(netf), esc(link(net="", p=0)))) if netf else ""),
                '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
@@ -5055,6 +5150,7 @@ def export_ip(ip):
                         "port": x["port"], "hits": x["n"], "first": iso(x["first"]), "last": iso(x["last"])}
                        for x in con.execute("SELECT * FROM ids WHERE ip=? ORDER BY first", (ip,))],
         "project_honeypot": hb_get(con, ip),
+        "tor_exit": ({k: iso(v) for k, v in tor_get(con, ip).items()} if tor_get(con, ip) else None),
         "netblock": ({k: v for k, v in nb.items() if k not in ("ip", "checked", "name")} | {"owner": nb.get("name"), "looked_up": iso(nb["checked"])}) if nb else None,
     }
 
@@ -5508,7 +5604,7 @@ def v_help():
     personas = sorted(set(PERSONA.values()))
     tags = [row(tag(t), esc(TAG_HELP[t])) for t in ("shell", "dropper", "proxy", "exploit", "bruteforce", "human-like", "took-bait", "read-bait",
                                                     "sshole-probe", "web-exploit", "web-probe", "robots-trap", "ids-alert", "multi-service", "tarpitted",
-                                                    "returned", "stepped-up", "research", "block", "allow")]
+                                                    "returned", "stepped-up", "tor", "research", "block", "allow")]
     if personas:
         tags.append(row(" ".join(tag(p) for p in personas), "Persona: which fake machine a session hit. Set by the installer (HUGINN_PERSONAS)."))
     sessions = [
@@ -5542,6 +5638,9 @@ def v_help():
         row("Netblock", "The announced network block the address belongs to (for example 45.148.10.0/24), from Team Cymru over DNS, and how many "
             "attackers came from the same block. Click it for all of them. Block owner is the AS that announces it, its registry and the date "
             "the block was allocated: a young block is often a fresh rented range. Campaigns lists the busiest blocks. No key needed; on by default."),
+        row("Tor", "Once a day Huginn downloads the Tor Project's list of exit addresses. An attacker listed there within 30 days of its "
+            "attack is tagged tor: someone using Tor, not the owner of the address. It never counts as coming back and stays off the "
+            "blocklist unless chosen on Settings, Lookups (or tor=1 on a feed). On by default; nothing is sent."),
         row("Keys", "VirusTotal, MalwareBazaar and Project Honey Pot keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
     ]
     ids = [
@@ -6136,17 +6235,21 @@ def v_campaign_web(con, rtype):
     return page(title, body, "/campaigns")
 
 
-def blocklist_ips(con, min_score, days, research, v6):
+def blocklist_ips(con, min_score, days, research, v6, tor=None):
+    # tor: True puts Tor exit nodes on the list like any other attacker; None = as chosen on Settings (left out by default).
+    tor = tor_bl(con) if tor is None else tor
     since = time.time() - days * 86400
     rows = con.execute(
-        "SELECT i.ip, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
+        "SELECT i.ip, (','||COALESCE(i.tags,'')||',' LIKE '%,tor,%' AND COALESCE(f.flag,'')!='block') via_tor, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,web-exploit,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,took-bait,%' "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,read-bait,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,sshole-probe,%' maybe "
         "FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
         "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=?))",
         (since, min_score)).fetchall()
     out = []
-    for ip, maybe in rows:
+    for ip, via_tor, maybe in rows:
+        if via_tor and not tor:
+            continue
         # A scanner by name, and nothing but looking around: left out, unless it tried to log in to a decoy service.
         if maybe and not research and not any(canary_is_login(s, b) for s, b in con.execute("SELECT a,b FROM events WHERE ip=? AND kind='canary' AND b LIKE '% / %'", (ip,))):
             continue
@@ -6198,7 +6301,9 @@ def bl_params(qs):
             return max(lo, min(hi, int(qs.get(k) or d)))
         except ValueError:
             return d
-    return gi("min", int(st["bl_min"]), 1, 1000), gi("days", int(st["bl_days"]), 1, 3650), qs.get("research") == "1", qs.get("v6", "1") != "0"
+    tor = qs.get("tor")
+    return (gi("min", int(st["bl_min"]), 1, 1000), gi("days", int(st["bl_days"]), 1, 3650), qs.get("research") == "1", qs.get("v6", "1") != "0",
+            tor_bl() if tor not in ("0", "1") else tor == "1")
 
 
 def render_feed(fmt, ips, with_v6=True):
@@ -6415,11 +6520,11 @@ def base_url(h):
 
 def v_blocklist(h, qs):
     con = db()
-    mn, days, research, v6 = bl_params(qs)
-    ips = blocklist_ips(con, mn, days, research, v6)
+    mn, days, research, v6, tor = bl_params(qs)
+    ips = blocklist_ips(con, mn, days, research, v6, tor)
     c2 = c2_list(con)
     token = get_meta(con, "feed_token")
-    params = urllib.parse.urlencode({"min": mn, "days": days, "research": "1" if research else "0", "v6": "1" if v6 else "0"})
+    params = urllib.parse.urlencode({"min": mn, "days": days, "research": "1" if research else "0", "v6": "1" if v6 else "0", "tor": "1" if tor else "0"})
     feeds = "".join('<div class="feed"><div class="feed-h"><b>%s</b><button class="btn-s" data-copy="%s">Copy URL</button></div><div class="mono url">%s</div><div class="muted small">%s</div></div>'
                     % (esc(lab), esc("%s/feed/%s/%s?%s" % (base_url(h), token, fmt, params)), esc("%s/feed/••••/%s?%s" % (base_url(h), fmt, params)), esc(desc))
                     for fmt, lab, desc in FEEDS)
@@ -6427,10 +6532,10 @@ def v_blocklist(h, qs):
     frows = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (ip_link(f["ip"]), cc_html(f["cc"]), tag_html(f["flag"]), esc(f["note"] or ""), esc(fmt_ts(f["updated"]))) for f in flags)
     sel = lambda name, cur, vals: '<select name=%s>%s</select>' % (name, "".join('<option value="%s"%s>%s</option>' % (v, " selected" if str(v) == str(cur) else "", esc(l)) for v, l in vals))
     form = ('<form class="filters" method=get action="/blocklist"><label>Min score %s</label><label>Seen within %s</label>'
-            '<label>Research scanners %s</label><label>IPv6 %s</label><button>Update</button></form>'
+            '<label>Research scanners %s</label><label>Tor exits %s</label><label>IPv6 %s</label><button>Update</button></form>'
             % (sel("min", mn, [(1, "1 (everything)"), (3, "3 (tried to log in)"), (5, "5"), (10, "10 (ran commands)"), (15, "15 (dropped files)"), (25, "25")]),
                sel("days", days, [(1, "24 hours"), (7, "7 days"), (30, "30 days"), (90, "90 days"), (365, "1 year")]),
-               sel("research", "1" if research else "0", [("0", "Exclude"), ("1", "Include")]), sel("v6", "1" if v6 else "0", [("1", "Include"), ("0", "Exclude")])))
+               sel("research", "1" if research else "0", [("0", "Exclude"), ("1", "Include")]), sel("tor", "1" if tor else "0", [("0", "Exclude"), ("1", "Include")]), sel("v6", "1" if v6 else "0", [("1", "Include"), ("0", "Exclude")])))
     preview = " ".join('<span class=mono>%s</span>' % esc(i) for i in ips[:300])
     body = ('<h1>Blocklist <span class=muted>%s IPs</span></h1>%s'
             '<div class="grid"><div class="card span2"><h3>Feeds</h3><p class="muted small">Feed URLs contain a secret token and need no login — keep them on the LAN. '
@@ -6605,11 +6710,12 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "hb": ("httpbl", "Saved. Project Honey Pot answers through this DNS server. It cannot confirm the key itself: if no attacker is ever listed, check the key."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
                "nbon": ("netblock", "Saved. Netblocks are looked up in the background, newest attackers first."),
                "nboff": ("netblock", "Netblock lookups are off. What was already looked up stays."),
+               "tor": ("tor", "Saved."), "toron": ("tor", "Saved. The Tor exit list is being downloaded and attackers are tagged."),
                "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
                "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
-SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "metrics", "about"}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "tor", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
 COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
@@ -6648,7 +6754,7 @@ def v_settings(ok="", err="", at=""):
         top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
     elif err:
         # The error itself stands at its form further down; up here only where to find it.
-        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "honeypot": "Logout message",
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "tor": "Tor exit nodes", "honeypot": "Logout message",
                  "notifications": "Notifications"}
         top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
 
@@ -6924,7 +7030,23 @@ def lookups_card(flash=lambda s: "", at="", err=""):
              lasterr("nb_error"), " checked" if on else "",
              "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
              num(NB_DAILY)))
-    return vt + mb + gn + hb + nb
+
+    on, inbl = tor_on(con), tor_bl(con)
+    fetched = float(get_meta(con, "tor_fetched", "0") or 0)
+    tn = con.execute("SELECT COUNT(*) FROM ips WHERE (','||COALESCE(tags,'')||',') LIKE '%,tor,%'").fetchone()[0]
+    tor = ('<div class="sp-panel" id="tor"><div class="sp-ph"><h3>Tor exit nodes</h3>%s</div>%s'
+           '<p>Tags attackers that came through Tor. Downloads the Tor Project\'s list of exit addresses once a day; sends nothing.</p>%s%s'
+           '<form method=post action="/settings/tor" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Check attackers against the Tor exit list</label>'
+           '<label class="sp-check"><input type=checkbox name=bl value=1%s> Put Tor exits on the blocklist too</label>'
+           '<div class="sp-keyrow"><button>Save</button></div></form>'
+           '<p class="sp-help">A Tor exit is shared by many people, so an attack from one says little about the next visitor: tagged attackers never count as '
+           'coming back, and blocking them mostly blocks Tor users. Your manual Always block still wins. Each blocklist feed can also choose with tor=0 or tor=1.</p></div>'
+           % (sp_status("On", "on") if on else sp_status("Off"), flash("tor"),
+              ('<p class="sp-usage">%s · %s attackers came through Tor</p>' % (
+                  ("%s exit addresses, list updated %s" % (num(int(float(get_meta(con, "tor_count", "0") or 0))), ago(fetched))) if fetched else "list not downloaded yet",
+                  num(tn))) if on else "",
+              lasterr("tor_error"), " checked" if on else "", " checked" if inbl else ""))
+    return vt + mb + gn + hb + nb + tor
 
 
 SETTINGS_SCOPES = ("appearance", "views", "notifications")
@@ -7631,8 +7753,8 @@ class Handler(BaseHTTPRequestHandler):
             tok = get_meta(db(), "feed_token") or ""
             if not hmac.compare_digest(m.group(1), tok):
                 return self.send(404, "Not found", "text/plain")
-            mn, days, research, v6 = bl_params(qs)
-            body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6), v6)
+            mn, days, research, v6, tor = bl_params(qs)
+            body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6, tor), v6)
             return self.send(200, body, ctype + "; charset=utf-8")
         if path == "/login":
             if not get_meta(db(), "pw"):
@@ -7851,6 +7973,23 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "nb_wait_until", "0")
             set_meta(con, "nb_error", "")
             return self.redirect(settings_url("nbon" if on else "nboff"))
+        if path == "/settings/tor":
+            f = self.form()
+            was = tor_tagging(con)
+            set_meta(con, "tor_on", "1" if f.get("on") == "1" else "0")
+            set_meta(con, "tor_bl", "1" if f.get("bl") == "1" else "0")
+            set_meta(con, "tor_wait_until", "0")
+            now_on = tor_tagging(con)
+            if now_on != was:
+                if now_on:
+                    set_meta(con, "tor_fetched", "0")     # the next lookup round downloads the list
+                # Tags follow at once: on from the stored list, off for everyone (the list stays for when it is turned on again).
+                sql = ("SELECT ip FROM ips JOIN tor USING(ip)" if now_on else
+                       "SELECT ip FROM ips WHERE (','||COALESCE(tags,'')||',') LIKE '%,tor,%'")
+                with con:
+                    for (ip,) in con.execute(sql).fetchall():
+                        recompute_ip(con, ip)
+            return self.redirect(settings_url("toron" if now_on and not was else "tor"))
         if path == "/settings/metrics":
             on = self.form().get("on") == "1"
             if on and not get_meta(con, "metrics_token"):

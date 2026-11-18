@@ -107,6 +107,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - country, network, reverse DNS, open ports and known CVEs (from Shodan InternetDB)
   - whether [GreyNoise](https://viz.greynoise.io) knows it as a mass scanner, and a benign one (research scanners stay off the blocklist unless they logged in or ran something)
   - whether [Project Honey Pot](https://www.projecthoneypot.org) lists it as a web spammer, e-mail harvester or suspicious visitor, with its threat score and when it was last seen there (optional, free key)
+  - whether it came through a Tor exit node (the Tor Project's daily exit list): tagged `tor`, never counted as coming back and left off the blocklist unless you choose otherwise
   - its netblock: the announced network block it comes from, the AS and owner behind it, registry and allocation date ([Team Cymru](https://www.team-cymru.com/ip-asn-mapping), no key), how many attackers came from the same block, and a list of the busiest blocks on Campaigns
   - every password they tried
   - every session as a terminal log, plus a **replay** that plays the session back exactly as they saw it
@@ -429,7 +430,7 @@ The restore checks the copy before it touches anything, and keeps the database y
 
 The ipset and MikroTik feeds also clear the IPv6 list, so an address that left the blocklist is removed. A firewall without IPv6 support should fetch the feed with `v6=0`. Addresses an earlier feed added to an IPv6 list then have to be removed by hand.
 
-The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
+The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not, include Tor exit nodes or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
 
 | Format | Use with |
 |---|---|
@@ -456,6 +457,7 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 **Before you block anything:**
 - Attacking addresses are often infected home routers or short-lived servers whose addresses change hands. That is why the feeds only include IPs seen in the last N days.
 - Research scanners (Censys, Shadowserver, BinaryEdge and others) are detected from reverse DNS and network names and left out by default. Anyone who logged in, ran commands, dropped files or tried an exploit is always blocklisted, research network or not.
+- Tor exit nodes are left out by default as well: an attack through Tor says nothing about the next person on the same exit. Include them on Settings, Lookups, or with `tor=1` on one feed. An attacker you set to Always block stays on the list.
 - "Never block" always wins.
 
 ## Personas and bait
@@ -585,7 +587,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.
 - **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
 - **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported.
-- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. Netblock lookups (Team Cymru) are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there.
+- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. The Tor exit list is only downloaded from check.torproject.org once a day; nothing is sent. Netblock lookups (Team Cymru) are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there.
 - **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
 
 **Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.
