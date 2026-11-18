@@ -5,8 +5,20 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.49.0"
+HUGINN_VERSION = "0.49.1"
 CHANGELOG = [
+    ("0.49.1", "2026-11-18", "Fixes from a full code review of everything since 0.25. Sharing: hp-sample-zip reads one file at a time, "
+               "gives each zip a name of its own and prints the hashes that really went in; Huginn marks only those as shared and "
+               "lists only files still on the honeypot. hp-fileinfo hashes the whole file, not the first 8 MB, and stops listing "
+               "deleted files. Numbers: new web rules recompute the tags the old rules gave, a line sent twice counts once against "
+               "the decoy cap, events older than the history limit are not stored again after a restart, a tarpit catch counts "
+               "every day it lasted and a failed download no longer counts as files (both for returned/stepped-up), Tor is "
+               "judged by each listing period, a reused tarpit port no longer hides a stuck connection. Lookups: an odd VirusTotal "
+               "answer is an error instead of \"known\", LAN addresses no longer hold GreyNoise and http:BL back, GreyNoise's "
+               "research verdict counts on the blocklist before the other lookups are done, testing a VirusTotal key stays within "
+               "the daily limit. Settings forms saved at the same time keep both changes, an ntfy alert that failed is sent again, "
+               "an old protection report is no longer shown as all in place, feed tokens stay out of the error log, the CSV export "
+               "says it holds the events only, and the honeypot update checks that the export really finished."),
     ("0.49.0", "2026-11-18", "Share captured malware with Sanesecurity: the Files page lists the files VirusTotal has never seen (every file "
                "when no VirusTotal key is set) and gives the command to run on the honeypot. The new hp-sample-zip packs them into a "
                "zip with the password \"infected\" (the convention malware labs use), each file as <sha256>.bin without an execute bit "
@@ -400,6 +412,7 @@ CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TE
 CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
 CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
 CREATE TABLE IF NOT EXISTS tor(ip TEXT PRIMARY KEY, first REAL, last REAL);
+CREATE TABLE IF NOT EXISTS torp(ip TEXT, first REAL, last REAL, PRIMARY KEY(ip, first));
 CREATE TABLE IF NOT EXISTS shared(sha TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
@@ -788,9 +801,17 @@ def classify_web(con, budget=20.0, limit=5000):
     if not rules:
         return 0
     if get_meta(con, "webrules") != sig:
+        # Attackers whose tags or score came from the old rules are remembered (in meta, so a restart does not lose
+        # them) and recomputed once every request has been matched again: a rule that disappeared takes its tag along.
+        old = {r[0] for r in con.execute("SELECT DISTINCT ip FROM webhits WHERE level IN ('exploit','probe') OR robots=1 OR reply<>''")}
+        try:
+            old |= set(json.loads(get_meta(con, "webrules_redo", "[]") or "[]"))
+        except ValueError:
+            pass
         with con:
             con.execute("DELETE FROM webhits")
             con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('webrules',?)", (sig,))
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('webrules_redo',?)", (json.dumps(sorted(old)),))
     rows = con.execute("SELECT e.h, e.ip, e.ts, e.b FROM events e WHERE e.kind='canary' AND e.a IN ('http','https') "
                        "AND NOT EXISTS (SELECT 1 FROM webhits w WHERE w.h=e.h) ORDER BY e.ts DESC LIMIT ?", (limit,)).fetchall()
     end = time.time() + budget
@@ -802,11 +823,21 @@ def classify_web(con, budget=20.0, limit=5000):
             touched.add(ip)
         if time.time() > end:
             break
-    if out:
+    done = len(out) == len(rows) and len(rows) < limit
+    redo = []
+    if done:
+        try:
+            redo = json.loads(get_meta(con, "webrules_redo", "[]") or "[]")
+        except ValueError:
+            redo = []
+    if out or redo:
         with con:
             con.executemany("INSERT OR IGNORE INTO webhits(h, ip, ts, level, type, cve, sev, rule, robots, reply) VALUES(?,?,?,?,?,?,?,?,?,?)", out)
-            for ip in touched:
-                recompute_ip(con, ip)
+            for ip in touched | set(redo):
+                if con.execute("SELECT 1 FROM ips WHERE ip=?", (ip,)).fetchone():
+                    recompute_ip(con, ip)
+            if done:
+                con.execute("DELETE FROM meta WHERE k='webrules_redo'")
     return len(out)
 
 
@@ -1426,7 +1457,14 @@ def vt_lookup(con, limit=3, pause=16):
         day_spend(con, "vt_day")
         try:
             with api_urlopen(req, timeout=20) as r:
-                a = (json.loads(r.read(4 * 1024 * 1024)).get("data") or {}).get("attributes") or {}
+                d = json.loads(r.read(4 * 1024 * 1024))
+            # Only a file object for this very hash, with attributes, counts as found. Anything else (an empty {} from a
+            # broken proxy or an API change) is an error, not "VirusTotal knows it" (Codex 049 M10).
+            d = d.get("data") if isinstance(d, dict) else None
+            a = d.get("attributes") if isinstance(d, dict) else None
+            if not (isinstance(d, dict) and d.get("type") == "file" and str(d.get("id") or "").lower() == sha
+                    and isinstance(a, dict) and isinstance(a.get("last_analysis_stats"), dict)):
+                raise ValueError("unexpected answer from VirusTotal")
             st = a.get("last_analysis_stats") or {}
             cnt = lambda k: st.get(k) if isinstance(st.get(k), int) and 0 <= st.get(k) < 1000 else 0
             label = str((a.get("popular_threat_classification") or {}).get("suggested_threat_label") or "").lower()
@@ -1446,6 +1484,7 @@ def vt_lookup(con, limit=3, pause=16):
                 set_meta(con, "vt_error", "%s HTTP %s" % (fmt_ts(time.time()), e.code))
                 break
         except Exception as e:
+            set_meta(con, "vt_wait_until", time.time() + 3600)          # odd answers: try again in an hour, keep the old result
             set_meta(con, "vt_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
             break
         v["at"] = int(time.time())
@@ -1543,7 +1582,8 @@ def gn_html(g):
 def sendable_ip(ip):
     # Only public addresses ever go to an outside service (test mode can store LAN addresses).
     try:
-        return ipaddress.ip_address(ip).is_global
+        a = ipaddress.ip_address(ip)
+        return a.is_global and not a.is_multicast      # global unicast only
     except ValueError:
         return False
 
@@ -1557,11 +1597,12 @@ def gn_lookup(con, limit=5):
     now = time.time()
     ips = [r[0] for r in con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN greynoise g USING(ip) WHERE i.last>=? AND (g.ip IS NULL OR g.checked<?) "
-        "ORDER BY (g.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 14 * 86400, min(limit, left)))]
+        "ORDER BY (g.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 14 * 86400, 50 * max(1, min(limit, left))))]
+    # Addresses that are never sent (LAN in test mode) are dropped before the batch is cut, or they would hold the
+    # first places for ever and the public ones behind them would never be asked (Codex 049 M11).
+    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left)]
     done = 0
     for ip in ips:
-        if not sendable_ip(ip):
-            continue
         h = {"User-Agent": UA, "Accept": "application/json"}
         if key:
             h["key"] = key
@@ -1818,11 +1859,10 @@ def hb_lookup(con, limit=20):
     now = time.time()
     ips = [r[0] for r in con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN httpbl h USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%:%' AND (h.ip IS NULL OR h.checked<?) "
-        "ORDER BY (h.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 7 * 86400, min(limit, left)))]
+        "ORDER BY (h.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 7 * 86400, 50 * max(1, min(limit, left))))]
+    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left)]       # see gn_lookup (Codex 049 M11)
     done = 0
     for ip in ips:
-        if not sendable_ip(ip):
-            continue
         day_spend(con, "hb_day")
         try:
             h = hb_parse(hb_query(key, ip, hb_dns(con)))
@@ -1844,6 +1884,7 @@ def hb_lookup(con, limit=20):
 # and is left out of the blocklist unless chosen on Settings. A listing within TOR_WINDOW of the attack counts.
 TOR_URL = "https://check.torproject.org/torbulkexitlist"
 TOR_WINDOW = 30 * 86400
+TOR_GAP = 3 * 86400             # missing from the daily list for longer than this: the next listing is a new period
 TOR_KEEP = 365 * 86400
 TOR_MAX_BYTES = 4_000_000        # about 1,300 addresses today, about 20 KB
 TOR_MAX_ADDRS = 100_000
@@ -1881,8 +1922,12 @@ def tor_parse(text):
 def tor_is(con, ip, last):
     # Decided by the latest activity: it must fall within TOR_WINDOW of the time the address was on the list. A Tor match
     # long ago, or between two attacks, never covers newer traffic (Codex review 047).
-    r = con.execute("SELECT first, last FROM tor WHERE ip=?", (ip,)).fetchone()
-    return bool(r and r[0] - TOR_WINDOW <= last <= r[1] + TOR_WINDOW)
+    # Listed periods are kept apart (0.49.1, Codex 049 M8): an address on the list in January and again in April was not a
+    # Tor exit in between. Before the first refresh with periods, the single first/last row is all there is.
+    rows = con.execute("SELECT first, last FROM torp WHERE ip=?", (ip,)).fetchall()
+    if not rows and get_meta(con, "torp_init") != "1":
+        rows = con.execute("SELECT first, last FROM tor WHERE ip=?", (ip,)).fetchall()
+    return any(a - TOR_WINDOW <= last <= b + TOR_WINDOW for a, b in rows)
 
 
 def tor_get(con, ip):
@@ -1914,9 +1959,16 @@ def tor_refresh(con, force=False):
         set_meta(con, "tor_error", "%s %s" % (fmt_ts(now), str(e)[:120]))
         return None
     with con:
+        if get_meta(con, "torp_init") != "1":        # one time: what the single-row table knew becomes the first period
+            con.execute("INSERT OR IGNORE INTO torp(ip, first, last) SELECT ip, first, last FROM tor")
+            con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('torp_init','1')")
         con.executemany("INSERT INTO tor(ip, first, last) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET last=excluded.last",
                         [(ip, now, now) for ip in listed])
+        for ip in listed:                            # still listed (seen within TOR_GAP): extend; otherwise a new period
+            if not con.execute("UPDATE torp SET last=? WHERE ip=? AND last>=?", (now, ip, now - TOR_GAP)).rowcount:
+                con.execute("INSERT OR IGNORE INTO torp(ip, first, last) VALUES(?,?,?)", (ip, now, now))
         con.execute("DELETE FROM tor WHERE last < ?", (now - TOR_KEEP,))
+        con.execute("DELETE FROM torp WHERE last < ?", (now - TOR_KEEP,))
     affected = {r[0] for r in con.execute("SELECT i.ip FROM ips i JOIN tor t USING(ip)")}
     affected |= {r[0] for r in con.execute("SELECT ip FROM ips WHERE (','||COALESCE(tags,'')||',') LIKE '%,tor,%'")}
     with con:
@@ -2450,6 +2502,13 @@ def return_info(con, ip, n=None):
                             "WHERE ip=? AND start IS NOT NULL", (ip,)):
         if a is not None:
             days.update(range(a, max(a, min(b if b is not None else a, a + 366)) + 1))
+    # A tarpit catch is logged when it ends, with how long it lasted: the days in between count as being there (Codex 049 M7).
+    for ts, secs in con.execute("SELECT ts, a FROM events WHERE ip=? AND kind='tarpit'", (ip,)):
+        try:
+            end, dur = float(ts), min(max(float(secs or 0), 0.0), 366 * 86400.0)
+        except (TypeError, ValueError):
+            continue
+        days.update(range(int((end - dur) // 86400), int(end // 86400) + 1))
     days = sorted(days)
     back = None
     for a, b in zip(days, days[1:]):
@@ -2457,10 +2516,13 @@ def return_info(con, ip, n=None):
             back = (b - a - 1, b * 86400.0)
     if not back:
         return None
-    q = ("SELECT COALESCE(SUM(logins_ok),0), COALESCE(SUM(cmds),0), COALESCE(SUM(tcpip),0), COALESCE(SUM(files),0), COUNT(*) "
-         "FROM sessions WHERE ip=? AND start %s ?")
-    return (back[0], back[1], work_level(con.execute(q % "<", (ip, back[1])).fetchone()),
-            work_level(con.execute(q % ">=", (ip, back[1])).fetchone()))
+    # Files = files really captured. The sessions' file count also holds failed downloads (file_fail), which are only
+    # an attempt and must not lift the level to "left files" (Codex 049 M21).
+    q = ("SELECT COALESCE(SUM(logins_ok),0), COALESCE(SUM(cmds),0), COALESCE(SUM(tcpip),0), "
+         "(SELECT COUNT(*) FROM events WHERE ip=?1 AND kind='file' AND ts %s ?2), COUNT(*) "
+         "FROM sessions WHERE ip=?1 AND start %s ?2")
+    return (back[0], back[1], work_level(con.execute(q % ("<", "<"), (ip, back[1])).fetchone()),
+            work_level(con.execute(q % (">=", ">="), (ip, back[1])).fetchone()))
 
 
 def recompute_ip(con, ip):
@@ -2515,6 +2577,11 @@ def retry_seen(con):
 
 
 def store(con, rows):
+    if rows and RETENTION_DAYS > 0:
+        # Older than the history limit: retention would delete it again, and storing it would count it as new (Codex 049 M3).
+        # The export can still send such lines after a restart, when the in-memory skip set starts empty.
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        rows = [r for r in rows if r[1] >= cutoff]
     if not rows:
         retry_seen(con)
         return 0
@@ -2616,18 +2683,25 @@ def decoy_keep(svc, b, memo):
     return memo[b]
 
 
+CAPPED_SEEN_DAYS = 15
+
+
 def cap_rows(con, rows):
     # Decoy events beyond DECOY_CAP per IP, service and day are counted in `capped`, not stored, unless they hold something
     # that matters (decoy_keep). The export sends the newest lines again on every sync, so a row is known by its hash:
-    # stored ones are in events, counted ones in capped_seen (kept for 3 days). `upto` = newest activity, also when dropped.
+    # stored ones are in events, counted ones in capped_seen (kept CAPPED_SEEN_DAYS). `upto` = newest activity, also when dropped.
     if DECOY_CAP <= 0:
         return rows
     out, state, dirty, memo, dropped = [], {}, set(), {"_con": con}, []
     since = float(get_meta(con, "capped_seen_since", "0") or 0)
+    batch = set()
     for r in rows:
         if r[4] != "canary":
             out.append(r)
             continue
+        if r[0] in batch:                        # the same line twice in one export counts once (Codex 049 M2)
+            continue
+        batch.add(r[0])
         if con.execute("SELECT 1 FROM events WHERE h=?", (r[0],)).fetchone() or \
                 con.execute("SELECT 1 FROM capped_seen WHERE h=?", (r[0],)).fetchone():
             continue
@@ -2733,7 +2807,8 @@ def retention(con):
         con.execute("DELETE FROM logins WHERE expires < ?", (time.time(),))
         # Cap state is only needed while the export can send a day again; the rows that dropped something stay as the count.
         con.execute("DELETE FROM capped WHERE dropped=0 AND day < ?", (utc_day(time.time() - 14 * 86400),))
-        con.execute("DELETE FROM capped_seen WHERE ts < ?", (time.time() - 3 * 86400,))
+        # As long as the export can send a line again (OpenCanary keeps 14 daily logs), or a counted row is counted twice.
+        con.execute("DELETE FROM capped_seen WHERE ts < ?", (time.time() - CAPPED_SEEN_DAYS * 86400,))
         con.execute("DELETE FROM ids_seen WHERE ts < ?", (time.time() - IDS_MAX_AGE - 86400,))
     if RETENTION_DAYS == 0:          # keep the whole history
         con.execute("PRAGMA optimize")
@@ -3020,6 +3095,13 @@ def protection_status(con):
         return None, 0
 
 
+def log_path(path):
+    # A path for the error log without anything secret: feed tokens live in the path or the query (Codex 049 L7).
+    p = (path or "").split("?", 1)[0]
+    p = re.sub(r"^/feed/[^/]+", "/feed/<token>", p)
+    return p[:300]
+
+
 def protection_missing(con):
     items, at = protection_status(con)
     if not items or time.time() - at > 3600:          # nothing reported recently: the sync check covers that
@@ -3044,6 +3126,11 @@ def protection_note(con):
            " · logout note %s" % ("on" if items["option:goodbye"] else "off (update-honeypot.sh --goodbye-on)"))
     if missing:
         return '<span class="err">missing: %s</span> · reported %s%s' % (esc(", ".join(protection_label(k) for k in missing)), esc(ago(at)), esc(bye))
+    # An old report says nothing about now: show what it said, never "all in place" (Codex 049 L8).
+    if time.time() - at > 3600:
+        old = sorted(k for k, ok in items.items() if not ok and not k.startswith("option:"))
+        return '<span class="err">no recent report</span> (last %s%s)%s' % (
+            esc(ago(at)), (": missing " + esc(", ".join(protection_label(k) for k in old))) if old else "", esc(bye))
     return "all in place: %s · reported %s%s" % (esc(ok), esc(ago(at)), esc(bye))
 
 
@@ -3195,7 +3282,7 @@ def human_like(con, sid):
     return human_gaps([r[0] for r in con.execute("SELECT ts FROM events WHERE session=? AND kind='cmd' ORDER BY ts", (sid,))])
 
 
-def returned_news(con, since):
+def returned_news(con, since, save=True):
     # Attackers that came back and got further than before, not told yet: [(ip, level after)]. One alert per IP and return.
     try:
         told = json.loads(get_meta(con, "ntfy_returned", "{}") or "{}")
@@ -3210,10 +3297,15 @@ def returned_news(con, since):
         if back and back[3] > back[2] and told.get(ip) != back[1]:
             told[ip] = back[1]
             out.append((ip, back[3]))
-    if out:
-        keep = sorted(told.items(), key=lambda kv: kv[1])[-2000:]       # bounded: the oldest returns are forgotten first
-        set_meta(con, "ntfy_returned", json.dumps(dict(keep)))
+    if out and save:
+        save_told(con, told)
+    returned_news.told = told
     return out
+
+
+def save_told(con, told):
+    keep = sorted(told.items(), key=lambda kv: kv[1])[-2000:]       # bounded: the oldest returns are forgotten first
+    set_meta(con, "ntfy_returned", json.dumps(dict(keep)))
 
 
 def notify(con):
@@ -3227,7 +3319,7 @@ def notify(con):
     if not last:
         set_meta(con, "ntfy_last", now)
         return
-    if now - last < NOTIFY_EVERY:
+    if now - last < NOTIFY_EVERY or float(get_meta(con, "ntfy_retry_at", "0") or 0) > now:
         return
     lines, prio = [], 3
     rows = con.execute("SELECT ip,kind,a,b FROM events WHERE ts>? AND kind IN ('cmd','login_ok','login_fail','canary')", (last,)).fetchall()
@@ -3267,15 +3359,26 @@ def notify(con):
     if sshole and "exploit" in ev:
         lines.append("SSHole probes from %d IP(s)" % sshole)
     if "returned" in ev:
-        stepped = returned_news(con, last)
+        stepped = returned_news(con, last, save=False)       # remembered only once the alert is out
         if stepped:
             prio = 4
             lines.append("Came back and got further: " + ", ".join("%s (%s)" % (ip, WORK_LEVELS[lv]) for ip, lv in stepped[:5])
                          + (" +%d" % (len(stepped) - 5) if len(stepped) > 5 else ""))
-    set_meta(con, "ntfy_last", now)
     if not lines:
+        set_meta(con, "ntfy_last", now)
         return
-    ntfy_post("\n".join(lines), "Huginn: honeypot activity", prio)
+    # The period counts as told only when ntfy took the message. A failure keeps it, and the next try comes after 10 minutes
+    # with the same period (plus whatever happened since), so a short ntfy outage loses nothing (Codex 049 M18).
+    try:
+        ntfy_post("\n".join(lines), "Huginn: honeypot activity", prio)
+    except Exception as e:
+        set_meta(con, "ntfy_retry_at", now + 600)
+        set_meta(con, "ntfy_error", "%s %s" % (fmt_ts(now), str(e)[:120]))
+        return
+    set_meta(con, "ntfy_last", now)
+    set_meta(con, "ntfy_error", "")
+    if "returned" in ev and stepped:
+        save_told(con, returned_news.told)
     set_meta(con, "last_notify", "%s: %s" % (fmt_ts(now), " | ".join(lines))[:500])
 
 
@@ -4477,9 +4580,23 @@ def time_wasted(con, since):
         for r in top:
             r["cc"] = cc.get(r["ip"])
     # Stuck right now: ACCEPT without a matching CLOSE (same IP and source port) in the last 2 days.
-    opens = con.execute("SELECT ip, a FROM events WHERE kind='tarpit_open' AND ts>=?", (time.time() - 2 * 86400,)).fetchall()
-    closed = {(r[0], r[1]) for r in con.execute("SELECT ip, b FROM events WHERE kind='tarpit' AND b IS NOT NULL AND ts>=?", (time.time() - 2 * 86400,))}
-    stuck = sum(1 for ip, port in opens if (ip, port) not in closed)
+    # Stuck = an opening with no later close from the same address and port. Matched in time order, so a port that is
+    # used again does not hide the new connection behind the old one's close (Codex 049 L2).
+    since2 = time.time() - 2 * 86400
+    ev = {}
+    for ts, ip, port, kind in con.execute("SELECT ts, ip, a, 'o' FROM events WHERE kind='tarpit_open' AND ts>=? UNION ALL "
+                                          "SELECT ts, ip, b, 'c' FROM events WHERE kind='tarpit' AND b IS NOT NULL AND ts>=? "
+                                          "ORDER BY 1", (since2, since2)):
+        ev.setdefault((ip, port), []).append(kind)
+    stuck = 0
+    for seq in ev.values():
+        open_ = 0
+        for k in seq:
+            if k == "o":
+                open_ += 1
+            elif open_:
+                open_ -= 1
+        stuck += open_
     longest = max(rows, key=lambda r: r["longest"], default=None)    # over all rows, like the totals; the address may be hidden
     return {"tarpit": sum(r["tarpit"] for r in rows), "shell": sum(r["shell"] for r in rows),
             "total": sum(r["total"] for r in rows), "top": top, "stuck": stuck,
@@ -4914,14 +5031,14 @@ def v_ip(ip, qs=None):
     nbr = nb_get(con, ip)
     now = time.time()
     tags = r["tags"] or ""
-    if e and e["research"]:
+    if (e and e["research"]) or (not e and research_now(con, ip, base=0)):
         tags += ",research"
     if f:
         tags += "," + f["flag"]
 
     # Summary
     links = " · ".join(['<a href="/ip/%s/export.json">Export JSON</a>' % esc(urllib.parse.quote(ip)),
-                        '<a href="/ip/%s/export.csv">Export CSV</a>' % esc(urllib.parse.quote(ip)),
+                        '<a href="/ip/%s/export.csv" title="Only the raw events: lookups, IDS alerts and sessions are in the JSON export">Export events (CSV)</a>' % esc(urllib.parse.quote(ip)),
                         ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
                         ext("https://ipinfo.io/" + ip, "ipinfo"), ext("https://www.projecthoneypot.org/ip_" + ip, "Project Honey Pot"),
@@ -5816,6 +5933,7 @@ def v_search(qs):
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SHARE_MAX = 50          # hp-sample-zip takes at most this many files per zip
 SHARE_URL = "https://sanesecurity.com/contact-us/"
+SHARE_FRESH = 86400     # a file counts as still on the honeypot if the export listed it within this time
 
 
 def share_candidates(con, shas, fi, vts):
@@ -5823,9 +5941,12 @@ def share_candidates(con, shas, fi, vts):
     # VirusTotal key to tell. Only files hp-fileinfo has looked at (still on the honeypot); already shared ones are left out.
     shared = {r[0] for r in con.execute("SELECT sha FROM shared")}
     have_vt = bool(vt_key())
+    fresh = time.time() - SHARE_FRESH
     out = []
     for sha in shas:
         if sha in shared or sha not in fi or not SHA256_RE.fullmatch(sha):
+            continue
+        if (fi[sha]["updated"] or 0) < fresh:       # no longer in hp-fileinfo's export: deleted from the honeypot
             continue
         v = vts.get(sha)
         if have_vt and not (v is not None and not v.get("found")):
@@ -5848,10 +5969,13 @@ def share_card(con, shas, fi, vts, fam=""):
         cmd = "hp-sample-zip " + " ".join(pick)
         body = ('<p>%s file%s %s%s%s.</p><div class="feed"><div class="feed-h"><b>On the honeypot</b><button class="btn-s" data-copy="%s">Copy</button></div>'
                 '<div class="mono url">%s</div></div>'
-                '<form method=post action="/files/shared"><input type=hidden name=shas value="%s"><button>Mark %s as shared</button></form>'
+                '<form method=post action="/files/shared" class="pwcheck"><input name=shas required autocomplete=off '
+                'placeholder="Paste the line that starts with included:" aria-label="Hashes that went into the zip"> <button>Mark as shared</button></form>'
+                '<p class="muted small">After sending the zip, paste the <b>included:</b> line hp-sample-zip printed. Only the hashes '
+                'that really went into the zip are marked; a file missing on the honeypot stays in the list.</p>'
                 % (num(len(cand)), "" if len(cand) == 1 else "s", esc(what), (" (%s only)" % esc("unknown family" if fam == "unknown" else fam)) if fam else "",
                    (", the first %d in this command" % SHARE_MAX) if len(cand) > SHARE_MAX else "",
-                   esc(cmd), esc(cmd), esc(" ".join(pick)), "it" if len(pick) == 1 else "these %d" % len(pick)))
+                   esc(cmd), esc(cmd)))
     undo = ""
     if n_shared:
         last = con.execute("SELECT sha FROM shared ORDER BY ts DESC LIMIT 1").fetchone()[0]
@@ -5861,7 +5985,8 @@ def share_card(con, shas, fi, vts, fam=""):
 
 
 def mark_shared(con, raw, on=True):
-    shas = [x for x in (raw or "").lower().split() if SHA256_RE.fullmatch(x)][:SHARE_MAX]
+    raw = (raw or "").lower().replace("included:", " ").replace(",", " ")
+    shas = [x for x in raw.split() if SHA256_RE.fullmatch(x)][:SHARE_MAX]
     with con:
         for sha in shas:
             if on:
@@ -6323,16 +6448,18 @@ def blocklist_ips(con, min_score, days, research, v6, tor=None):
     tor = tor_bl(con) if tor is None else tor
     since = time.time() - days * 86400
     rows = con.execute(
-        "SELECT i.ip, (','||COALESCE(i.tags,'')||',' LIKE '%,tor,%' AND COALESCE(f.flag,'')!='block') via_tor, COALESCE(e.research,0) AND COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
+        "SELECT i.ip, (','||COALESCE(i.tags,'')||',' LIKE '%,tor,%' AND COALESCE(f.flag,'')!='block') via_tor, COALESCE(e.research,-1) rs, COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,web-exploit,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,took-bait,%' "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,read-bait,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,sshole-probe,%' maybe "
         "FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
         "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=?))",
         (since, min_score)).fetchall()
     out = []
-    for ip, via_tor, maybe in rows:
+    for ip, via_tor, rs, quiet in rows:
         if via_tor and not tor:
             continue
+        # No name/network lookup yet: GreyNoise may already know it is a benign scanner (Codex 049 M12).
+        maybe = quiet and (rs == 1 or (rs == -1 and research_now(con, ip, base=0)))
         # A scanner by name, and nothing but looking around: left out, unless it tried to log in to a decoy service.
         if maybe and not research and not any(canary_is_login(s, b) for s, b in con.execute("SELECT a,b FROM events WHERE ip=? AND kind='canary' AND b LIKE '% / %'", (ip,))):
             continue
@@ -7142,41 +7269,44 @@ def save_settings(f, lists):
     if scope and scope not in SETTINGS_SCOPES:
         return False
     every = not scope
-    st = settings()
-    if every or scope == "appearance":
-        if f.get("theme") in THEMES:
-            st["theme"] = f["theme"]
-        if f.get("accent") in ACCENTS:
-            st["accent"] = f["accent"]
-        if f.get("density") in ("comfortable", "compact"):
-            st["density"] = f["density"]
-        title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
-        st["title"] = title or "Huginn"
-        if f.get("clock") in ("24", "12"):
-            st["clock"] = f["clock"]
-    if every or scope == "views":
-        st["cards"] = [k for k, _ in CARDS if k in lists.get("cards", [])]
-        if f.get("ips_days") in ("1", "7", "30", "90", "all"):
-            st["ips_days"] = f["ips_days"]
-        if f.get("bl_min") in ("1", "3", "5", "10", "15", "25"):
-            st["bl_min"] = int(f["bl_min"])
-        if f.get("bl_days") in ("1", "7", "30", "90", "365"):
-            st["bl_days"] = int(f["bl_days"])
-        st["ips_cols"] = [k for k, *_ in IPS_COLS if k in lists.get("ips_cols", [])]
-        cc, asn = [], []
-        for tok in re.split(r"[\s,;]+", (f.get("hidden_nets") or "").upper())[:100]:
-            if re.fullmatch(r"[A-Z]{2}", tok):
-                cc.append(tok)
-            elif re.fullmatch(r"(AS)?\d{1,10}", tok):
-                asn.append(tok.lstrip("AS"))
-        st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
-        if (f.get("return_days") or "").isdigit() and (int(f["return_days"]) in RETURN_CHOICES or int(f["return_days"]) == RETURN_DAYS):
-            st["return_days"] = int(f["return_days"])
-    if every or scope == "notifications":
-        st["notify"] = f.get("notify") == "1"
-        st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
     con = db()
-    set_meta(con, "settings", json.dumps(st))
+    # Read, change and write in one write transaction: two forms saved at the same time cannot undo each other (Codex 049 M14).
+    with con:
+        con.execute("BEGIN IMMEDIATE")
+        st = settings(con)
+        if every or scope == "appearance":
+            if f.get("theme") in THEMES:
+                st["theme"] = f["theme"]
+            if f.get("accent") in ACCENTS:
+                st["accent"] = f["accent"]
+            if f.get("density") in ("comfortable", "compact"):
+                st["density"] = f["density"]
+            title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
+            st["title"] = title or "Huginn"
+            if f.get("clock") in ("24", "12"):
+                st["clock"] = f["clock"]
+        if every or scope == "views":
+            st["cards"] = [k for k, _ in CARDS if k in lists.get("cards", [])]
+            if f.get("ips_days") in ("1", "7", "30", "90", "all"):
+                st["ips_days"] = f["ips_days"]
+            if f.get("bl_min") in ("1", "3", "5", "10", "15", "25"):
+                st["bl_min"] = int(f["bl_min"])
+            if f.get("bl_days") in ("1", "7", "30", "90", "365"):
+                st["bl_days"] = int(f["bl_days"])
+            st["ips_cols"] = [k for k, *_ in IPS_COLS if k in lists.get("ips_cols", [])]
+            cc, asn = [], []
+            for tok in re.split(r"[\s,;]+", (f.get("hidden_nets") or "").upper())[:100]:
+                if re.fullmatch(r"[A-Z]{2}", tok):
+                    cc.append(tok)
+                elif re.fullmatch(r"(AS)?\d{1,10}", tok):
+                    asn.append(tok.lstrip("AS"))
+            st["hide_cc"], st["hide_asn"] = sorted(set(cc)), sorted(set(asn))
+            if (f.get("return_days") or "").isdigit() and (int(f["return_days"]) in RETURN_CHOICES or int(f["return_days"]) == RETURN_DAYS):
+                st["return_days"] = int(f["return_days"])
+        if every or scope == "notifications":
+            st["notify"] = f.get("notify") == "1"
+            st["notify_events"] = [k for k, _ in NOTIFY_EVENTS if k in lists.get("notify_events", [])]
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('settings',?)", (json.dumps(st),))
     if get_meta(con, "returned_days") != str(return_days(con)):
         recheck_returned(con)
     return True
@@ -7761,7 +7891,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.route_get()
         except Exception as e:
-            log("error", "http_error", repr(e), method="GET", path=self.path[:300])
+            log("error", "http_error", repr(e), method="GET", path=log_path(self.path))
             self.close_connection = True
             self.send(500, "Internal error", "text/plain")
         finally:
@@ -7772,7 +7902,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.route_post()
         except Exception as e:
-            log("error", "http_error", repr(e), method="POST", path=self.path[:300])
+            log("error", "http_error", repr(e), method="POST", path=log_path(self.path))
             self.close_connection = True
             self.send(500, "Internal error", "text/plain")
         finally:
@@ -7968,27 +8098,34 @@ class Handler(BaseHTTPRequestHandler):
             scope = f.get("scope", "")
             return self.redirect(settings_url(scope if scope in SETTINGS_SCOPES else "1"))
         if path == "/settings/theme":
-            st = settings(con)
-            st["theme"] = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
-            set_meta(con, "settings", json.dumps(st))
+            with con:
+                con.execute("BEGIN IMMEDIATE")
+                st = settings(con)
+                st["theme"] = THEMES[(THEMES.index(st["theme"]) + 1) % 3] if st["theme"] in THEMES else "auto"
+                con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('settings',?)", (json.dumps(st),))
             return self.redirect(self.back())
         if path == "/settings/overview":
             view = self.form().get("view")
             if view in ("cards", "board"):
-                st = settings(con)
-                st["overview"] = view
-                set_meta(con, "settings", json.dumps(st))
+                with con:
+                    con.execute("BEGIN IMMEDIATE")
+                    st = settings(con)
+                    st["overview"] = view
+                    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('settings',?)", (json.dumps(st),))
             return self.redirect("/")
         if path == "/settings/virustotal":
             key = (self.form().get("key") or "").strip().lower()
             if not VT_KEY_RE.fullmatch(key):
                 return self.send(400, v_settings(at="virustotal", err="That does not look like a VirusTotal API key (64 characters, 0-9 and a-f)."))
+            # The test is a lookup too: it is booked before it is made and never goes past the daily limit (Codex 049 L5).
+            if day_budget(con, "vt_day", VT_DAILY)[0] <= 0:
+                return self.send(429, v_settings(at="virustotal", err="Today's VirusTotal allowance is used up, so the key cannot be tested. Try again tomorrow (UTC)."))
+            day_spend(con, "vt_day")
             res = vt_test(key)
             if res == "bad":
                 return self.send(400, v_settings(at="virustotal", err="VirusTotal refused that key. Nothing was saved."))
             if res == "error":
                 return self.send(502, v_settings(at="virustotal", err="Could not reach VirusTotal to test the key. Nothing was saved, try again."))
-            day_spend(con, "vt_day")
             set_meta(con, "vt_key", key)
             set_meta(con, "vt_wait_until", "0")
             set_meta(con, "vt_error", "")

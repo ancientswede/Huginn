@@ -228,6 +228,9 @@ else
 fi
 
 say "Check"
-N=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || true)
-[ "$N" -ge 7 ] && ok "hp-export works ($N sections)" || { warn "hp-export printed $N sections (expected 7)"; FAILED=1; }
+# A whole export: it must end with ##END and exit 0, the same test Huginn's collector uses (Codex 049 L1).
+OUT=$(sleep 30 | timeout 60 /usr/local/bin/hp-export) && RC=0 || RC=$?
+N=$(printf '%s\n' "$OUT" | grep -c '^##' || true)
+if [ "$RC" = 0 ] && [ "$N" -ge 7 ] && printf '%s\n' "$OUT" | grep -qx '##END'; then ok "hp-export works ($N sections)"
+else warn "hp-export did not finish cleanly (exit $RC, $N sections, end marker $(printf '%s\n' "$OUT" | grep -qx '##END' && echo found || echo missing))"; FAILED=1; fi
 [ "$FAILED" = 0 ] && echo -e "\n    Done. Previous files are in $B" || die "Something needs a look (see above). Previous files are in $B"

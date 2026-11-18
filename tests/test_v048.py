@@ -24,12 +24,13 @@ class FakeResp(io.BytesIO):
 def clean(con):
     with con:
         con.execute("DELETE FROM tor")
+        con.execute("DELETE FROM torp")
         for ip in (TOR_IP, OTHER):
             con.execute("DELETE FROM ips WHERE ip=?", (ip,))
             con.execute("DELETE FROM sessions WHERE ip=?", (ip,))
             con.execute("DELETE FROM events WHERE ip=?", (ip,))
             con.execute("DELETE FROM flags WHERE ip=?", (ip,))
-        for k in ("tor_on", "tor_bl", "tor_fetched", "tor_count", "tor_error", "tor_wait_until"):
+        for k in ("tor_on", "tor_bl", "tor_fetched", "tor_count", "tor_error", "tor_wait_until", "torp_init"):
             con.execute("DELETE FROM meta WHERE k=?", (k,))
 
 

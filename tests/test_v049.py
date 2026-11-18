@@ -85,7 +85,7 @@ class SampleZip(unittest.TestCase):
         a = self.put(hashlib.sha256(SCRIPT).hexdigest(), SCRIPT)
         rc, out, _ = self.run_tool(a, "c" * 64)
         self.assertEqual(rc, 0)
-        self.assertIn("not found: " + "c" * 64, out)
+        self.assertIn("not included: " + "c" * 64, out)
 
     def test_dirs_from_conf(self):
         os.environ.pop("HP_DOWNLOAD_DIRS")

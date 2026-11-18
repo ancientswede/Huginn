@@ -67,7 +67,7 @@ class VirusTotal(unittest.TestCase):
         return n, f
 
     def test_found_and_novel(self):
-        found = {"data": {"attributes": {"last_analysis_stats": {"malicious": 41, "suspicious": 2, "undetected": 19, "harmless": 0},
+        found = {"data": {"type": "file", "id": SHA1, "attributes": {"last_analysis_stats": {"malicious": 41, "suspicious": 2, "undetected": 19, "harmless": 0},
                                          "popular_threat_classification": {"suggested_threat_label": "trojan.mirai/gafgyt"},
                                          "first_submission_date": 1700000000}}}
         n, f = self.run_lookup({SHA1: found, SHA2: 404})
@@ -111,9 +111,9 @@ class VirusTotal(unittest.TestCase):
             app.VT_KEY = old
 
     def test_bad_values_dropped(self):
-        weird = {"data": {"attributes": {"last_analysis_stats": {"malicious": "<b>9</b>", "undetected": -5},
+        weird = {"data": {"type": "file", "id": SHA1, "attributes": {"last_analysis_stats": {"malicious": "<b>9</b>", "undetected": -5},
                                          "popular_threat_classification": {"suggested_threat_label": "<script>alert(1)</script>"}}}}
-        self.run_lookup({SHA1: weird, SHA2: weird})
+        self.run_lookup({SHA1: weird, SHA2: dict(weird, data=dict(weird["data"], id=SHA2))})
         v = app.vt_get(SHA1, self.con)
         self.assertEqual((v["mal"], v["total"], v["label"]), (0, 0, ""))
         self.assertEqual(app.vt_family({"label": "../../etc"}), "")

@@ -550,8 +550,10 @@ if [ "$WITH_SURICATA" = yes ]; then
   say "Suricata IDS"
   bash "$HERE/honeypot/setup-suricata.sh" on || warn "Suricata not set up (the honeypot works without it): ./update-honeypot.sh --suricata-on later"
 fi
-SECTIONS=$(sleep 30 | timeout 60 /usr/local/bin/hp-export | grep -c '^##' || true)
-[ "$SECTIONS" -ge 7 ] && ok "hp-export works ($SECTIONS sections)" || warn "hp-export printed $SECTIONS sections (expected 7)"
+OUT=$(sleep 30 | timeout 60 /usr/local/bin/hp-export) && RC=0 || RC=$?
+SECTIONS=$(printf '%s\n' "$OUT" | grep -c '^##' || true)
+if [ "$RC" = 0 ] && [ "$SECTIONS" -ge 7 ] && printf '%s\n' "$OUT" | grep -qx '##END'; then ok "hp-export works ($SECTIONS sections)"
+else warn "hp-export did not finish cleanly (exit $RC, $SECTIONS sections)"; fi
 
 # ------------------------------------------------------------------ summary
 say "Done"
