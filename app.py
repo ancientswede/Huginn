@@ -7,116 +7,221 @@
 
 HUGINN_VERSION = "0.50.1"
 CHANGELOG = [
-    ("0.50.1", "2026-11-18", "Search is about twice as fast on common words (measured on a real database of 650,000 events: 0.43 s down "
-               "to 0.22 s): the shape of a command is worked out once per text instead of once per attacker, and the decoy "
-               "results are counted in the same pass that finds them."),
-    ("0.50.0", "2026-11-18", "Second part of the full code review. The honeypot no longer reads as root what a service user could "
-               "redirect: logs, patch checks and captured files are read after dropping to the user who owns them (new "
-               "hp-readlogs; hp-sample-zip reads in a child process). Logs are read from the end and reading stops once there "
-               "is enough, instead of the whole rotated history on every sync. The IDS switch takes the same lock as rule "
-               "updates and is only on when engine and rule timer both run (the export now reports the timer too). A new "
-               "Suricata config is tested before use and the previous one comes back if the engine will not start. Cowrie and "
-               "OpenCanary upgrades go back to the version that ran before when the install or Huginn's patches fail. The "
-               "Huginn update checks every step of a rollback. One broken field in the export (text SQLite cannot store, "
-               "JSON nested too deep) no longer stops the whole sync. Board and the Overview numbers are kept for up to 5 "
-               "minutes instead of being rebuilt after every sync, and the password index no longer counts every login to "
-               "see whether anything changed. hp-add-huginn-key refuses a key that is already there with other options."),
-    ("0.49.1", "2026-11-18", "Fixes from a full code review of everything since 0.25. Sharing: hp-sample-zip reads one file at a time, "
-               "gives each zip a name of its own and prints the hashes that really went in; Huginn marks only those as shared and "
-               "lists only files still on the honeypot. hp-fileinfo hashes the whole file, not the first 8 MB, and stops listing "
-               "deleted files. Numbers: new web rules recompute the tags the old rules gave, a line sent twice counts once against "
-               "the decoy cap, events older than the history limit are not stored again after a restart, a tarpit catch counts "
-               "every day it lasted and a failed download no longer counts as files (both for returned/stepped-up), Tor is "
-               "judged by each listing period, a reused tarpit port no longer hides a stuck connection. Lookups: an odd VirusTotal "
-               "answer is an error instead of \"known\", LAN addresses no longer hold GreyNoise and http:BL back, GreyNoise's "
-               "research verdict counts on the blocklist before the other lookups are done, testing a VirusTotal key stays within "
-               "the daily limit. Settings forms saved at the same time keep both changes, an ntfy alert that failed is sent again, "
-               "an old protection report is no longer shown as all in place, feed tokens stay out of the error log, the CSV export "
-               "says it holds the events only, and the honeypot update checks that the export really finished."),
-    ("0.49.0", "2026-11-18", "Share captured malware with Sanesecurity: the Files page lists the files VirusTotal has never seen (every file "
-               "when no VirusTotal key is set) and gives the command to run on the honeypot. The new hp-sample-zip packs them into a "
-               "zip with the password \"infected\" (the convention malware labs use), each file as <sha256>.bin without an execute bit "
-               "and a manifest. Nothing is executed and the files never leave the honeypot unless you send the zip. Mark as shared "
-               "tags them so the list only shows what is left (undo per file). The attacker page links to Cisco Talos' reputation "
-               "lookup. From a LinkedIn comment."),
-    ("0.48.0", "2026-11-18", "Tor exit nodes: once a day Huginn downloads the Tor Project's list of exit addresses (nothing is sent) and tags "
-               "attackers that came through one \"tor\". Such an address is shared by many people, so it never counts as returned or "
-               "stepped-up, and it is left out of the blocklist and its feeds unless you choose otherwise on Settings, Lookups (or "
-               "tor=1 on a feed); Always block still wins. The tag can be filtered on, and the JSON export says when the address was "
-               "listed. On by default. From a LinkedIn comment. Also from a code review: whether an attacker came through Tor is decided "
-               "by its latest activity, a Tor list that is too large is refused whole, and attackers removed by the history limit "
-               "no longer count towards their netblock."),
+    ('0.50.1', '2026-11-18',
+     'Faster Search.\n'
+     '- About twice as fast on common words (0.43 s to 0.22 s on 650,000 events)'),
+    ('0.50.0', '2026-11-18',
+     'Second part of the full code review.\n'
+     '- The honeypot reads logs, patch checks and captured files as the user who owns them, never as root\n'
+     '- Logs are read from the end, so a long history is not read on every sync\n'
+     '- IDS switch: same lock as rule updates, and only on when engine and rule timer both run\n'
+     '- A new Suricata config is tested first; the old one comes back if the engine will not start\n'
+     '- Failed Cowrie or OpenCanary upgrades go back to the version that ran before\n'
+     '- One broken field in the export no longer stops the whole sync\n'
+     '- Board and Overview numbers are kept for up to 5 minutes\n'
+     '- hp-add-huginn-key refuses a key that is already there with other options'),
+    ('0.49.1', '2026-11-18',
+     'Fixes from a full code review of everything since 0.25.\n'
+     '- Sharing: hp-sample-zip prints the hashes that went into the zip; paste them to mark them as shared\n'
+     '- Files deleted from the honeypot leave the share list, and large files get the right hash\n'
+     '- New web rules remove tags the old rules gave\n'
+     '- Decoy cap: a line sent twice counts once, and old events are not stored again after a restart\n'
+     '- returned/stepped-up: tarpit time counts as being there, a failed download is not a payload\n'
+     '- Tor is judged per listing period\n'
+     '- Odd VirusTotal answers count as errors, not as known files\n'
+     '- GreyNoise and http:BL are no longer held back by LAN addresses\n'
+     '- Settings forms saved at the same time keep both changes\n'
+     '- A failed ntfy alert is sent again\n'
+     '- Feed tokens stay out of the error log'),
+    ('0.49.0', '2026-11-18',
+     'Share captured malware with Sanesecurity.\n'
+     '- Files lists what VirusTotal has never seen and gives a command for the honeypot\n'
+     '- hp-sample-zip packs those files into a zip with the password "infected", ready to send\n'
+     '- Nothing is run, and nothing leaves the honeypot unless you send the zip\n'
+     '- Mark as shared keeps the list to what is left\n'
+     '- The attacker page links to Cisco Talos\n'
+     '- From a LinkedIn comment'),
+    ('0.48.0', '2026-11-18',
+     'Tor exit nodes.\n'
+     "- The Tor Project's exit list is fetched once a day; nothing is sent\n"
+     '- Attackers that came through Tor are tagged tor\n'
+     '- They never count as returned and stay off the blocklist unless you choose otherwise (Settings, Lookups)\n'
+     '- On by default. From a LinkedIn comment'),
     ("0.47.1", "2026-11-17", "Campaigns has a tab per grouping (command scripts, SSH clients, netblocks, web attacks, IDS alerts, mail clients, "
                "proxy use, slow replies) with how many rows each holds, instead of one long page to scroll. The tab you chose is "
                "remembered and can be linked to (#c-netblocks). Without JavaScript the tabs jump to their section as before."),
-    ("0.47.0", "2026-11-17", "Netblocks: every attacker is looked up with Team Cymru's free IP-to-ASN service (over DNS, no key): the announced "
-               "network block it comes from, the AS that announces it, owner, registry and the date the block was allocated. The attacker "
-               "page shows the block and how many attackers came from it, with a link to all of them. Attackers can be filtered by "
-               "block and get an optional Netblock column, Campaigns lists the blocks with more than one attacker (owner, how many are "
-               "active this week and how many came back), and the JSON export has it too. On by default, through the system resolver; "
-               "turn it off or pick a DNS server on Settings, Lookups. From a LinkedIn comment."),
-    ("0.46.2", "2026-11-17", "Fixes from a code review. \"returned\" counts every day the address did something (commands, logins, a "
-               "session that stayed open), not only the days a session started, so an attacker who never left is no longer "
-               "\"back\". A new return alert can no longer be crowded out by 200 already told ones. The http:BL DNS client only "
-               "takes an answer that belongs to the question (owner name, CNAME chain, no truncated replies), never a multicast "
-               "server, and never writes the key into an error. Settings never sends a form twice: if the answer is lost it "
-               "says so instead, one save at a time per panel, and only the panel you saved is replaced."),
-    ("0.46.1", "2026-11-17", "Project Honey Pot: choose which DNS server Huginn asks (Settings, Lookups): the system resolver, Cloudflare, "
-               "Quad9 or Google. Pi-hole and many routers drop answers that start with 127 (DNS rebinding protection), and http:BL "
-               "answers always do, so the key test failed with a message that blamed the key. It now says what is wrong. "
-               "Project Honey Pot cannot confirm a key itself, only that its answers get through. "
-               "Settings: Save no longer reloads the page; only the part you saved is updated, so you stay where you were "
-               "(Appearance still reloads, since it changes the whole page; without JavaScript it works as before)."),
-    ("0.46.0", "2026-11-17", "Project Honey Pot (http:BL): with a free access key Huginn asks whether an attacker is a known web spammer, "
-               "e-mail harvester or suspicious visitor, how bad (threat 0 to 255) and how many days ago it was last seen there. "
-               "The answer is on the attacker page and in its JSON export. Paste the key on Settings, Lookups: it is tested on "
-               "Project Honey Pot's own test address and never shown again. IPv4 only, top attackers first, each again after a week, "
-               "at most 300 a day. From a LinkedIn comment."),
-    ("0.45.0", "2026-11-16", "Attackers that come back: \"returned\" for an address seen again after 7 or more quiet days (change it under Settings, Views & defaults), "
-               "\"stepped-up\" (+5) when it then gets further than ever before, for example only knocked first and later ran commands, "
-               "left files or used the honeypot as a proxy. The attacker page says when it came back and what it did before and since, "
-               "both tags can be filtered on, and a new ntfy alert (on by default) tells you once per return. Stored attackers are "
-               "checked once at start. From a LinkedIn comment: a home connection is worth most as a proxy, and the first checks are "
-               "often followed later by specific tasks."),
+    ('0.47.0', '2026-11-17',
+     'Netblocks from Team Cymru (over DNS, no key).\n'
+     '- The attacker page shows the network block, its owner and how many attackers came from it\n'
+     '- Filter attackers by block, and an optional Netblock column\n'
+     '- Campaigns lists blocks with more than one attacker\n'
+     '- On by default; turn off or pick a DNS server under Settings, Lookups\n'
+     '- From a LinkedIn comment'),
+    ('0.46.2', '2026-11-17',
+     'Fixes from a code review.\n'
+     '- returned counts every day with activity, so an attacker who never left is not "back"\n'
+     '- New return alerts can no longer be crowded out\n'
+     '- The http:BL DNS client only accepts answers to its own question\n'
+     '- Settings never sends a form twice'),
+    ('0.46.1', '2026-11-17',
+     'Choose the DNS server for Project Honey Pot.\n'
+     '- System resolver, Cloudflare, Quad9 or Google (Settings, Lookups)\n'
+     "- Pi-hole and many routers block http:BL's answers; the key test now says so\n"
+     '- Settings saves without reloading the page'),
+    ('0.46.0', '2026-11-17',
+     'Project Honey Pot (http:BL).\n'
+     '- With a free key: is the attacker a known spammer, harvester or suspicious visitor, and how bad\n'
+     '- Shown on the attacker page and in its JSON export\n'
+     '- IPv4 only, top attackers first, at most 300 a day\n'
+     '- From a LinkedIn comment'),
+    ('0.45.0', '2026-11-16',
+     'Attackers that come back.\n'
+     '- returned: seen again after 7 or more quiet days (Settings, Views & defaults)\n'
+     '- stepped-up (+5): it then got further than ever before\n'
+     '- The attacker page says what it did before and since\n'
+     '- An ntfy alert once per return\n'
+     '- From a LinkedIn comment'),
     ("0.44.0", "2026-11-15", "Suricata can be turned on and off under Settings, Honeypot, once it is set up on the honeypot (update-honeypot.sh --suricata-on, which installs the package and the rules). The locked export key accepts exactly \"ids on\" or \"ids off\", which only start or stop a Suricata that is already set up, and checks that it really started or stopped. Update the honeypot side once for the switch to show."),
-    ("0.43.0", "2026-11-15", "Optional Suricata IDS on the honeypot: one command (update-honeypot.sh --suricata-on, or install-honeypot.sh --suricata) installs it, fetches the free Emerging Threats Open rules and starts it, and Huginn names known attacks by rule and CVE. Nothing to set up in your router: Suricata only listens on the honeypot's own network card, never blocks anything, leaves your admin SSH out, drops root to its own user in a sandbox and is capped at 900 MB of memory. Only alerts on traffic to the honeypot are exported, as a few fixed fields. Each attacker page gets a card IDS alerts, Campaigns lists the rules with a page per rule and the addresses that tripped it, and Settings, Honeypot shows whether it runs and how old the rules are. An attack rule (severity 1) adds 3 to the score and tags the attacker ids-alert. Rules are updated daily, or from a downloaded file on a honeypot without internet (--suricata-rules), and are always tested with the installed Suricata first; the previous set is kept and comes back if Suricata does not start."),
+    ('0.43.0', '2026-11-15',
+     'Optional Suricata IDS on the honeypot.\n'
+     '- One command: update-honeypot.sh --suricata-on\n'
+     '- Listens only, never blocks, sandboxed and capped at 900 MB\n'
+     '- Attacker pages get IDS alerts, Campaigns a page per rule\n'
+     '- Rules update daily, or from a file on a honeypot without internet\n'
+     '- An attack rule adds 3 to the score and tags ids-alert'),
     ("0.42.0", "2026-11-14", "Every number at the top of the Overview is a link to the list behind it: Took the bait opens the attackers who took the bait in the last 7 days, Sessions the attackers with the most sessions, Files captured the Files page, Time wasted the receipt, On blocklist the Blocklist. New this week links its attackers, new attackers, each new country, each malware family and the bait count too."),
     ("0.41.1", "2026-11-14", "Account: the changelog is as tall as the System card next to it and scrolls, instead of making the page very long. Settings, Logout message shows how often the note was shown, to how many addresses, in the last 7 days and when last (also in /metrics as events of kind goodbye)."),
-    ("0.41.0", "2026-11-14", "The goodbye on logout can be turned on and off in Settings (card Goodbye on logout), no need to log in to the honeypot. It is the only thing Huginn can change there: the locked export key accepts exactly \"goodbye on\" or \"goodbye off\" and nothing else. Update the honeypot once (update-honeypot.sh) for the button to work. Settings is rebuilt: a menu of sections, one Save button per part that only saves that part, status badges (On, Off, Not configured, Update required) and shorter texts that state the free and keyed lookup limits instead of guessing your traffic. The footer and Settings › About link to Buy me a coffee."),
-    ("0.40.0", "2026-11-14", "An optional goodbye: when someone who really logged in types exit or logout, the honeypot can answer with a short note: how long they stayed, how many lines they typed, and that all of it is logged along with their address. Off by default; turn it on with update-honeypot.sh --goodbye-on (and off with --goodbye-off), no restart. It never shows for sh -c, scripts, nested shells or bots that just disconnect, and only at the very end, so it does not change what is collected. The session log shows who got it, and Account says whether it is on. Update the honeypot (update-honeypot.sh) for the patch. Also from a review before release: Campaigns compares long scripts quickly (a crafted script with thousands of repeated commands made the page slow), groups rows by the shape of their first commands, no longer says \"ends after\" for two rows that read the same, and a failed Cowrie upgrade puts Huginn's patches back on the old version."),
-    ("0.39.0", "2026-11-14", "Campaigns: scripts that start with the same commands no longer look identical. Each such row shows the first command where it differs from the others (or that it is the same script cut short), and every script has a Preview with all its commands numbered, the differing one marked, so you can choose what to open without opening it. The JSON log setting now says it is for log tools such as Grafana Loki, Graylog or Elasticsearch."),
-    ("0.38.0", "2026-11-14", "Metrics for Prometheus and Grafana, off until you turn them on in Settings: events per decoy service, attackers, sessions, blocklist size, sync health and lookup allowances, read with a token. Counts only, never addresses or anything an attacker typed. A ready Grafana dashboard is in examples/grafana. Logs can be JSON for Loki (HUGINN_LOG_FORMAT=json): syncs, collection problems, logins, failed backups and every new error."),
+    ('0.41.0', '2026-11-14',
+     'Settings rebuilt, and the logout note from Huginn.\n'
+     '- Turn the goodbye note on or off in Settings (update the honeypot once)\n'
+     '- A menu of sections, one Save per part, status badges\n'
+     '- Buy me a coffee link in the footer'),
+    ('0.40.0', '2026-11-14',
+     'An optional goodbye on logout.\n'
+     '- People who really logged in see how long they stayed and that everything was logged\n'
+     '- Off by default: update-honeypot.sh --goodbye-on\n'
+     '- Never shown to scripts or bots that just disconnect\n'
+     '- Campaigns compares long scripts quickly'),
+    ('0.39.0', '2026-11-14',
+     'Campaigns tells similar scripts apart.\n'
+     '- Each row shows where a script differs from the others\n'
+     '- Preview lists all commands, with the differing one marked'),
+    ('0.38.0', '2026-11-14',
+     'Metrics and JSON logs.\n'
+     '- Prometheus metrics with a token (Settings): counts only, never addresses\n'
+     '- A ready Grafana dashboard in examples/grafana\n'
+     '- JSON logs for Loki and similar (HUGINN_LOG_FORMAT=json)'),
     ("0.37.0", "2026-11-14", "A GreyNoise key can be saved on the Settings page, like the VirusTotal and MalwareBazaar keys. It is tested without using a lookup and never shown again. Without a key Huginn now asks at most 20 addresses a day, under the free allowance; with one, 40."),
-    ("0.36.0", "2026-11-14", "Fixes from a deep security and bug review. The decoy cap never drops a web attack, a bait hit or a login with a new kind of password, and knows rows by their content, so two hits at the same second both count and a resent line is never counted twice. A pasted chmod line can no longer make the attacker page slow. Lookups never follow redirects, so a key only ever goes to its own service. A changed GreyNoise answer takes the research mark off again, and web exploits or bait use always keep an attacker on the blocklist. A collection source that stopped stays alerted for 30 days instead of two. MalwareBazaar copes with odd answers and pauses on a refused key. Engagement counts late commands of long sessions and uses a true median; the timeline always shows the newest activity; Files is faster."),
+    ('0.36.0', '2026-11-14',
+     'Fixes from a deep security and bug review.\n'
+     '- The decoy cap never drops web attacks, bait hits or new kinds of passwords\n'
+     '- Lookups never follow redirects, so a key only goes to its own service\n'
+     '- Web exploits and bait use always keep an attacker on the blocklist\n'
+     '- A stopped source stays alerted for 30 days\n'
+     '- Engagement and Files are more accurate and faster'),
     ("0.35.0", "2026-11-14", "New Help page (link in the header, or g h): what every attacker tag, session badge, file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it."),
     ("0.34.0", "2026-11-14", "The MalwareBazaar key can be pasted on the Settings page too (Lookups), like the VirusTotal key: it is tested before it is saved and never shown again. The page shows how many files were checked and how many abuse.ch knows, and the last error if a lookup failed."),
-    ("0.33.0", "2026-11-14", "VirusTotal verdicts for captured files: only the SHA-256 is sent, never the file. Each file shows how many engines flag it, or \"novel\" when VirusTotal has never seen it, and VirusTotal's label names the family when nothing better is known. Paste the key on the Settings page (it is tested, then never shown again) or set HUGINN_VIRUSTOTAL_KEY. GreyNoise (no key needed) says whether an attacker is a known mass scanner: benign ones count as research unless they logged in or ran something. Both keep to a daily allowance."),
-    ("0.32.0", "2026-11-14", "New Engagement page: sessions that got in, day by day, with what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it. Huginn now also stores the terminal size a client asks for: it shows on each session and in a table on the Engagement page."),
-    ("0.31.0", "2026-11-13", "The attacker page starts with a timeline of the last 30 days across every service: web requests, tarpit, decoy logins, SSH and Telnet sessions, files and programs run, with the same kind of activity within 30 minutes as one step and a phase for each (Recon, Access, Commands, Payload, Exploit). Commands are labelled with MITRE ATT&CK techniques (for example T1105 tool transfer, T1098.004 SSH keys, T1496 mining), linked to MITRE, on the timeline and on every session."),
-    ("0.30.0", "2026-11-13", "The attacker page folds its sessions: the same command script is shown once with \"×N like this\" and the repeats under it, and sessions that only connected or only tried to log in are two folded groups at the end. Chips filter the list to sessions with commands or with logins. The honeypot now reports its own protection in the export (sandbox and memory/file limits per service, whether each service runs, every Huginn patch); Account shows it and Huginn alerts when something is missing, for example a limit removed because a service would not start with it, or a patch that no longer fits after a Cowrie upgrade. Update the honeypot too (update-honeypot.sh)."),
-    ("0.29.0", "2026-11-13", "Huginn tells you when collection stops: no sync from the honeypot for 30 minutes, or a source (each Cowrie port, OpenCanary, hp-traps, endlessh) quiet for longer than its own longest silence last week. One phone alert per problem and one when it is back; Account lists every source with its newest data, and /healthz names the problems. On the honeypot, wget now prints what the persona's own wget would (BusyBox on the camera, no \"connected\" before a connection fails, no name lookup for an address), and an uploaded program for the persona's CPU \"runs\" silently instead of failing with \"Exec format error\". Nothing is ever executed; the run, its arguments and the file's hash show in the session log and in the phone alert. Update the honeypot too (update-honeypot.sh)."),
-    ("0.28.0", "2026-11-13", "Repeated tries on the decoy services are counted but no longer all stored: the first 2,000 per IP, service and day are kept (HUGINN_DECOY_CAP). A single brute forcer can otherwise fill much of the database; existing history is trimmed once on update, and every page still counts all tries. Account shows how fast the data folder grows and when the disk would be full. Web exploits recognised by the rules (with their CVE) now trigger the phone alert. Wider screens get three columns on the Overview and two on Campaigns. Campaigns shows IPs in the last 7 days and has an Active filter; Files has a chip per malware family. The Blocklist explains the whole scoring, empty Overview cards say so, the Attackers list marks its sort column, charts have a text for screen readers, and keyboard focus is visible everywhere."),
+    ('0.33.0', '2026-11-14',
+     'VirusTotal and GreyNoise.\n'
+     '- VirusTotal verdicts for captured files, by hash only\n'
+     '- novel when VirusTotal has never seen a file\n'
+     '- GreyNoise marks known mass scanners as research\n'
+     '- Both stay within a daily allowance'),
+    ('0.32.0', '2026-11-14',
+     'New Engagement page.\n'
+     '- What sessions that got in did, day by day\n'
+     '- Hand-typed sessions, median stay, new against returning attackers\n'
+     '- Compare the days before and after a release'),
+    ('0.31.0', '2026-11-13',
+     'A timeline on the attacker page.\n'
+     '- 30 days across every service, grouped into phases (Recon, Access, Commands, Payload, Exploit)\n'
+     '- Commands labelled with MITRE ATT&CK techniques'),
+    ('0.30.0', '2026-11-13',
+     'Folded sessions and honeypot protection status.\n'
+     '- The same script shows once with ×N like this\n'
+     '- Filter sessions with commands or logins\n'
+     '- The honeypot reports its sandbox, limits and patches; Huginn alerts when something is missing\n'
+     '- Update the honeypot too'),
+    ('0.29.0', '2026-11-13',
+     'Alerts when collection stops.\n'
+     '- No sync for 30 minutes, or a source quiet for longer than usual\n'
+     '- One alert per problem and one when it is back\n'
+     '- More realistic wget, and uploaded programs "run" silently (nothing is ever executed)\n'
+     '- Update the honeypot too'),
+    ('0.28.0', '2026-11-13',
+     'A cap on repeated decoy tries.\n'
+     '- The first 2,000 per IP, service and day are stored, the rest counted\n'
+     '- Account shows how fast the data grows\n'
+     '- Web exploits with a CVE trigger the phone alert\n'
+     '- Wider layouts, family chips on Files, better accessibility'),
     ("0.27.3", "2026-11-12", "The Overview banner is a new raven with a soft beam of light from its eye, in a dark and a light version that follow the theme."),
     ("0.27.2", "2026-11-12", "A new raven banner on the Overview, in a dark and a light version that follow the theme (Auto, Light or Dark), with the text colour to match."),
-    ("0.27.1", "2026-11-12", "Two Cowrie bugs that ended many attacks early are patched on the honeypot. ping never accepted \"-c N\", so \"ping -c 1 8.8.8.8\" always failed; a bot that checks the network that way left when it failed. And a file uploaded over SFTP or scp vanished before the next command, so \"chmod +x\" failed and the bot never ran it; now it stays for the whole connection. Security and robustness after a review: uploads are capped at 10 MB (also a write far past the end of a file), Cowrie and OpenCanary get memory and file-size limits, a mail session really ends after 10 minutes (also while a message is being sent), a held TLS proxy check frees its slot as soon as the client leaves and later data on it is not logged again, scp refuses file names with a slash, and the honeypot patches are written all at once or not at all. Campaigns says \"sent in full\" instead of \"read to the end\" (the honeypot cannot see whether the client read it), and the proxy table covers the last 7 days like its heading. Update the honeypot (update-honeypot.sh)."),
-    ("0.27.0", "2026-11-12", "Slow replies: the fake mail server waits 1 to 2.5 seconds before it says a message is queued (after the message is logged), with a cap of 50 messages and 10 minutes per session and half the trap connections for mail. The web trap sends the robots-only backup file slowly, over about 5 seconds (at most 32 at a time, 2 per IP). Both log how the visit ended, and Campaigns has a Slow replies summary for the last 7 days, to see whether bots stay longer and still go on. Update the honeypot too (hp-traps and the OpenCanary patch)."),
-    ("0.26.0", "2026-11-11", "Proxy that seems to work: bots that log in to the SSH honeypot to use it as a proxy test it with a plain web request first, and leave when Cowrie refuses. The honeypot now answers such a check with an empty 200 page and holds TLS for up to 30 seconds; nothing is ever forwarded. The attacker page shows each answered check, and Campaigns has a Proxy use table with proxy sessions and requests per session for the last 7 days, to compare before and after."),
-    ("0.25.0", "2026-11-11", "Web attacks: every request to the web trap is matched against about 3,100 rules from Krawl (MIT), so CVE exploits, path traversal, webshells, .env and .git hunting, scanners and MCP server probes have a name. Exploits tag the attacker web-exploit (+8), probes web-probe (+3). The attacker page lists them, Campaigns groups them with a page per attack and a link to the CVE, Search finds them by CVE, and the Board shows them in the raw data. A plain GET only counts as a probe. The web trap now answers .env, .git, AWS, phpinfo, traversal, PHPUnit, actuator and MCP probes with fake files holding bait values (read-bait), and serves a robots.txt with paths found nowhere else (robots-trap, +5). Synology now uses a generated login page like the other identities."),
-    ("0.24.1", "2026-11-11", "VNC passwords count as logins: on Credentials, in the password check, the exports and the Board. VNC only reveals a password when it is on OpenCanary's list of common ones, so tries with an unknown password stay plain hits. The mail relay trap keeps every recipient, the HELO name, the size and the start of each message (on the attacker's page, recipients also in Search). Campaigns groups mail clients by HELO name."),
+    ('0.27.1', '2026-11-12',
+     'Two Cowrie bugs that ended attacks early are fixed.\n'
+     '- ping -c N works\n'
+     '- Uploaded files stay for the whole connection\n'
+     '- Upload size and memory limits on the honeypot\n'
+     '- Update the honeypot'),
+    ('0.27.0', '2026-11-12',
+     'Slow replies.\n'
+     '- The fake mail server waits before it says queued\n'
+     "- The web trap's bait file is sent slowly\n"
+     '- Campaigns has a Slow replies summary\n'
+     '- Update the honeypot too'),
+    ('0.26.0', '2026-11-11',
+     'A proxy that seems to work.\n'
+     '- Bots testing the SSH honeypot as a proxy get an empty page instead of a refusal; nothing is forwarded\n'
+     '- Campaigns has a Proxy use table'),
+    ('0.25.0', '2026-11-11',
+     'Web attacks named.\n'
+     '- Every web trap request is matched against about 3,100 Krawl rules\n'
+     '- Tags web-exploit (+8) and web-probe (+3)\n'
+     '- A page per attack, with the CVE\n'
+     '- Fake .env, .git and similar files with bait values, and a robots.txt trap'),
+    ('0.24.1', '2026-11-11',
+     'VNC passwords and mail details.\n'
+     '- VNC passwords count as logins\n'
+     '- The mail relay trap keeps recipients, HELO name and the start of each message\n'
+     '- Campaigns groups mail clients'),
     ("0.24.0", "2026-11-11", "Overview has a second layout, Board: every service side by side with IPs, hits, logins and accepted logins, attacker IPs and login attempts on the same time axis, top attackers and the latest raw data, for the last 24 hours or 7 days and one service or all. Switch between Cards and Board at the top of the Overview; the choice is remembered."),
-    ("0.23.1", "2026-11-09", "Security and bug hunt. Fixed: a specially crafted command line could freeze Huginn for minutes, web requests were counted as logins on the password lists, a failed update of New left permanent holes, backup and restore could collide, restore accepted a database that was not Huginn's, one huge captured file could stop all file analysis, firewall feeds did not clear IPv6 when the list became empty, a reverse DNS name containing a word like research could keep an attacker off the blocklist, and the database file was readable by other users on the machine."),
+    ('0.23.1', '2026-11-09',
+     'Security and bug hunt.\n'
+     '- A crafted command could freeze Huginn\n'
+     '- Web requests were counted as logins\n'
+     '- Backup and restore are safer\n'
+     '- One huge file could stop file analysis\n'
+     '- The database file was readable by other users'),
     ("0.23.0", "2026-11-09", "The web trap can pretend to be many NAS and router brands and changes by itself every few weeks (hp-identity on the honeypot, ROTATE_DAYS sets how often, 0 turns it off). Personas shows which device drew the most attention, per day, because each one runs for a different time."),
-    ("0.22.0", "2026-11-09", "A visual pass: the attacker page is headed by its address, phones get shorter lists with paging at the top and readable rows, campaigns and New lead with the commands instead of a hash, rare finds (bait, files, exploits) have their own warm colour, Replay looks like a terminal and has a timeline, Personas shows how far attackers got as bars, and empty sections no longer draw empty tables. Two small extras: the raven in the header reacts once to a new file or used bait, and Time wasted has a receipt."),
+    ('0.22.0', '2026-11-09',
+     'A visual pass.\n'
+     '- The attacker page is headed by its address\n'
+     '- Better phone layouts\n'
+     '- Replay looks like a terminal\n'
+     '- Personas shows how far attackers got\n'
+     '- A receipt for Time wasted'),
     ("0.21.2", "2026-11-08", "Releases now include a Debian package, plus Docker files that work without cloning the repository."),
     ("0.21.1", "2026-11-08", "Session logs are easier to read: download and permission commands stand out, addresses link to Search (never to the attacker's server) and captured files link to their file page."),
     ("0.21.0", "2026-11-08", "New page, Search: commands, file hashes and names, addresses inside malware, failed downloads, decoy service data, sessions and attacker IPs across the whole history. Press / on any page without a filter to get there."),
     ("0.20.0", "2026-11-08", "New page, Personas: how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof."),
     ("0.19.1", "2026-11-08", "Overview: the banner is back to its full size on computers. It stays low on phones."),
     ("0.19.0", "2026-11-08", "Campaigns: scripts that differ only in addresses, numbers or random markers are now one campaign (old links to a script campaign stop working). Attacker page: a one-line summary, sessions first with the facts in a side column on wide screens, related attackers as a count and the five latest. Sync gaps: the day charts and the Account page show when Huginn did not collect."),
-    ("0.18.0", "2026-11-08", "New page: everything Huginn has never seen before since you last reviewed (files, scripts, commands, password patterns, SSH clients), with Mark all reviewed and Undo. Overview: a low banner so more fits on the first screen, today's unfinished bar is striped, rare events stand out, a change against the prior 7 days. Files: steady columns and two IOCs with the rest behind Show more. Attacker page: what the score is made of. Phone: three key numbers first, sync status back, larger touch targets. Replay: short sessions no longer leave an empty terminal."),
+    ('0.18.0', '2026-11-08',
+     'New page: New.\n'
+     '- Everything Huginn has not seen before since you last looked, with Mark all reviewed and Undo\n'
+     '- A lower Overview banner, rare events stand out\n'
+     '- What makes up a score, on the attacker page'),
     ("0.17.0", "2026-11-07", "Automatic database backups: once a day Huginn saves a checked, compressed copy of its database in data/backups and keeps the last 3 (HUGINN_DB_BACKUPS, HUGINN_DB_BACKUP_HOURS). A damaged database never pushes out the good copies, you get a warning on the Account page and through ntfy. Bring one back with: app.py restore-db."),
-    ("0.16.2", "2026-11-06", "More security and reliability fixes from a deep review. Honeypot: root no longer changes or writes files the honeypot users control (update it, this one matters), Cowrie and OpenCanary run in a filesystem sandbox, the real sshd leaves port 22 on new installs. Huginn: addresses with an IPv6 scope are refused and can no longer add lines to a feed. The C2 list only has addresses seen from at least 2 attackers, never from failed downloads (HUGINN_C2_EXCLUDE removes more): treat it as advice. A bad file, port or recording can no longer stop the sync or a thread. update-huginn.sh rolls back when the restart itself fails. Optional HUGINN_ALLOWED_HOSTS."),
-    ("0.16.1", "2026-11-06", "Security fixes: text sent to a decoy service could add fake lines to the honeypot export and break pages. The export is now split on real line ends only, impossible times and durations are refused, and pages tolerate bad values. The web server has a time limit and a cap on connections, the login limit holds under parallel requests, and an unread request body closes the connection. Update the honeypot too (hp-traps)."),
+    ('0.16.2', '2026-11-06',
+     'More security fixes from a deep review.\n'
+     '- Root no longer writes files the honeypot users control (update the honeypot)\n'
+     '- Cowrie and OpenCanary run in a sandbox\n'
+     '- The C2 list needs at least 2 attackers\n'
+     '- update-huginn.sh rolls back a failed restart'),
+    ('0.16.1', '2026-11-06',
+     'Security fixes.\n'
+     '- Text sent to a decoy could add fake lines to the export\n'
+     '- Time limits and connection caps on the web server\n'
+     '- Update the honeypot too'),
     ("0.16.0", "2026-11-06", "SSHole detection (CVE-2026-123158): an SSH login with a password of 257-1024 bytes tags the attacker sshole-probe (+10 score), stands out in the session log and counts as an exploit attempt in ntfy. Attackers already in the database are tagged at the first start."),
     ("0.15.0", "2026-11-05", "Overview: a banner with the raven and what Huginn has seen so far (since when, attackers, countries, login attempts, last sync). It is a card like the others: switch it off in Settings."),
     ("0.14.3", "2026-11-05", "Security review: data from ipwho.is, Shodan and reverse DNS is validated, the CSV blocklist uses real CSV quoting, a negative Content-Length can no longer hang a request, extra security headers, harder systemd sandbox, hp-export never follows symlinks, hp-logclean runs as the cowrie user. New tests plant HTML/JS in every attacker-controlled field."),
@@ -3134,6 +3239,15 @@ def log_path(path):
     p = (path or "").split("?", 1)[0]
     p = re.sub(r"^/feed/[^/]+", "/feed/<token>", p)
     return p[:300]
+
+
+def cl_html(text):
+    # A changelog entry: a headline, then "- " lines as a list. Older entries are one paragraph and stay as they were.
+    head, *rest = text.split("\n")
+    items = [x[2:] for x in rest if x.startswith("- ")]
+    if not items:
+        return "<span>%s</span>" % esc(text)
+    return '<span><b class="cl-h">%s</b><ul class="cl-l">%s</ul></span>' % (esc(head), "".join("<li>%s</li>" % esc(x) for x in items))
 
 
 def protection_missing(con):
@@ -6869,7 +6983,7 @@ def v_account(cur, ok="", err=""):
                  ("Updates", esc(("newest release %s" % get_meta(con, "update_latest")) if get_meta(con, "update_latest") else
                                  ("not checked yet" if UPDATE_CHECK else "check turned off (HUGINN_UPDATE_CHECK=0)"))
                   + (' <span class=muted>(%s)</span>' % esc(ago(float(get_meta(con, "update_checked", "0") or 0))) if get_meta(con, "update_checked") else ""))])
-    log = "".join('<div class="cl"><span class="mono">%s</span><span class="muted">%s</span><span>%s</span></div>' % (esc(v), esc(d), esc(t)) for v, d, t in CHANGELOG)
+    log = "".join('<div class="cl"><span class="mono">%s</span><span class="muted">%s</span>%s</div>' % (esc(v), esc(d), cl_html(t)) for v, d, t in CHANGELOG)
     body = ('<h1>Account</h1>%s<div class="grid">'
             '<div class="card"><h3>Change password</h3><form method=post action="/account/password" class="stack">'
             '<label>Current password<input type=password name=current autocomplete=current-password required></label>'
@@ -7678,6 +7792,7 @@ CSS += (".hdr-link{color:var(--muted)}.hdr-link:hover,.hdr-link.on{color:var(--t
         ".stack{display:flex;flex-direction:column;gap:12px;max-width:420px}.stack label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:13px}"
         ".stack button{align-self:flex-start}.okmsg{color:var(--green);margin:0 0 14px}.err{margin:0 0 14px}"
         ".cl{display:grid;grid-template-columns:60px 90px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)}.cl:last-child{border:0}"
+        ".cl-h{font-weight:600}.cl-l{margin:4px 0 2px;padding-left:18px}.cl-l li{margin:2px 0}"
         # 0.41.1: the changelog takes the height of the System card next to it and scrolls (it does not stretch the row).
         ".cl-card{display:flex;flex-direction:column;min-height:320px}.cl-scroll{flex:1 1 0;min-height:0;overflow-y:auto;padding-right:6px}"
         "button[disabled]{opacity:.5;cursor:default}")

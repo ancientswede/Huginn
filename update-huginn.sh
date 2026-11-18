@@ -169,6 +169,9 @@ log = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Ass
 old = tuple(int(x) for x in sys.argv[2].split("."))
 for v, d, text in log:
     if tuple(int(x) for x in v.split(".")) > old:
-        print("    %s  %s" % (v, text))
+        head, *rest = text.split("\n")
+        print("    %s  %s" % (v, head))
+        for line in rest:
+            print("            %s" % line)
 PY
 echo
