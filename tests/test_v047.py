@@ -196,6 +196,14 @@ class Pages(SettingsKey):
         j = app.export_ip("203.0.113.10")["netblock"]
         self.assertEqual((j["prefix"], j["owner"], j["asn"]), ("203.0.113.0/24", "EXAMPLE-NET", "64501"))
 
+    def test_gone_attacker_not_counted(self):
+        # Codex 047 L2: a netblock row whose attacker is gone is neither counted nor listed.
+        with self.con:
+            self.con.execute("DELETE FROM ips WHERE ip=?", (IPS[1],))
+        self.assertIn("only this attacker", app.nb_html(self.con, app.nb_get(self.con, IPS[0])))
+        r, html = self.get("/ip/" + IPS[0])
+        self.assertNotIn("Same netblock", html)
+
     def test_settings(self):
         r, html = self.get("/settings")
         self.assertIn('id="netblock"', html)

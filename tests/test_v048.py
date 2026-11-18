@@ -98,6 +98,20 @@ class Tor(unittest.TestCase):
         self.assertEqual(app.bl_params({"tor": "1"})[4], True)
         self.assertEqual(app.bl_params({})[4], False)
 
+    def test_between_attacks_not_tor(self):
+        # Codex 047 M1: attacks 120 and 1 days ago, on the Tor list only 60 days ago: neither attack came through Tor.
+        now = time.time()
+        with self.con:
+            self.con.execute("INSERT INTO tor VALUES(?,?,?)", (OTHER, now - 61 * 86400, now - 60 * 86400))
+            self.con.execute("UPDATE sessions SET start=?, end=? WHERE session=?", (now - 120 * 86400, now - 120 * 86400 + 60, "s-%s-0" % OTHER))
+            app.recompute_ip(self.con, OTHER)
+        self.assertNotIn("tor", self.tags(OTHER))
+        # Listed shortly before the latest attack: Tor.
+        with self.con:
+            self.con.execute("UPDATE tor SET first=?, last=? WHERE ip=?", (now - 10 * 86400, now - 9 * 86400, OTHER))
+            app.recompute_ip(self.con, OTHER)
+        self.assertIn("tor", self.tags(OTHER))
+
     def test_window(self):
         # Listed long after the attack: not Tor then.
         with self.con:
@@ -108,9 +122,17 @@ class Tor(unittest.TestCase):
     def test_short_list_and_errors(self):
         n, _ = self.fetch(TOR_IP + "\n")
         self.assertIsNone(n)
-        self.assertIn("only 1 addresses", app.get_meta(self.con, "tor_error"))
+        self.assertIn("held 1 addresses", app.get_meta(self.con, "tor_error"))
         self.assertNotIn("tor", self.tags(TOR_IP))
         self.assertGreater(float(app.get_meta(self.con, "tor_wait_until")), time.time())
+
+    def test_oversize_refused(self):
+        # Codex 047 L1: a list larger than the limit is refused whole, never cut and taken as complete.
+        with mock.patch.object(app, "TOR_MAX_BYTES", 500):
+            n, _ = self.fetch(big_list(TOR_IP))
+        self.assertIsNone(n)
+        self.assertIn("larger than", app.get_meta(self.con, "tor_error"))
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM tor").fetchone()[0], 0)
 
     def test_once_a_day_and_off(self):
         with mock.patch.object(app, "ENRICH", True):

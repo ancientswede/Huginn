@@ -11,7 +11,9 @@ CHANGELOG = [
                "attackers that came through one \"tor\". Such an address is shared by many people, so it never counts as returned or "
                "stepped-up, and it is left out of the blocklist and its feeds unless you choose otherwise on Settings, Lookups (or "
                "tor=1 on a feed); Always block still wins. The tag can be filtered on, and the JSON export says when the address was "
-               "listed. On by default. From a LinkedIn comment."),
+               "listed. On by default. From a LinkedIn comment. Also from a code review: whether an attacker came through Tor is decided "
+               "by its latest activity, a Tor list that is too large is refused whole, and attackers removed by the history limit "
+               "no longer count towards their netblock."),
     ("0.47.1", "2026-11-17", "Campaigns has a tab per grouping (command scripts, SSH clients, netblocks, web attacks, IDS alerts, mail clients, "
                "proxy use, slow replies) with how many rows each holds, instead of one long page to scroll. The tab you chose is "
                "remembered and can be linked to (#c-netblocks). Without JavaScript the tabs jump to their section as before."),
@@ -1836,6 +1838,8 @@ def hb_lookup(con, limit=20):
 TOR_URL = "https://check.torproject.org/torbulkexitlist"
 TOR_WINDOW = 30 * 86400
 TOR_KEEP = 365 * 86400
+TOR_MAX_BYTES = 4_000_000        # about 1,300 addresses today, about 20 KB
+TOR_MAX_ADDRS = 100_000
 
 
 def tor_tagging(con=None):
@@ -1867,9 +1871,11 @@ def tor_parse(text):
     return out
 
 
-def tor_is(con, ip, first, last):
+def tor_is(con, ip, last):
+    # Decided by the latest activity: it must fall within TOR_WINDOW of the time the address was on the list. A Tor match
+    # long ago, or between two attacks, never covers newer traffic (Codex review 047).
     r = con.execute("SELECT first, last FROM tor WHERE ip=?", (ip,)).fetchone()
-    return bool(r and r[0] - TOR_WINDOW <= last and r[1] + TOR_WINDOW >= first)
+    return bool(r and r[0] - TOR_WINDOW <= last <= r[1] + TOR_WINDOW)
 
 
 def tor_get(con, ip):
@@ -1890,9 +1896,12 @@ def tor_refresh(con, force=False):
     try:
         req = urllib.request.Request(TOR_URL, headers={"User-Agent": UA, "Accept": "text/plain"})
         with api_urlopen(req, timeout=30) as r:
-            listed = tor_parse(r.read(4_000_000).decode("ascii", "replace"))
-        if len(listed) < 100:
-            raise OSError("the list held only %d addresses" % len(listed))
+            raw = r.read(TOR_MAX_BYTES + 1)
+        if len(raw) > TOR_MAX_BYTES:                  # never take the first part of a cut list as the whole (Codex 047)
+            raise OSError("the list was larger than %d bytes" % TOR_MAX_BYTES)
+        listed = tor_parse(raw.decode("ascii", "replace"))
+        if not 100 <= len(listed) <= TOR_MAX_ADDRS:
+            raise OSError("the list held %d addresses" % len(listed))
     except Exception as e:
         set_meta(con, "tor_wait_until", now + 3600)
         set_meta(con, "tor_error", "%s %s" % (fmt_ts(now), str(e)[:120]))
@@ -1991,7 +2000,7 @@ def nb_html(con, n):
         return '<span class=muted>not looked up yet</span>' if nb_on(con) else "–"
     if not n.get("prefix"):
         return '<span class=muted>not routed</span>'
-    many = con.execute("SELECT COUNT(*) FROM netblock WHERE prefix=?", (n["prefix"],)).fetchone()[0]
+    many = con.execute("SELECT COUNT(*) FROM netblock JOIN ips USING(ip) WHERE prefix=?", (n["prefix"],)).fetchone()[0]
     return '<a class=mono href="%s">%s</a> <span class=muted>%s</span>' % (
         esc(nb_url(n["prefix"])), esc(n["prefix"]), "only this attacker" if many <= 1 else "%s attackers in this block" % num(many))
 
@@ -2476,7 +2485,7 @@ def recompute_ip(con, ip):
     # gain, trojans, web application attacks); 2 is mostly scanning and recon, which nearly every attacker does.
     ids = con.execute("SELECT 1 FROM ids WHERE ip=? AND sev=1 LIMIT 1", (ip,)).fetchone() is not None
     rd = return_days(con)
-    tor = tor_tagging(con) and tor_is(con, ip, min(firsts), max(lasts))
+    tor = tor_tagging(con) and tor_is(con, ip, max(lasts))
     # A Tor exit is shared by many users: a later visit is most likely someone else, so it never counts as coming back.
     back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 and not tor else None
     score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor)
@@ -2743,6 +2752,9 @@ def retention(con):
             recompute_session(con, sid)
         for ip in old_ips:
             recompute_ip(con, ip)
+        # Lookups of attackers that are gone (Codex 047): their netblock and owner rows would still be counted.
+        con.execute("DELETE FROM netblock WHERE ip NOT IN (SELECT ip FROM ips)")
+        con.execute("DELETE FROM asname WHERE asn NOT IN (SELECT asn FROM netblock WHERE asn IS NOT NULL)")
     con.execute("PRAGMA optimize")
 
 
@@ -4961,7 +4973,7 @@ def v_ip(ip, qs=None):
                  ("Same command script", same % ("cmdhash", "cmdhash", "cmdhash"), (ip, ip)),
                  ("Same file", "SELECT DISTINCT ip FROM events WHERE kind='file' AND b IN (SELECT DISTINCT b FROM events WHERE ip=? AND kind='file' AND b IS NOT NULL) AND ip!=?", (ip, ip))]
     if nbr and nbr.get("prefix"):
-        relations.append(("Same netblock %s" % nbr["prefix"], "SELECT ip FROM netblock WHERE prefix=? AND ip!=?", (nbr["prefix"], ip)))
+        relations.append(("Same netblock %s" % nbr["prefix"], "SELECT ip FROM netblock JOIN ips USING(ip) WHERE prefix=? AND ip!=?", (nbr["prefix"], ip)))
     if ":" not in ip and not (nbr and (nbr.get("prefix") or "").endswith("/24")):      # a /24 block is the same list
         relations.append(("Same /24 network", "SELECT ip FROM ips WHERE ip LIKE ? AND ip!=?", (".".join(ip.split(".")[:3]) + ".%", ip)))
     rel = []
