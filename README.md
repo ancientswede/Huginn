@@ -114,6 +114,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - files they dropped, decoy services they touched and time spent in the tarpit
   - **related attackers** (same SSH client fingerprint, same command script, same file, same /24)
   - an "always block" / "never block" switch
+  - links to look the address up elsewhere: AbuseIPDB, GreyNoise, Shodan, VirusTotal, ipinfo, Project Honey Pot and Cisco Talos
 - **Personas:** how far attackers get on each fake machine, where sessions with several lines stop with no download seen, and which single lines hit it. A hint about what may give the honeypot away, not proof.
 - **Engagement:** sessions that got in, day by day: what they did after the login (left at once, proxy only, ran commands, went for a payload), how many were typed by hand, the median stay and new against returning attackers. Pick a release to compare the whole days before it with the days after it, to see whether a change to the honeypot kept attackers busier. Also the terminal sizes clients asked for: a bot that asks tends to use one fixed size.
 - **Help:** what every attacker tag, session and file badge, lookup result and blocklist rule means. Every tag also explains itself when you hover it.
@@ -142,7 +143,7 @@ All from the demo, with made-up data. They follow your light/dark setting.
 
 | A page per attacker | Session replay |
 |---|---|
-| <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/attacker-dark.png">  <img alt="Attacker page with network info, credentials, related attackers and sessions" src="docs/screenshots/attacker-light.png"></picture> | <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/replay-dark.png">  <img alt="Replay of an attacker's shell session" src="docs/screenshots/replay-light.png"></picture> |
+| <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/attacker-dark.png">  <img alt="Attacker page with a 30-day timeline, MITRE ATT&amp;CK labels, sessions, captured files and decoy hits" src="docs/screenshots/attacker-light.png"></picture> | <picture>  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/replay-dark.png">  <img alt="Replay of an attacker's shell session" src="docs/screenshots/replay-light.png"></picture> |
 
 **New this week and when they attack**
 
@@ -151,11 +152,25 @@ All from the demo, with made-up data. They follow your light/dark setting.
   <img alt="New this week card next to a heat map of attacker IPs per hour of the week" src="docs/screenshots/week-light.png">
 </picture>
 
-**Captured malware, with the family it looks like**
+**Captured malware, with the family it looks like, ready to share with Sanesecurity**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/malware-dark.png">
-  <img alt="Files page with captured malware tagged as XMRig, Mirai, Gafgyt and a dropper script" src="docs/screenshots/malware-light.png">
+  <img alt="Files page with captured malware tagged as XMRig, Mirai, Gafgyt and a dropper script, and the Share with Sanesecurity card" src="docs/screenshots/malware-light.png">
+</picture>
+
+**Campaigns: one botnet as one group**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/campaigns-dark.png">
+  <img alt="Campaigns page with tabs for command scripts, SSH clients, netblocks, web attacks and IDS alerts" src="docs/screenshots/campaigns-light.png">
+</picture>
+
+**Engagement: what attackers do once they are in**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/engagement-dark.png">
+  <img alt="Engagement page with sessions per day, split into left at once, proxy only, ran commands and went for a payload" src="docs/screenshots/engagement-light.png">
 </picture>
 
 **Blocklist feeds**
@@ -588,7 +603,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Logins:** one password (scrypt), HttpOnly SameSite=Strict cookies, at most 5 failed logins per 15 minutes per IP, same-origin checks on every form.
 - **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.
 - **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
-- **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported.
+- **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported. The only way out is a zip you make yourself with `hp-sample-zip` and send on.
+- **The honeypot's own tools never read as root what an attacker could redirect.** Logs, patch checks and captured files belong to the Cowrie and OpenCanary users, so the tools drop to that user before they open anything there. Someone who took over Cowrie cannot point them at another file.
 - **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. The Tor exit list is only downloaded from check.torproject.org once a day; nothing is sent. Netblock lookups (Team Cymru) are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there.
 - **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
 
