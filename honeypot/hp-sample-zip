@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+# hp-sample-zip — packs files the honeypot captured into a password-protected zip, ready to share with a malware
+# signature project such as Sanesecurity (part of Huginn, AGPL-3.0-or-later).
+#
+#   hp-sample-zip SHA256 [SHA256 ...]        (as root on the honeypot; Huginn's Files page prints this command)
+#
+# Writes /root/hp-samples/samples-YYYYmmdd-HHMMSS.zip (mode 600), password "infected": the convention malware labs use so
+# that mail filters and virus scanners leave the attachment alone. Each file is stored as <sha256>.bin without any
+# execute bit, and manifest.txt lists hash, size and name. NOTHING is ever executed: files are only read, as bytes, with
+# O_NOFOLLOW, and a file is only taken when its content really has the hash that was asked for.
+# Standard library only (the honeypot has no internet, so no zip/7z package): traditional PKWARE encryption ("ZipCrypto")
+# is written here. It keeps scanners out, which is its only job; it is not meant to keep a determined reader out.
+import binascii, datetime, hashlib, os, re, shlex, struct, sys, time, zlib
+
+PASSWORD = b"infected"
+OUT_DIR = os.environ.get("HP_SAMPLE_DIR", "/root/hp-samples")
+CONF = os.environ.get("HP_EXPORT_CONF", "/etc/default/hp-export")
+MAX_FILES = 50
+MAX_FILE = 32 * 1024 * 1024         # Cowrie's own download limit is far lower; anything bigger is not a sample to mail
+MAX_TOTAL = 64 * 1024 * 1024
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+NAME_RE = re.compile(r"[0-9a-f]{64}|(redir|tmp)_?[A-Za-z0-9_]{4,80}")   # the names hp-fileinfo looks at
+
+
+def download_dirs():
+    # HP_DOWNLOAD_DIRS wins (tests, odd layouts); otherwise every COWRIE_DIRS entry in /etc/default/hp-export.
+    if os.environ.get("HP_DOWNLOAD_DIRS"):
+        return os.environ["HP_DOWNLOAD_DIRS"].split()
+    dirs = []
+    try:
+        with open(CONF, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"\s*COWRIE_DIRS=(.*)$", line)
+                if m:
+                    for d in shlex.split(m.group(1), comments=True):
+                        dirs.extend(os.path.join(x, "var/lib/cowrie/downloads") for x in d.split())
+    except (OSError, ValueError):
+        pass
+    return dirs or ["/home/cowrie/cowrie/var/lib/cowrie/downloads"]
+
+
+def read_plain(path):
+    # Bytes of a regular file, never through a symlink, never more than MAX_FILE.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    try:
+        st = os.fstat(fd)
+        if not (st.st_mode & 0o170000 == 0o100000) or st.st_size > MAX_FILE:
+            return None
+        chunks, left = [], MAX_FILE + 1
+        while left > 0:
+            b = os.read(fd, min(1 << 20, left))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        data = b"".join(chunks)
+        return data if len(data) <= MAX_FILE else None
+    finally:
+        os.close(fd)
+
+
+def find(wanted, dirs):
+    # {sha: (name, bytes)} for the asked hashes. A name that is a hash is checked against its content all the same.
+    found = {}
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if len(found) == len(wanted):
+                return found
+            if not NAME_RE.fullmatch(n) or (SHA_RE.fullmatch(n) and n not in wanted):
+                continue
+            try:
+                data = read_plain(os.path.join(d, n))
+            except OSError:
+                continue
+            if data is None:
+                continue
+            sha = hashlib.sha256(data).hexdigest()
+            if sha in wanted and sha not in found:
+                found[sha] = (n, data)
+    return found
+
+
+# ---------------------------------------------------------------- ZipCrypto (APPNOTE 6.1)
+def _crc_table():
+    t = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
+        t.append(c)
+    return t
+
+
+CRC = _crc_table()
+
+
+class ZipCrypto:
+    def __init__(self, pw):
+        self.k = [0x12345678, 0x23456789, 0x34567890]
+        for c in pw:
+            self.update(c)
+
+    def update(self, c):
+        k0, k1, k2 = self.k
+        k0 = CRC[(k0 ^ c) & 0xFF] ^ (k0 >> 8)
+        k1 = ((k1 + (k0 & 0xFF)) * 134775813 + 1) & 0xFFFFFFFF
+        k2 = CRC[(k2 ^ (k1 >> 24)) & 0xFF] ^ (k2 >> 8)
+        self.k = [k0, k1, k2]
+
+    def encrypt(self, data):
+        out = bytearray(len(data))
+        for i, p in enumerate(data):
+            t = (self.k[2] | 2) & 0xFFFF
+            out[i] = p ^ (((t * (t ^ 1)) >> 8) & 0xFF)
+            self.update(p)
+        return bytes(out)
+
+
+def dos_time(ts):
+    d = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    return ((d.hour << 11) | (d.minute << 5) | (d.second // 2)), (((d.year - 1980) << 9) | (d.month << 5) | d.day)
+
+
+def write_zip(path, entries, pw=PASSWORD, now=None):
+    # entries: [(name, bytes)]. Deflate, then encrypt; flag bit 0 = encrypted, no data descriptor (sizes are known).
+    t, d = dos_time(now or time.time())
+    central, off = [], 0
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        for name, data in entries:
+            nb = name.encode("ascii")
+            crc = zlib.crc32(data) & 0xFFFFFFFF
+            co = zlib.compressobj(9, zlib.DEFLATED, -15)
+            comp = co.compress(data) + co.flush()
+            zc = ZipCrypto(pw)
+            head = bytearray(os.urandom(11)) + bytes([crc >> 24])     # last byte of the 12 lets a reader check the password
+            enc = zc.encrypt(bytes(head)) + zc.encrypt(comp)
+            local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 1, 8, t, d, crc, len(enc), len(data), len(nb), 0) + nb
+            fh.write(local + enc)
+            # made by Unix (3), external attributes = regular file 0600: nothing extracts with an execute bit
+            central.append(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, (3 << 8) | 20, 20, 1, 8, t, d, crc, len(enc), len(data),
+                                       len(nb), 0, 0, 0, 0, (0o100600 << 16), off) + nb)
+            off += len(local) + len(enc)
+        cd = b"".join(central)
+        fh.write(cd + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), len(cd), off, 0))
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__ or "usage: hp-sample-zip SHA256 [SHA256 ...]")
+        return 2
+    wanted = []
+    for a in argv[1:]:
+        a = a.strip().lower()
+        if not SHA_RE.fullmatch(a):
+            print("not a SHA-256: %r" % a[:80], file=sys.stderr)
+            return 2
+        if a not in wanted:
+            wanted.append(a)
+    if len(wanted) > MAX_FILES:
+        print("at most %d files per zip" % MAX_FILES, file=sys.stderr)
+        return 2
+    found = find(set(wanted), download_dirs())
+    entries, manifest, total = [], [], 0
+    for sha in wanted:
+        if sha not in found:
+            continue
+        name, data = found[sha]
+        if total + len(data) > MAX_TOTAL:
+            print("skipped %s: the zip would pass %d MB" % (sha, MAX_TOTAL >> 20), file=sys.stderr)
+            continue
+        total += len(data)
+        entries.append((sha + ".bin", data))
+        manifest.append("%s  %9d  %s" % (sha, len(data), name))
+    missing = [s for s in wanted if s not in found]
+    if not entries:
+        print("none of the files were found on this honeypot (Cowrie's downloads may have been cleaned up)", file=sys.stderr)
+        return 1
+    now = time.time()
+    text = ("Files captured by a honeypot (Cowrie), collected with Huginn's hp-sample-zip on %s UTC.\n"
+            "They are live malware: never run them. sha256, size in bytes, name on the honeypot:\n\n%s\n"
+            % (datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"), "\n".join(manifest)))
+    entries.append(("manifest.txt", text.encode("ascii", "replace")))
+    os.makedirs(OUT_DIR, mode=0o700, exist_ok=True)
+    os.chmod(OUT_DIR, 0o700)
+    out = os.path.join(OUT_DIR, "samples-%s.zip" % datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    write_zip(out, entries, now=now)
+    print("wrote %s (%d file%s, %.1f KB), password: %s" % (out, len(entries) - 1, "" if len(entries) == 2 else "s",
+                                                            os.path.getsize(out) / 1024.0, PASSWORD.decode()))
+    for s in missing:
+        print("not found: %s" % s)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

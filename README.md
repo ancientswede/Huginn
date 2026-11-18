@@ -121,7 +121,7 @@ Replies to connections that were made *to* the honeypot still work, because the 
 - **Campaigns:** IPs grouped by command script (addresses, numbers and random markers ignored), SSH client fingerprint (HASSH), web attack, IDS rule and mail client name (HELO), so one botnet shows up as one group. **Proxy use** lists what bots fetch through the fake SSH proxy, with a 7-day count of proxy sessions and requests per session to compare before and after a change. **Slow replies** shows how many slow robots exports were sent in full (the client stayed until the last byte) and how long mail sessions lasted.
 - **Web attacks:** every request to the web trap is matched against about 3,100 rules from [Krawl](https://github.com/BlessedRebuS/Krawl): CVE exploits (with a link to the CVE), path traversal, webshells, `.env`/`.git` hunting, scanners and probes for exposed MCP servers. Exploits tag the attacker `web-exploit`, probes `web-probe`. A plain GET of a path counts as a probe: it only asks whether the path is there.
 - **IDS alerts (optional):** turn on [Suricata](https://suricata.io) on the honeypot with one command and Huginn names known attacks by rule and CVE, from the free [Emerging Threats Open](https://rules.emergingthreats.net) rules: exploits against routers, cameras and web apps, scanners, brute force tools. Each attacker page lists the rules it tripped, Campaigns groups them with a page per rule, and an attack rule tags the attacker `ids-alert`. Nothing to set up in your router: Suricata runs on the honeypot and only listens. See [Suricata IDS](#suricata-ids-optional).
-- **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up by its hash on [MalwareBazaar](https://bazaar.abuse.ch) (family and tags) and [VirusTotal](https://www.virustotal.com) (how many engines flag it, or *novel* if nobody has seen it). Only the hash is sent; the keys are pasted on the Settings page.
+- **Files:** everything attackers uploaded or downloaded. Each file is analysed statically on the honeypot: type, CPU architecture, UPX packing, the IP addresses and URLs embedded in it, and **which malware family it looks like** (Mirai, Gafgyt, Mozi, Tsunami, XMRig and other miners, SSH-key backdoors, dropper scripts) from strings these families are known to contain. Nothing is ever executed. Optionally, Huginn looks each file up by its hash on [MalwareBazaar](https://bazaar.abuse.ch) (family and tags) and [VirusTotal](https://www.virustotal.com) (how many engines flag it, or *novel* if nobody has seen it). Only the hash is sent; the keys are pasted on the Settings page. **Share with Sanesecurity** lists the files VirusTotal has never seen and gives a command for the honeypot: `hp-sample-zip` packs them into a zip with the password `infected` (each as `<sha256>.bin`, no execute bit, plus a manifest) that you send to [Sanesecurity](https://sanesecurity.com/contact-us/) so they become ClamAV signatures. Huginn never uploads anything itself.
 - **Credentials:** top usernames, passwords and pairs across SSH, Telnet, FTP, HTTP, MySQL, Redis, SMTP, POP3, IMAP, PostgreSQL and SOCKS5.
   - **Is my password in here?** Check whether attackers have tried one of your own passwords. The check runs in your browser: only the first 4 characters of the password's SHA-256 hash go to Huginn (the same idea as Have I Been Pwned), so the password itself never leaves your machine.
   - Search every username and password, and export them as word lists (for your own password policy or audits) or as a CSV of every attempt.
@@ -271,6 +271,7 @@ Install Cowrie (and optionally OpenCanary and endlessh) following their own docu
 ```bash
 install -m 755 honeypot/hp-export   /usr/local/bin/hp-export
 install -m 755 honeypot/hp-fileinfo /usr/local/bin/hp-fileinfo
+install -m 755 honeypot/hp-sample-zip /usr/local/bin/hp-sample-zip
 ```
 
 If your paths differ from the defaults, create `/etc/default/hp-export`. Several Cowrie directories mean several personas:
@@ -395,7 +396,7 @@ cd Huginn && git pull
 ./update-huginn.sh --rollback   # go back to the version before the last update
 
 # On the honeypot
-./update-honeypot.sh                          # hp-export, hp-fileinfo, hp-traps
+./update-honeypot.sh                          # hp-export, hp-fileinfo, hp-sample-zip, hp-traps
 ./update-honeypot.sh --cowrie --opencanary    # also upgrade Cowrie and OpenCanary and re-apply Huginn's patches
 ./update-honeypot.sh --goodbye-on             # optional logout note (see Personas and bait); --goodbye-off turns it off
 ./update-honeypot.sh --suricata-on            # optional Suricata IDS (see Suricata IDS); --suricata-off turns it off

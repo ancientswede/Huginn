@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.48.0"
+HUGINN_VERSION = "0.49.0"
 CHANGELOG = [
+    ("0.49.0", "2026-11-18", "Share captured malware with Sanesecurity: the Files page lists the files VirusTotal has never seen (every file "
+               "when no VirusTotal key is set) and gives the command to run on the honeypot. The new hp-sample-zip packs them into a "
+               "zip with the password \"infected\" (the convention malware labs use), each file as <sha256>.bin without an execute bit "
+               "and a manifest. Nothing is executed and the files never leave the honeypot unless you send the zip. Mark as shared "
+               "tags them so the list only shows what is left (undo per file). The attacker page links to Cisco Talos' reputation "
+               "lookup. From a LinkedIn comment."),
     ("0.48.0", "2026-11-18", "Tor exit nodes: once a day Huginn downloads the Tor Project's list of exit addresses (nothing is sent) and tags "
                "attackers that came through one \"tor\". Such an address is shared by many people, so it never counts as returned or "
                "stepped-up, and it is left out of the blocklist and its feeds unless you choose otherwise on Settings, Lookups (or "
@@ -394,6 +400,7 @@ CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TE
 CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
 CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
 CREATE TABLE IF NOT EXISTS tor(ip TEXT PRIMARY KEY, first REAL, last REAL);
+CREATE TABLE IF NOT EXISTS shared(sha TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS mails(h TEXT PRIMARY KEY, mail_from TEXT, subject TEXT, rcpts TEXT, helo TEXT, size INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS ids(ip TEXT, sid INTEGER, day TEXT, proto TEXT, port INTEGER, n INTEGER, first REAL, last REAL, sev INTEGER,
   sig TEXT, cat TEXT, PRIMARY KEY(ip, sid, day, proto, port));
@@ -4917,7 +4924,8 @@ def v_ip(ip, qs=None):
                         '<a href="/ip/%s/export.csv">Export CSV</a>' % esc(urllib.parse.quote(ip)),
                         ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
-                        ext("https://ipinfo.io/" + ip, "ipinfo"), ext("https://www.projecthoneypot.org/ip_" + ip, "Project Honey Pot")])
+                        ext("https://ipinfo.io/" + ip, "ipinfo"), ext("https://www.projecthoneypot.org/ip_" + ip, "Project Honey Pot"),
+                        ext("https://talosintelligence.com/reputation_center/lookup?search=" + urllib.parse.quote(ip), "Cisco Talos")])
     left = kv([("First seen", esc(fmt_tss(r["first"]))), ("Last seen", "%s <span class=muted>(%s)</span>" % (esc(fmt_tss(r["last"])), esc(ago(r["last"])))),
                ("Sessions", num(r["sessions"])), ("Logins", "%s ok · %s failed" % (num(r["logins_ok"]), num(r["logins_fail"]))),
                ("Commands", num(r["cmds"])), ("Files", num(r["files"])), ("Proxy attempts", num(r["tcpip"])), ("Exploits", num(r["exploits"])),
@@ -5634,6 +5642,7 @@ def v_help():
         row('<span class="tag t-red">Mirai</span>', "The malware family, best source first: MalwareBazaar, strings in the file, VirusTotal's label, then the file name or URL. Hover to see which."),
         row('<span class="tag t-red">41/62</span>', "VirusTotal: how many antivirus engines flag the file. Only the SHA-256 is sent, never the file."),
         row('<span class="tag t-orange">novel</span>', "VirusTotal has never seen this file. Rare, and worth a closer look."),
+        row('<span class="tag t-green">shared</span>', "You marked the file as shared with Sanesecurity (Share with Sanesecurity, at the bottom of Files)."),
         row('<span class="tag t-orange">UPX</span>', "Packed with UPX, which hides its contents from simple string searches."),
         row('<span class="tag">echo-built</span>', "Written on the honeypot line by line with echo or printf instead of being downloaded."),
         row("Embedded IPs / URLs", "Addresses found inside the file: often its command server or the next download. They feed the C2 list."),
@@ -5804,6 +5813,64 @@ def v_search(qs):
     return page("Search", form + '<div class="stack-w">%s</div>%s' % (found_any or '<div class="card muted">Nothing found.</div>', also), "/search")
 
 
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+SHARE_MAX = 50          # hp-sample-zip takes at most this many files per zip
+SHARE_URL = "https://sanesecurity.com/contact-us/"
+
+
+def share_candidates(con, shas, fi, vts):
+    # Files worth sending to a signature project: the ones VirusTotal has never seen, or every file when there is no
+    # VirusTotal key to tell. Only files hp-fileinfo has looked at (still on the honeypot); already shared ones are left out.
+    shared = {r[0] for r in con.execute("SELECT sha FROM shared")}
+    have_vt = bool(vt_key())
+    out = []
+    for sha in shas:
+        if sha in shared or sha not in fi or not SHA256_RE.fullmatch(sha):
+            continue
+        v = vts.get(sha)
+        if have_vt and not (v is not None and not v.get("found")):
+            continue
+        out.append(sha)
+    return out
+
+
+def share_card(con, shas, fi, vts, fam=""):
+    cand = share_candidates(con, shas, fi, vts)
+    n_shared = con.execute("SELECT COUNT(*) FROM shared").fetchone()[0]
+    what = "VirusTotal has never seen" if vt_key() else "the honeypot captured (no VirusTotal key, so Huginn cannot tell which are new)"
+    intro = ('<p class="muted small">Signature projects such as %s turn new malware into virus signatures (ClamAV and others). '
+             'The files stay on the honeypot: run the command there as root, it writes a zip with the password <b>infected</b> '
+             'to /root/hp-samples/. Send that zip as their contact page asks. Nothing is uploaded by Huginn.</p>' % ext(SHARE_URL, "Sanesecurity"))
+    if not cand:
+        body = none_yet("Nothing new to share" + (" (%s shared so far)" % num(n_shared) if n_shared else ""))
+    else:
+        pick = cand[:SHARE_MAX]
+        cmd = "hp-sample-zip " + " ".join(pick)
+        body = ('<p>%s file%s %s%s%s.</p><div class="feed"><div class="feed-h"><b>On the honeypot</b><button class="btn-s" data-copy="%s">Copy</button></div>'
+                '<div class="mono url">%s</div></div>'
+                '<form method=post action="/files/shared"><input type=hidden name=shas value="%s"><button>Mark %s as shared</button></form>'
+                % (num(len(cand)), "" if len(cand) == 1 else "s", esc(what), (" (%s only)" % esc("unknown family" if fam == "unknown" else fam)) if fam else "",
+                   (", the first %d in this command" % SHARE_MAX) if len(cand) > SHARE_MAX else "",
+                   esc(cmd), esc(cmd), esc(" ".join(pick)), "it" if len(pick) == 1 else "these %d" % len(pick)))
+    undo = ""
+    if n_shared:
+        last = con.execute("SELECT sha FROM shared ORDER BY ts DESC LIMIT 1").fetchone()[0]
+        undo = ('<form method=post action="/files/unshared" class="inline"><input type=hidden name=shas value="%s">'
+                '<button class="btn-s">Undo the last one</button></form>' % esc(last))
+    return '<h2>Share with Sanesecurity</h2><div class="card">%s%s%s</div>' % (intro, body, undo)
+
+
+def mark_shared(con, raw, on=True):
+    shas = [x for x in (raw or "").lower().split() if SHA256_RE.fullmatch(x)][:SHARE_MAX]
+    with con:
+        for sha in shas:
+            if on:
+                con.execute("INSERT OR IGNORE INTO shared(sha, ts) VALUES(?,?)", (sha, time.time()))
+            else:
+                con.execute("DELETE FROM shared WHERE sha=?", (sha,))
+    return len(shas)
+
+
 def v_files(qs=None):
     con = db()
     want = ((qs or {}).get("fam") or "")[:80]
@@ -5831,7 +5898,9 @@ def v_files(qs=None):
              + (chip("unknown", "Unknown", counts[""]) if counts.get("") else "") + "</div>") if len(counts) > 1 or counts.get("") else ""
     if want:
         shas = [x for x in shas if (fams[x][0] or "unknown") == want or (want == "unknown" and not fams[x][0])]
+    share = share_card(con, shas, fi, vts, want)      # follows the family filter: pick Mirai, share only Mirai
     shas = shas[:300]
+    shared = dict(con.execute("SELECT sha, ts FROM shared").fetchall())
     trs = ""
     for sha in shas:
         e, f = ev.get(sha), fi.get(sha)
@@ -5843,15 +5912,17 @@ def v_files(qs=None):
                 % (("<a href='/campaign/file/%s'>%s…</a>" % (esc(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
                    esc("%.1f KB" % (f["size"] / 1024.0)) if f else "", esc(clean(e["names"], 200)) if e else "",
                    ioc_cell(iocs),
-                   esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "", vt_html(vts.get(sha)),
+                   esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "", vt_html(vts.get(sha)) + (
+                       ' <span class="tag t-green" title="Marked as shared %s">shared</span>' % esc(fmt_ts(shared.get(sha, 0))) if sha in shared else ""),
                    ext("https://bazaar.abuse.ch/sample/%s/" % sha, "MalwareBazaar"), ext("https://www.virustotal.com/gui/file/" + sha, "VirusTotal")))
     urls = con.execute("SELECT a, MAX(ts) l, COUNT(*) n, COUNT(DISTINCT ip) nip FROM events WHERE kind='file_fail' AND a IS NOT NULL GROUP BY a ORDER BY l DESC LIMIT 200").fetchall()
     urs = "".join("<tr><td class='mono trunc'>%s</td><td>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
                   % (esc(clean(u["a"], 200)), esc(ago(u["l"])), num(u["n"]), num(u["nip"]), ext("https://urlhaus.abuse.ch/browse.php?search=" + urllib.parse.quote(u["a"]), "URLhaus")) for u in urls)
     body = ('<h1>Files</h1><p class=muted>Captured by the honeypot (uploads and downloads). Never executed here — look them up by hash only.</p>'
-            '<div class="card">%s%s</div><h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
+            '<div class="card">%s%s</div>%s<h2>Malware URLs (fetch blocked)</h2><div class="card">%s</div>'
             % (chips, '<input class="qf" data-filter="t-files" placeholder="Filter"><table id="t-files" class="wide"><thead><tr><th>SHA-256</th><th>Type</th><th class=num>Size</th><th>Names / URLs</th>'
                '<th>Embedded IPs / URLs</th><th>Last</th><th class=num>IPs</th><th>VirusTotal</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % trs if trs else none_yet("No files captured yet"),
+               share,
                '<table class="wide"><thead><tr><th>URL</th><th>Last</th><th class=num>Tries</th><th class=num>IPs</th><th>Lookup</th></tr></thead><tbody>%s</tbody></table>' % urs if urs else none_yet("No blocked downloads recorded")))
     return page("Files", body, "/files")
 
@@ -8109,6 +8180,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/new/undo":
             undo_review(con)
             return self.redirect("/new")
+        if path in ("/files/shared", "/files/unshared"):
+            if not mark_shared(con, self.form().get("shas"), on=path == "/files/shared"):
+                return self.send(400, "Bad value", "text/plain")
+            return self.redirect("/files")
         m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/flag", path)
         if m:
             try:

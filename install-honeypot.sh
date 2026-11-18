@@ -112,7 +112,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -513,6 +513,7 @@ fi
 say "Export for Huginn"
 install -m 755 "$HERE/honeypot/hp-export" /usr/local/bin/hp-export
 install -m 755 "$HERE/honeypot/hp-fileinfo" /usr/local/bin/hp-fileinfo
+install -m 755 "$HERE/honeypot/hp-sample-zip" /usr/local/bin/hp-sample-zip   # run by hand: packs captured files for Sanesecurity
 if [ ! -f /etc/default/hp-export ]; then
   cat > /etc/default/hp-export <<EOF
 # hp-export settings (read by /usr/local/bin/hp-export). Several Cowrie dirs = several personas.

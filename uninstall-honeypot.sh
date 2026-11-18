@@ -117,7 +117,7 @@ if [ -f /root/.ssh/authorized_keys ] && grep -q 'command="/usr/local/bin/hp-expo
   sed -i '\#command="/usr/local/bin/hp-export"#d' /root/.ssh/authorized_keys
   ok "removed Huginn's key from /root/.ssh/authorized_keys"
 fi
-rm -f /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-logclean /usr/local/sbin/hp-add-huginn-key /etc/default/hp-export
+rm -f /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-sample-zip /usr/local/bin/hp-logclean /usr/local/sbin/hp-add-huginn-key /etc/default/hp-export
 rm -rf /var/lib/hp-export /opt/hp-traps /etc/huginn-honeypot
 ok "removed hp-export, hp-fileinfo, hp-traps and the personas/bait"
 

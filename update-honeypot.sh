@@ -53,7 +53,7 @@ if [ -n "$GOODBYE" ]; then
   exit 0
 fi
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -83,13 +83,13 @@ FAILED=0
 say "Backup"
 B="/root/huginn-honeypot-backups/$(date +%Y%m%d-%H%M%S)"
 install -d -m 700 "$B"
-cp -p /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo "$B/" 2>/dev/null || true
+cp -p /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-sample-zip "$B/" 2>/dev/null || true
 [ -f /opt/hp-traps/hp-traps.py ] && cp -p /opt/hp-traps/hp-traps.py "$B/"
 ok "$B"
 ls -1dt /root/huginn-honeypot-backups/*/ 2>/dev/null | tail -n +6 | while read -r old; do rm -rf -- "$old"; done
 
 say "Huginn's honeypot scripts"
-for f in hp-export hp-fileinfo; do
+for f in hp-export hp-fileinfo hp-sample-zip; do
   if cmp -s "$HERE/honeypot/$f" "/usr/local/bin/$f"; then ok "$f unchanged"; else install -m 755 "$HERE/honeypot/$f" "/usr/local/bin/$f"; ok "$f updated"; fi
 done
 if [ -d /opt/hp-traps ]; then
