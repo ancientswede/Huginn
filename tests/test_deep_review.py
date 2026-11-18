@@ -286,8 +286,9 @@ class Scripts(unittest.TestCase):
             os.mkdir(os.path.join(d, "log.json.x\nsecret"))           # a name with a line break
             with open(os.path.join(d, "log.json.y\nsecret"), "w") as fh:
                 fh.write("ODD\n")
-            out = subprocess.run(["bash", "-c", self.catfiles() + '\ncd "%s"\ncatfiles "%s/log.json*"' % (d, d)],
-                                 capture_output=True, text=True, timeout=20).stdout
+            # 0.49.1: catfiles became hp-readlogs (reads from the end, drops to the folder's owner); same protections.
+            out = subprocess.run(["python3", "-I", os.path.join(ROOT, "honeypot", "hp-readlogs"), "%s/log.json*" % d, "0", "0"],
+                                 capture_output=True, text=True, timeout=20, cwd=d).stdout
             self.assertIn("REAL", out)
             self.assertNotIn("TOP-SECRET", out)
         finally:

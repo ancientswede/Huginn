@@ -112,7 +112,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -511,6 +511,7 @@ fi
 
 # ------------------------------------------------------------------ 5. export for Huginn
 say "Export for Huginn"
+install -m 755 "$HERE/honeypot/hp-readlogs" /usr/local/bin/hp-readlogs
 install -m 755 "$HERE/honeypot/hp-export" /usr/local/bin/hp-export
 install -m 755 "$HERE/honeypot/hp-fileinfo" /usr/local/bin/hp-fileinfo
 install -m 755 "$HERE/honeypot/hp-sample-zip" /usr/local/bin/hp-sample-zip   # run by hand: packs captured files for Sanesecurity
@@ -537,7 +538,18 @@ key="$*"
 blob="$(echo "$key" | awk '{print $2}')"
 install -d -m 700 /root/.ssh
 touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-if grep -qF "$blob" /root/.ssh/authorized_keys; then echo "Key is already present."; exit 0; fi
+# The key is matched as its own field, and a line that has it must be exactly the locked one: an older line with the
+# same key and wider rights (a plain admin key, say) is a conflict to sort out by hand, never "already present".
+match=$(awk -v b="$blob" '{for (i = 1; i <= NF; i++) if ($i == b) {print; break}}' /root/.ssh/authorized_keys)
+if [ -n "$match" ]; then
+  if [ "$(printf '%s\n' "$match" | wc -l)" = 1 ] && [[ "$match" == 'restrict,command="/usr/local/bin/hp-export" '* ]]; then
+    echo "Key is already present, locked to hp-export."; exit 0
+  fi
+  echo "This key is already in /root/.ssh/authorized_keys with other options (or more than once):" >&2
+  printf '%s\n' "$match" | cut -c1-80 | sed 's/^/  /' >&2
+  echo "Remove those lines first (or use another key for Huginn), then run this again." >&2
+  exit 1
+fi
 cp -p /root/.ssh/authorized_keys "/root/.ssh/authorized_keys.bak-$(date +%s)"
 echo "restrict,command=\"/usr/local/bin/hp-export\" $key" >> /root/.ssh/authorized_keys
 echo "Added. This key can only run /usr/local/bin/hp-export (no shell, no forwarding)."

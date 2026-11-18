@@ -171,10 +171,36 @@ except OSError:
 if old != new:
     with open(out + ".new", "w") as fh:
         fh.write(new)
-    import os
-    os.replace(out + ".new", out)
-    print("changed")
 PY
+  # A new config is tested with the rules in use before it replaces the working one, and the working one is kept as
+  # .prev, so a restart that fails with it can go back (Codex 049 M17).
+  [ -f "$CONF.new" ] || return 0
+  if [ -s "$RULES" ] && command -v suricata >/dev/null; then
+    ensure_user
+    local t
+    t=$(mktemp -d) || return 1
+    chown "$SURI_USER:$SURI_USER" "$t" || { rm -rf "$t"; return 1; }
+    if ! limited 900M 600 suricata -T -c "$CONF.new" -l "$t" --set logging.outputs.1.file.filename="$t/test.log" >"$WORK/conftest.out" 2>&1; then
+      grep -iE "error|fail" "$WORK/conftest.out" | tail -5 | sed 's/^/      /' >&2
+      rm -rf "$t" "$CONF.new"
+      warn "the new Suricata config did not pass Suricata's own test: the working config is kept" >&2
+      return 0
+    fi
+    rm -rf "$t"
+  fi
+  [ -f "$CONF" ] && cp -p "$CONF" "$CONF.prev"
+  mv "$CONF.new" "$CONF"
+  echo "changed"
+}
+
+restore_prev() {  # the config and unit from before this run, if the engine does not start with the new ones
+  local any=0
+  [ -f "$CONF.prev" ] && mv "$CONF.prev" "$CONF" && any=1
+  [ -f /etc/systemd/system/suricata.service.d/huginn.conf.prev ] && \
+    mv /etc/systemd/system/suricata.service.d/huginn.conf.prev /etc/systemd/system/suricata.service.d/huginn.conf && any=1
+  [ "$any" = 1 ] || return 1
+  systemctl daemon-reload
+  restart_engine
 }
 
 write_disable() {
@@ -217,6 +243,8 @@ EOF
   if cmp -s /etc/systemd/system/suricata.service.d/huginn.conf.new /etc/systemd/system/suricata.service.d/huginn.conf; then
     rm -f /etc/systemd/system/suricata.service.d/huginn.conf.new; return 1
   fi
+  [ -f /etc/systemd/system/suricata.service.d/huginn.conf ] && \
+    cp -p /etc/systemd/system/suricata.service.d/huginn.conf /etc/systemd/system/suricata.service.d/huginn.conf.prev
   mv /etc/systemd/system/suricata.service.d/huginn.conf.new /etc/systemd/system/suricata.service.d/huginn.conf
   systemctl daemon-reload
 }
@@ -378,8 +406,12 @@ case "${1:-}" in
     write_disable
     write_timer
     if [ ! -s "$RULES" ]; then warn "Suricata has no rules yet: ./update-honeypot.sh --suricata-rules emerging.rules.tar.gz"
-    elif [ "$changed" = 1 ] || ! systemctl is-active --quiet suricata; then start_check
+    elif [ "$changed" = 1 ] || ! systemctl is-active --quiet suricata; then
+      if restart_engine; then ok "Suricata is running"
+      elif [ "$changed" = 1 ] && restore_prev; then warn "Suricata did not start with the new config: the previous one is back and running"; exit 1
+      else start_check; fi
     else ok "Suricata running, config unchanged"; fi
+    rm -f "$CONF.prev" /etc/systemd/system/suricata.service.d/huginn.conf.prev
     ;;
   rules)
     f="${2:-}"

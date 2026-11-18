@@ -79,7 +79,7 @@ class SampleZip(unittest.TestCase):
         rc, _out, err = self.run_tool("a" * 64, "b" * 64)
         self.assertEqual(rc, 1)
         self.assertIn("none of the files", err)
-        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual([n for n in os.listdir(self.out) if n.endswith(".zip")] if os.path.exists(self.out) else [], [])
 
     def test_missing_listed(self):
         a = self.put(hashlib.sha256(SCRIPT).hexdigest(), SCRIPT)

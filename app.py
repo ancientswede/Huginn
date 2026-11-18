@@ -5,8 +5,19 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.49.1"
+HUGINN_VERSION = "0.50.0"
 CHANGELOG = [
+    ("0.50.0", "2026-11-18", "Second part of the full code review. The honeypot no longer reads as root what a service user could "
+               "redirect: logs, patch checks and captured files are read after dropping to the user who owns them (new "
+               "hp-readlogs; hp-sample-zip reads in a child process). Logs are read from the end and reading stops once there "
+               "is enough, instead of the whole rotated history on every sync. The IDS switch takes the same lock as rule "
+               "updates and is only on when engine and rule timer both run (the export now reports the timer too). A new "
+               "Suricata config is tested before use and the previous one comes back if the engine will not start. Cowrie and "
+               "OpenCanary upgrades go back to the version that ran before when the install or Huginn's patches fail. The "
+               "Huginn update checks every step of a rollback. One broken field in the export (text SQLite cannot store, "
+               "JSON nested too deep) no longer stops the whole sync. Board and the Overview numbers are kept for up to 5 "
+               "minutes instead of being rebuilt after every sync, and the password index no longer counts every login to "
+               "see whether anything changed. hp-add-huginn-key refuses a key that is already there with other options."),
     ("0.49.1", "2026-11-18", "Fixes from a full code review of everything since 0.25. Sharing: hp-sample-zip reads one file at a time, "
                "gives each zip a name of its own and prints the hashes that really went in; Huginn marks only those as shared and "
                "lists only files still on the honeypot. hp-fileinfo hashes the whole file, not the first 8 MB, and stops listing "
@@ -985,6 +996,17 @@ def p_traps(line):
 PARSERS = {"COWRIE": p_cowrie, "CANARY": p_canary, "ENDLESSH": p_endlessh, "TRAPS": p_traps}
 
 
+def u8(x):
+    # Text SQLite can store: JSON may hold lone surrogates (\ud800) that UTF-8 cannot encode, and one such field would
+    # roll back the whole batch (Codex 049 M19). Other types pass through.
+    if isinstance(x, str):
+        try:
+            x.encode("utf-8")
+        except UnicodeEncodeError:
+            return x.encode("utf-8", "replace").decode("utf-8")
+    return x
+
+
 def parse_export(text, skip):
     rows, hashes, section = [], set(), None
     files, personas, bait, identities, mails, status, ids_lines = [], [], {}, [], [], [], []
@@ -1001,7 +1023,7 @@ def parse_export(text, skip):
         if section == "FILES" and line.startswith("{"):
             try:
                 files.append(json.loads(line))
-            except ValueError:
+            except (ValueError, RecursionError):        # deeply nested JSON must not stop the whole sync (Codex 049 M19)
                 pass
             continue
         if section == "PERSONAS":
@@ -1022,7 +1044,7 @@ def parse_export(text, skip):
         if section == "BAIT" and line.startswith("{"):
             try:
                 bait.update(json.loads(line))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 pass
             continue
         fn = PARSERS.get(section)
@@ -1037,6 +1059,7 @@ def parse_export(text, skip):
         except Exception:
             r = None
         if r and sane_row(r):
+            r = tuple(u8(x) for x in r)
             rows.append((h,) + r)
             if section == "TRAPS" and r[5] and r[6].startswith("relay: "):
                 try:
@@ -1044,10 +1067,11 @@ def parse_export(text, skip):
                 except Exception:
                     m = None
                 if m:
-                    mails.append((h, r[6]) + m)
+                    mails.append(tuple(u8(x) for x in (h, r[6]) + m))
     parse_export.files = files
     parse_export.mails = mails
     parse_export.ids, ids_rules = parse_ids(ids_lines[-20000:] + ids_meta_lines[-2:], skip, hashes)
+    parse_export.ids = [tuple(u8(x) for x in r) for r in parse_export.ids]
     ids_dropped = max([int(x[8:]) for x in ids_meta_lines if x.startswith("dropped ") and x[8:].isdigit() and len(x) < 20] or [0])
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
@@ -1217,12 +1241,15 @@ def store_files(con, files):
                     continue
             except (TypeError, ValueError, OverflowError):
                 continue
-            con.execute("INSERT INTO files(sha, src, size, type, arch, packed, iocs, mtime, updated, family) VALUES(?,?,?,?,?,?,?,?,?,?) "
-                        "ON CONFLICT(sha) DO UPDATE SET src=excluded.src, size=excluded.size, type=excluded.type, arch=excluded.arch, "
-                        "packed=excluded.packed, iocs=excluded.iocs, mtime=excluded.mtime, updated=excluded.updated, family=excluded.family",
-                        (sha, str(f.get("src") or "")[:20], size, str(f.get("type") or "")[:80],
-                         str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now,
-                         str(f.get("family") or "")[:60]))
+            row = tuple(u8(x) for x in (sha, str(f.get("src") or "")[:20], size, str(f.get("type") or "")[:80],
+                                        str(f.get("arch") or "")[:20], 1 if f.get("packed") else 0, json.dumps(iocs), mtime, now,
+                                        str(f.get("family") or "")[:60]))
+            try:
+                con.execute("INSERT INTO files(sha, src, size, type, arch, packed, iocs, mtime, updated, family) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                            "ON CONFLICT(sha) DO UPDATE SET src=excluded.src, size=excluded.size, type=excluded.type, arch=excluded.arch, "
+                            "packed=excluded.packed, iocs=excluded.iocs, mtime=excluded.mtime, updated=excluded.updated, family=excluded.family", row)
+            except (sqlite3.Error, ValueError, OverflowError):
+                continue                            # one bad file record, not the whole list
 
 
 # File and URL names that give a family away, for files the honeypot could not fetch or analyse.
@@ -2837,6 +2864,7 @@ def retention(con):
         # Lookups of attackers that are gone (Codex 047): their netblock and owner rows would still be counted.
         con.execute("DELETE FROM netblock WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM asname WHERE asn NOT IN (SELECT asn FROM netblock WHERE asn IS NOT NULL)")
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('events_gen',?)", (str(time.time()),))   # caches start over
     con.execute("PRAGMA optimize")
 
 
@@ -4107,7 +4135,7 @@ def v_overview(qs=None):
     now = time.time()
     d7 = now - 7 * 86400
     st = settings(con)
-    kp, w, tw = overview_kpis(con, st)
+    kp, w, tw = board_cached(con, st, ("kpis",), lambda: overview_kpis(con, st))
 
     days = []
     for i in range(13, -1, -1):
@@ -4195,8 +4223,14 @@ def board_hidden(st):
     return " AND e.ip NOT IN (SELECT x.ip FROM enrich x WHERE NOT (1" + hs + "))", ha
 
 
+BOARD_TTL = 300      # Board and the Overview numbers are reused for up to 5 minutes, not rebuilt after every 2-minute sync
+
+
 def board_cached(con, st, key, fn):
-    full = (key, get_meta(con, "last_ingest", ""), tuple(st["hide_cc"]), tuple(st["hide_asn"]))
+    # Keyed on a 5-minute generation instead of every sync's time stamp: a sync every 2 minutes used to throw the heavy
+    # aggregates away before anyone looked at them again (Codex 049 M13). A history cut (retention) starts a new one.
+    gen = int(float(get_meta(con, "last_ingest", "0") or 0) // BOARD_TTL)
+    full = (key, gen, get_meta(con, "events_gen", ""), tuple(st["hide_cc"]), tuple(st["hide_asn"]))
     if full not in _board_cache:
         if len(_board_cache) > 16:
             _board_cache.clear()
@@ -4366,7 +4400,7 @@ def v_board(con, qs):
     svcs = board_cached(con, st, ("svc", rng), lambda: board_services(con, st, rng))
     svc = qs.get("svc") if qs.get("svc") in svcs else None
     d = board_cached(con, st, ("detail", rng, svc), lambda: board_detail(con, st, rng, svc))
-    kp, _w, _tw = overview_kpis(con, st)
+    kp, _w, _tw = board_cached(con, st, ("kpis",), lambda: overview_kpis(con, st))
     every = BOARD_RANGES[rng][2]
     what = esc(svc) if svc else "all services"
 
@@ -6153,7 +6187,9 @@ def pw_hash(pw):
 
 def cred_index(con):
     global _cred_cache
-    key = "%s|%s" % (get_meta(con, "last_ingest", ""), con.execute("SELECT COUNT(*) FROM events WHERE kind IN ('login_ok','login_fail','canary')").fetchone()[0])
+    # The newest event and the history-cut generation say whether anything changed: a COUNT over every login on each
+    # check cost as much as the lookup itself (Codex 049 M13).
+    key = "%s|%s" % (con.execute("SELECT MAX(rowid) FROM events").fetchone()[0], get_meta(con, "events_gen", ""))
     with _cred_lock:
         if _cred_cache.get("key") == key:
             return _cred_cache

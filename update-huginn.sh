@@ -66,11 +66,21 @@ wait_for() {  # wait_for VERSION -> 0 when Huginn answers with that version
 }
 
 restore() {  # restore BACKUPDIR: put the code from a backup back and restart (data is left alone)
-  install -m 644 "$1/app.py" "$DIR/app.py"
-  if [ -d "$1/static" ]; then rm -rf "$DIR/static"; cp -a "$1/static" "$DIR/static"; fi
-  if [ -f "$1/huginn.service" ]; then install -m 644 "$1/huginn.service" "/etc/systemd/system/$SVC.service"; fi
-  systemctl daemon-reload
-  systemctl restart "$SVC"
+  # Every step checks its own result and the files are compared afterwards: called as "restore || ...", set -e does not
+  # apply in here, so a failed copy must not be hidden by a successful restart (Codex 049 M15).
+  local bad=0
+  install -m 644 "$1/app.py" "$DIR/app.py" || bad=1
+  if [ -d "$1/static" ]; then
+    rm -rf "$DIR/static.restore" && cp -a "$1/static" "$DIR/static.restore" && rm -rf "$DIR/static" \
+      && mv "$DIR/static.restore" "$DIR/static" || bad=1
+  fi
+  if [ -f "$1/huginn.service" ]; then install -m 644 "$1/huginn.service" "/etc/systemd/system/$SVC.service" || bad=1; fi
+  cmp -s "$1/app.py" "$DIR/app.py" || bad=1
+  [ ! -d "$1/static" ] || diff -rq "$1/static" "$DIR/static" >/dev/null || bad=1
+  [ ! -f "$1/huginn.service" ] || cmp -s "$1/huginn.service" "/etc/systemd/system/$SVC.service" || bad=1
+  systemctl daemon-reload || bad=1
+  systemctl restart "$SVC" || bad=1
+  [ "$bad" = 0 ] || { warn "the restore from $1 was not complete: compare $1 with $DIR by hand"; return 1; }
 }
 
 # ------------------------------------------------------------------ rollback

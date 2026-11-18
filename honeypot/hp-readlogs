@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+# hp-readlogs — reads log files for hp-export (part of Huginn, AGPL-3.0-or-later).
+#   hp-readlogs PATTERN MAXLINES MAXBYTES       e.g.  hp-readlogs '/home/cowrie/cowrie/var/log/cowrie/cowrie.json*' 30000 0
+# Prints the newest MAXLINES lines (0 = no line limit) of the files matching PATTERN, oldest first, skipping .gz.
+# Files are read from the end, newest file first, and reading stops once there are enough lines or MAXBYTES (0 = 256 MB)
+# have been read, so a long rotated history is not read in full on every sync (Codex 049 M20).
+#
+# It runs as root, but never reads as root what a service user could redirect (Codex 049 H1): the folder is checked
+# component by component; if any part of the way belongs to a service user (cowrie, opencanary, hp-traps), the folder is
+# opened, its owner checked, and the process drops to that user before a single file is opened in it. Root-owned
+# symlinks (/var/log/hp-traps -> private/hp-traps) are followed; one owned by anyone else counts as that user's.
+# Files are opened with O_NOFOLLOW relative to the open folder, must be regular files with one link.
+import fnmatch, os, stat, sys
+
+DEFAULT_BYTES = 256 * 1024 * 1024
+
+
+def expected_owner(path, depth=0):
+    # (uid, gid) of the first component on the way that is not root's, after following root-owned symlinks; (0, 0) if
+    # the whole way belongs to root. None if the way does not exist or loops.
+    if depth > 20:
+        return None
+    cur = "/"
+    parts = [p for p in os.path.abspath(path).split("/") if p]
+    for i, part in enumerate(parts):
+        nxt = os.path.join(cur, part)
+        try:
+            st = os.lstat(nxt)
+        except OSError:
+            return None
+        if st.st_uid != 0:
+            return st.st_uid, st.st_gid
+        if stat.S_ISLNK(st.st_mode):
+            target = os.readlink(nxt)
+            rest = os.path.join(target if target.startswith("/") else os.path.join(cur, target), *parts[i + 1:])
+            return expected_owner(os.path.normpath(rest), depth + 1)
+        cur = nxt
+    return 0, 0
+
+
+def tail_lines(fd, size, want, budget):
+    # The last `want` lines of an open file (all when want is 0), reading backwards in blocks, never more than budget bytes.
+    lines, buf, pos, used = [], b"", size, 0
+    while pos > 0 and used < budget and (not want or len(lines) < want):
+        n = min(1 << 20, pos, budget - used)
+        pos -= n
+        used += n
+        chunk = os.pread(fd, n, pos) + buf
+        parts = chunk.split(b"\n")
+        buf = parts[0] if pos > 0 else b""
+        new = parts[1:] if pos > 0 else parts
+        lines[:0] = new
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if pos == 0 and buf:
+        lines.insert(0, buf)
+    return (lines[-want:] if want else lines), used
+
+
+def main():
+    pattern, want, budget = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) or DEFAULT_BYTES
+    folder, name_pat = os.path.dirname(pattern) or "/", os.path.basename(pattern)
+    owner = expected_owner(folder)
+    if owner is None:
+        return 0
+    try:
+        dfd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return 0
+    st = os.fstat(dfd)
+    if owner[0] and st.st_uid != owner[0]:
+        print("hp-readlogs: %s changed owner while it was opened, skipped" % folder, file=sys.stderr)
+        return 1
+    if owner[0] and os.getuid() == 0:            # from here on, only what that user may read
+        os.setgroups([])
+        os.setgid(st.st_gid)
+        os.setuid(st.st_uid)
+    files = []
+    for n in os.listdir(dfd):
+        if n.endswith(".gz") or not fnmatch.fnmatchcase(n, name_pat):
+            continue
+        try:
+            fd = os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError:
+            continue
+        fs = os.fstat(fd)
+        if not stat.S_ISREG(fs.st_mode) or fs.st_nlink != 1:
+            os.close(fd)
+            continue
+        files.append((fs.st_mtime, n, fd, fs.st_size))
+    out, used = [], 0
+    for _m, _n, fd, size in sorted(files, reverse=True):          # newest first
+        if (want and len(out) >= want) or used >= budget:
+            break
+        got, u = tail_lines(fd, size, want - len(out) if want else 0, budget - used)
+        out[:0] = got
+        used += u
+    for _m, _n, fd, _s in files:
+        os.close(fd)
+    w = sys.stdout.buffer
+    for line in out:
+        w.write(line + b"\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

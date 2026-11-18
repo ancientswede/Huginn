@@ -231,9 +231,10 @@ class Honeypot(unittest.TestCase):
         data = os.urandom(1000)
         sha = hashlib.sha256(data).hexdigest()
         (self.dl / "redir_abcd1234").write_bytes(data)
-        found = z.find({sha}, [str(self.dl)])
+        dirfds, owner = z.open_dirs([str(self.dl)])
+        found = z.find({sha}, dirfds)
         self.assertEqual(found[sha][1:], ("redir_abcd1234", 1000))
-        self.assertIsInstance(found[sha][0], str)
+        self.assertIsInstance(found[sha][0], int)          # an open folder, not a path
 
     def test_m6_whole_file_hashed(self):
         fi = tool("hp-fileinfo")

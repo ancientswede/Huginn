@@ -272,6 +272,7 @@ Install Cowrie (and optionally OpenCanary and endlessh) following their own docu
 install -m 755 honeypot/hp-export   /usr/local/bin/hp-export
 install -m 755 honeypot/hp-fileinfo /usr/local/bin/hp-fileinfo
 install -m 755 honeypot/hp-sample-zip /usr/local/bin/hp-sample-zip
+install -m 755 honeypot/hp-readlogs /usr/local/bin/hp-readlogs
 ```
 
 If your paths differ from the defaults, create `/etc/default/hp-export`. Several Cowrie directories mean several personas:

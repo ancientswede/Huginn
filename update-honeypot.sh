@@ -53,7 +53,7 @@ if [ -n "$GOODBYE" ]; then
   exit 0
 fi
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -83,13 +83,13 @@ FAILED=0
 say "Backup"
 B="/root/huginn-honeypot-backups/$(date +%Y%m%d-%H%M%S)"
 install -d -m 700 "$B"
-cp -p /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-sample-zip "$B/" 2>/dev/null || true
+cp -p /usr/local/bin/hp-export /usr/local/bin/hp-fileinfo /usr/local/bin/hp-sample-zip /usr/local/bin/hp-readlogs "$B/" 2>/dev/null || true
 [ -f /opt/hp-traps/hp-traps.py ] && cp -p /opt/hp-traps/hp-traps.py "$B/"
 ok "$B"
 ls -1dt /root/huginn-honeypot-backups/*/ 2>/dev/null | tail -n +6 | while read -r old; do rm -rf -- "$old"; done
 
 say "Huginn's honeypot scripts"
-for f in hp-export hp-fileinfo hp-sample-zip; do
+for f in hp-readlogs hp-export hp-fileinfo hp-sample-zip; do
   if cmp -s "$HERE/honeypot/$f" "/usr/local/bin/$f"; then ok "$f unchanged"; else install -m 755 "$HERE/honeypot/$f" "/usr/local/bin/$f"; ok "$f updated"; fi
 done
 if [ -d /opt/hp-traps ]; then
@@ -130,16 +130,32 @@ cowrie_patches() {  # every Huginn patch on the Cowrie source in $C (after an up
     src/cowrie/commands/scp.py src/cowrie/shell/fs.py src/cowrie/commands/wget.py src/cowrie/shell/protocol.py \
     src/cowrie/commands/bash.py 2>/dev/null || true
   BEFORE=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
+  BEFORE_FULL=$(runuser -u cowrie -- git -C "$C" rev-parse HEAD)
   back_or_die() {  # put the patches back on whatever source is there now, then stop with an honest message
     cowrie_patches
     if [ "$PFAIL" = 0 ]; then die "$1 Huginn's patches are back on the source in $C; restart Cowrie only after checking it."
     else die "$1 $PFAIL Huginn patch(es) could not be put back (see the warnings above); do not restart Cowrie before fixing $C."; fi
   }
+  # Back to the exact version that ran before, source AND packages, so a failed upgrade never leaves a mix of the two
+  # (Codex 049 M16). Nothing is restarted until the patches are checked.
+  go_back() {
+    warn "$1 — going back to Cowrie $BEFORE"
+    runuser -u cowrie -- git -C "$C" reset -q --hard "$BEFORE_FULL" \
+      && runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ." \
+      || back_or_die "$1, and going back to $BEFORE failed too."
+    PFAIL=0; cowrie_patches
+    [ "$PFAIL" = 0 ] || back_or_die "$1; back on $BEFORE, but"
+    for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
+    die "$1 Cowrie $BEFORE with Huginn's patches is running again."
+  }
   runuser -u cowrie -- git -C "$C" pull -q --ff-only || back_or_die "git pull failed in $C (local changes?) — Cowrie was not updated."
   AFTER=$(runuser -u cowrie -- git -C "$C" rev-parse --short HEAD)
-  runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ." || back_or_die "pip install failed in $C after the update."
+  runuser -u cowrie -- bash -c "cd '$C' && cowrie-env/bin/pip install -q -e ." || go_back "pip install failed in $C after the update"
   ok "Cowrie $BEFORE -> $AFTER"
+  PFAIL=0
   cowrie_patches
+  # A patch that protects the honeypot (sandbox-like: free, proxy, upload) no longer fitting is a reason to stay on the old version.
+  [ "$PFAIL" = 0 ] || [ "$BEFORE" = "$AFTER" ] || go_back "$PFAIL Huginn patch(es) do not fit Cowrie $AFTER"
   for u in $(systemctl list-units --type=service --all --no-legend 'cowrie*' | awk '{print $1}'); do restart_ok "$u"; done
 fi
 
@@ -147,11 +163,21 @@ if [ "$UP_CANARY" = 1 ]; then
   say "OpenCanary"
   [ -x "$O/oc-env/bin/pip" ] || die "OpenCanary is not installed in $O."
   BEFORE=$(runuser -u opencanary -- "$O/oc-env/bin/pip" show opencanary 2>/dev/null | sed -n 's/^Version: //p')
-  runuser -u opencanary -- "$O/oc-env/bin/pip" install -q -U opencanary
+  oc_back() {  # the version that ran before, if the upgrade or the patch on it failed (Codex 049 M16)
+    warn "$1 — going back to OpenCanary $BEFORE"
+    [[ "$BEFORE" =~ ^[0-9A-Za-z.+-]+$ ]] && runuser -u opencanary -- "$O/oc-env/bin/pip" install -q "opencanary==$BEFORE" \
+      || die "$1, and going back to $BEFORE failed too: do not restart OpenCanary before fixing $O/oc-env."
+  }
+  runuser -u opencanary -- "$O/oc-env/bin/pip" install -q -U opencanary || oc_back "the upgrade failed"
   AFTER=$(runuser -u opencanary -- "$O/oc-env/bin/pip" show opencanary 2>/dev/null | sed -n 's/^Version: //p')
   ok "OpenCanary $BEFORE -> $AFTER"
   HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
   rc=0; [ -n "$HTTPPY" ] && patch_as opencanary opencanary-http "$HTTPPY" || rc=$?
+  if [ "$rc" != 0 ] && [ "$rc" != 3 ] && [ "$BEFORE" != "$AFTER" ]; then
+    oc_back "the web reply patch does not fit OpenCanary $AFTER"
+    HTTPPY=$(find "$O/oc-env" -path "*opencanary/modules/http.py" | head -1)
+    rc=0; [ -n "$HTTPPY" ] && patch_as opencanary opencanary-http "$HTTPPY" || rc=$?
+  fi
   case $rc in 0|3) ok "web reply/logging patch in place" ;; *) warn "web reply/logging patch no longer fits the new OpenCanary (only start-page visits are logged)"; FAILED=1 ;; esac
   patch_as opencanary opencanary-ports "$O/.opencanary.conf" || true
   restart_ok opencanary

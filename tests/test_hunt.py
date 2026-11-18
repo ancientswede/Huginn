@@ -263,7 +263,8 @@ class Rest(unittest.TestCase):
         with self.con:
             self.con.execute("INSERT INTO events(h,ts,ip,src,kind,a,b) VALUES('p1',?,?,?,?,?,?)", (NOW, "198.51.100.22", "cowrie", "login_fail", "root", "hunter2"))
         first = app.cred_index(self.con)
-        app.set_meta(self.con, "last_ingest", repr(NOW + 1))
+        with self.con:                                  # a new event (0.49.1: the key is the newest event, not the sync time)
+            self.con.execute("INSERT INTO events(h,ts,ip,src,kind,a,b) VALUES('p2',?,?,?,?,?,?)", (NOW, "198.51.100.23", "cowrie", "login_fail", "root", "x"))
         second = app.cred_index(self.con)
         self.assertIsNot(first, second)
         self.assertEqual(first["distinct"], 1)

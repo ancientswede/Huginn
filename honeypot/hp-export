@@ -67,64 +67,42 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
              && [ -s /var/lib/suricata/rules/suricata.rules ]; }; then
         echo "Suricata is not set up on the honeypot: run ./update-honeypot.sh --suricata-on there once" >&2; exit 2
       fi
+      # The same lock as setup-suricata.sh: a rule update or a manual run is never half done under this (Codex 049 M9).
+      exec 9>/run/hp-suricata.lock; flock -w 60 9 || { echo "another Suricata change is running, try again in a minute" >&2; exit 2; }
       install -m 644 -o root -g root /dev/null "$f" || { echo "could not create $f" >&2; exit 2; }
       systemctl enable --now suricata hp-suricata-rules.timer >/dev/null 2>&1 || true
-      if systemctl is-active --quiet suricata; then echo "ids on"; else echo "Suricata did not start (see journalctl -u suricata on the honeypot)" >&2; exit 2; fi
+      # On means all three: flag, engine and the daily rule timer. Anything less goes back to off, so the export never
+      # says on while the engine is down.
+      if systemctl is-active --quiet suricata && systemctl is-active --quiet hp-suricata-rules.timer; then echo "ids on"; exit 0; fi
+      rm -f "$f"; systemctl disable --now hp-suricata-rules.timer suricata >/dev/null 2>&1 || true
+      echo "Suricata did not start, so it was turned off again (see journalctl -u suricata on the honeypot)" >&2; exit 2
     else
+      exec 9>/run/hp-suricata.lock; flock -w 60 9 || { echo "another Suricata change is running, try again in a minute" >&2; exit 2; }
       rm -f "$f"
       systemctl disable --now hp-suricata-rules.timer suricata >/dev/null 2>&1 || true
-      if systemctl is-active --quiet suricata; then echo "Suricata is still running" >&2; exit 2; fi
+      if systemctl is-active --quiet suricata || systemctl is-active --quiet hp-suricata-rules.timer; then echo "Suricata is still running" >&2; exit 2; fi
       echo "ids off"
     fi
     exit 0 ;;
   *) ;;  # any other command gets the normal export
 esac
-# Print the files matching a pattern, oldest first, skipping old compressed ones (Huginn has had those for days).
-# Never follows a symlink: this runs as root, and an attacker who got out of Cowrie (as the cowrie user) could replace a
-# log with a link to /etc/shadow. Files are opened with O_NOFOLLOW and must be regular files. No match -> no output.
-catfiles() {
-  python3 -I -c '
-import glob, os, stat, sys
-names = []
-for p in glob.glob(sys.argv[1]):
-    if p.endswith(".gz"):
-        continue
-    try:
-        st = os.lstat(p)
-    except OSError:
-        continue
-    if stat.S_ISREG(st.st_mode):
-        names.append((st.st_mtime, p))
-for _mtime, p in sorted(names):
-    try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        continue
-    with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            continue
-        while True:
-            b = fh.read(1 << 20)
-            if not b:
-                break
-            sys.stdout.buffer.write(b)
-' "$1"
-  return 0
-}
+# The newest lines of the logs matching a pattern, oldest first: hp-readlogs reads from the end and stops early (M20),
+# and never reads as root what a service user could redirect (H1: it drops to the folder's owner). No match: no output.
+readlogs() { python3 -I /usr/local/bin/hp-readlogs "$1" "$2" 0 2>/dev/null; return 0; }
 # Attackers choose how long a logged line is: drop the absurd ones and cap each log, so they cannot make the export refused.
 keep() { LC_ALL=C awk 'length($0) <= 16384' | tail -c 50331648; }
 WARNS=()
 echo "##COWRIE"
-for d in $COWRIE_DIRS; do catfiles "$d/var/log/cowrie/cowrie.json*" | tail -n 30000 | keep; done
+for d in $COWRIE_DIRS; do readlogs "$d/var/log/cowrie/cowrie.json*" 30000 | keep; done
 echo "##CANARY"
-catfiles "$OPENCANARY_LOG*" | tail -n 10000 | keep
+readlogs "$OPENCANARY_LOG*" 10000 | keep
 echo "##ENDLESSH"
 journalctl -u "$ENDLESSH_UNIT" --no-pager -o cat --since "30 days ago" 2>/dev/null | grep -E " (ACCEPT|CLOSE) host=" | tail -n 20000
 [ "${PIPESTATUS[0]}" = 0 ] || WARNS+=("journal")
 echo "##NFT"
 nft list ruleset 2>/dev/null | grep -o "dport [0-9]* counter packets [0-9]*"
 echo "##TRAPS"
-catfiles "$TRAPS_LOG_DIR/traps-*.json" | tail -n 20000 | keep
+readlogs "$TRAPS_LOG_DIR/traps-*.json" 20000 | keep
 # Personas and bait, so Huginn needs no extra settings. The bait is fake and already sits in the fake file systems.
 if [ -r "$PERSONAS_FILE" ]; then echo "##PERSONAS"; grep -E '^[0-9]{1,5}=[A-Za-z0-9_.-]{1,20}$' "$PERSONAS_FILE"; fi
 if [ -r "$IDENTITY_HISTORY" ]; then echo "##IDENTITY"; tail -n 500 "$IDENTITY_HISTORY" | grep -E '^[0-9]{9,11} [a-z0-9-]{1,32} (nas|router) [A-Za-z0-9 !+._-]{1,48}$' || true; fi
@@ -137,7 +115,7 @@ if [ -f "$SURICATA_FLAG" ]; then
   # (only absurd line lengths are dropped before the filter, no byte budget). "h" identifies the original line, so two
   # alerts that look the same here (two connections, same second) both count. "dropped N": more than fit since the
   # oldest line in eve.json, so Huginn can say that some were not counted.
-  catfiles "$SURICATA_EVE*" | LC_ALL=C awk 'length($0) <= 16384' | python3 -I -c '
+  readlogs "$SURICATA_EVE*" 0 | LC_ALL=C awk 'length($0) <= 16384' | python3 -I -c '
 import collections, hashlib, ipaddress, json, sys
 own = set()
 for a in sys.argv[1].split():
@@ -178,6 +156,7 @@ fi
 echo "##STATUS"
 if [ -f "$SURICATA_FLAG" ]; then
   if systemctl is-active --quiet suricata; then echo "running:suricata ok"; else echo "running:suricata missing"; fi
+  if systemctl is-active --quiet hp-suricata-rules.timer; then echo "running:suricata-rules ok"; else echo "running:suricata-rules missing"; fi
 fi
 # A choice, not protection: "ok" = Suricata is set up here, so Huginn's Settings may turn it on.
 if command -v suricata >/dev/null && [ -f /etc/huginn-honeypot/suricata.yaml ] && [ -s /var/lib/suricata/rules/suricata.rules ]; then
@@ -189,9 +168,11 @@ for u in cowrie cowrie-camera opencanary; do
   if [ -f "$d/huginn-limits.conf" ]; then echo "limits:$u ok"; else echo "limits:$u missing"; fi
   if systemctl is-active --quiet "$u"; then echo "running:$u ok"; else echo "running:$u missing"; fi
 done
-# Only regular files are read (no symlinks): the Cowrie user owns these and must not point root at another file.
-mark() { if [ -f "$2" ] && [ ! -L "$2" ] && grep -qsF "$3" "$2"; then echo "patch:$1 ok"; else echo "patch:$1 missing"; fi; }
+# The Cowrie user owns these files, so they are read as that user (H1): root never opens what it could swap.
 src="$FIRST_COWRIE/src/cowrie"
+SRC_UID=$(stat -c %u "$FIRST_COWRIE" 2>/dev/null || echo 0); SRC_GID=$(stat -c %g "$FIRST_COWRIE" 2>/dev/null || echo 0)
+asowner() { if [ "$SRC_UID" != 0 ]; then setpriv --reuid="$SRC_UID" --regid="$SRC_GID" --clear-groups --no-new-privs "$@"; else "$@"; fi; }
+mark() { if [ -f "$2" ] && [ ! -L "$2" ] && asowner grep -qsF "$3" "$2"; then echo "patch:$1 ok"; else echo "patch:$1 missing"; fi; }
 if [ -d "$src" ]; then
   mark free "$src/commands/free.py" "Huginn patch"
   mark proxy "$src/ssh/forwarding.py" "Huginn proxyreply"
@@ -202,11 +183,14 @@ if [ -d "$src" ]; then
   # Two files, one patch: the note (bash.py) and the line counter (protocol.py) must both be there.
   # Same order as mark(): a regular file that is not a symlink, and only then read it.
   p="$src/shell/protocol.py"
-  if [ -f "$p" ] && [ ! -L "$p" ] && grep -qsF "Huginn goodbye count v1" "$p"; then mark goodbye "$src/commands/bash.py" "Huginn goodbye v1"; else echo "patch:goodbye missing"; fi
+  if [ -f "$p" ] && [ ! -L "$p" ] && asowner grep -qsF "Huginn goodbye count v1" "$p"; then mark goodbye "$src/commands/bash.py" "Huginn goodbye v1"; else echo "patch:goodbye missing"; fi
 fi
 # A choice, not protection: "ok" = the logout note is on. Huginn shows it and never alerts on it.
 if [ -f /etc/huginn-goodbye ] && [ ! -L /etc/huginn-goodbye ]; then echo "option:goodbye ok"; else echo "option:goodbye missing"; fi
-for f in "$(dirname "$OPENCANARY_LOG")"/oc-env/lib/python3*/site-packages/opencanary/modules/http.py; do
+# OpenCanary's files belong to its own user: read them as that one.
+OC_HOME="$(dirname "$OPENCANARY_LOG")"
+SRC_UID=$(stat -c %u "$OC_HOME" 2>/dev/null || echo 0); SRC_GID=$(stat -c %g "$OC_HOME" 2>/dev/null || echo 0)
+for f in "$OC_HOME"/oc-env/lib/python3*/site-packages/opencanary/modules/http.py; do
   [ -f "$f" ] && mark webreply "$f" "Huginn webreply"
   break
 done

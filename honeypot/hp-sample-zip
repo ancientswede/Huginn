@@ -40,14 +40,60 @@ def download_dirs():
     return dirs or ["/home/cowrie/cowrie/var/lib/cowrie/downloads"]
 
 
-def open_plain(path):
-    # A descriptor for a regular file, never through a symlink, never bigger than MAX_FILE. None otherwise.
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+def open_plain(dfd, name):
+    # A descriptor for a regular file with one link, opened relative to an open folder, never through a symlink, never
+    # bigger than MAX_FILE. (None, None) otherwise.
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dfd)
     st = os.fstat(fd)
-    if not (st.st_mode & 0o170000 == 0o100000) or st.st_size > MAX_FILE:
+    if not (st.st_mode & 0o170000 == 0o100000) or st.st_size > MAX_FILE or st.st_nlink != 1:
         os.close(fd)
         return None, None
     return fd, st
+
+
+def expected_owner(path, depth=0):
+    # (uid, gid) of the first component on the way that is not root's (root-owned symlinks followed); (0, 0) if all is
+    # root's; None if the way does not exist. Same rule as hp-readlogs (Codex 049 H1).
+    if depth > 20:
+        return None
+    cur = "/"
+    parts = [p for p in os.path.abspath(path).split("/") if p]
+    for i, part in enumerate(parts):
+        nxt = os.path.join(cur, part)
+        try:
+            st = os.lstat(nxt)
+        except OSError:
+            return None
+        if st.st_uid != 0:
+            return st.st_uid, st.st_gid
+        if st.st_mode & 0o170000 == 0o120000:
+            target = os.readlink(nxt)
+            rest = os.path.join(target if target.startswith("/") else os.path.join(cur, target), *parts[i + 1:])
+            return expected_owner(os.path.normpath(rest), depth + 1)
+        cur = nxt
+    return 0, 0
+
+
+def open_dirs(dirs):
+    # Open folders whose owner is what the way to them says, all with the same owner (the first one found decides).
+    # Returns ([(fd, path)], (uid, gid)).
+    out, owner = [], None
+    for d in dirs:
+        exp = expected_owner(d)
+        if exp is None:
+            continue
+        try:
+            fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            continue
+        st = os.fstat(fd)
+        if (exp[0] and st.st_uid != exp[0]) or (owner is not None and exp[0] != owner[0]):
+            print("skipped %s: owner changed or differs from the other folders" % d, file=sys.stderr)
+            os.close(fd)
+            continue
+        owner = owner or ((st.st_uid, st.st_gid) if exp[0] else (0, 0))
+        out.append((fd, d))
+    return out, owner or (0, 0)
 
 
 def read_fd(fd, limit=MAX_FILE):
@@ -73,14 +119,14 @@ def hash_fd(fd):
         n += len(b)
 
 
-def find(wanted, dirs):
-    # {sha: (path, name, size)} for the asked hashes: only paths, never the bytes, so memory stays small however many
-    # files are asked for. A name that is a hash is still checked against the content (streamed). Files whose name is
-    # not their hash (echo-built, tmp_) are hashed until MAX_SCAN bytes have been read.
+def find(wanted, dirfds):
+    # {sha: (dirfd, name, size)} for the asked hashes: only where they are, never the bytes, so memory stays small however
+    # many files are asked for. A name that is a hash is still checked against the content (streamed). Files whose name
+    # is not their hash (echo-built, tmp_) are hashed until MAX_SCAN bytes have been read.
     found, scanned = {}, 0
-    for d in dirs:
+    for dfd, _path in dirfds:
         try:
-            names = sorted(os.listdir(d))
+            names = sorted(os.listdir(dfd))
         except OSError:
             continue
         for n in names:
@@ -89,9 +135,8 @@ def find(wanted, dirs):
             named = bool(SHA_RE.fullmatch(n))
             if not NAME_RE.fullmatch(n) or (named and n not in wanted):
                 continue
-            path = os.path.join(d, n)
             try:
-                fd, st = open_plain(path)
+                fd, st = open_plain(dfd, n)
             except OSError:
                 continue
             if fd is None:
@@ -107,7 +152,7 @@ def find(wanted, dirs):
             finally:
                 os.close(fd)
             if sha in wanted and sha not in found:
-                found[sha] = (path, n, size)
+                found[sha] = (dfd, n, size)
     return found
 
 
@@ -204,7 +249,73 @@ def main(argv):
     if len(wanted) > MAX_FILES:
         print("at most %d files per zip" % MAX_FILES, file=sys.stderr)
         return 2
-    found = find(set(wanted), download_dirs())
+    now = time.time()
+    try:
+        os.makedirs(OUT_DIR, mode=0o700, exist_ok=True)
+        os.chmod(OUT_DIR, 0o700)
+        tfd, tmp = tempfile.mkstemp(prefix=".samples-", suffix=".tmp", dir=OUT_DIR)
+    except OSError as e:
+        print("cannot write to %s: %s" % (OUT_DIR, e.strerror or e), file=sys.stderr)
+        return 1
+    try:
+        dirfds, owner = open_dirs(download_dirs())
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:                                  # child: reads as the folders' owner and writes into the open temp file
+            os.close(r)
+            code = 1
+            try:
+                if owner[0] and os.getuid() == 0:
+                    os.setgroups([])
+                    os.setgid(owner[1])
+                    os.setuid(owner[0])
+                included = pack(wanted, dirfds, tfd, now)
+                os.write(w, " ".join(included).encode())
+                code = 0
+            except Exception as e:                    # never let the child fall back into the parent's code
+                print("could not write the zip: %s" % e, file=sys.stderr)
+            finally:
+                os._exit(code)
+        os.close(w)
+        got = b""
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            got += b
+        os.close(r)
+        _pid, status = os.waitpid(pid, 0)
+        included = [x for x in got.decode().split() if SHA_RE.fullmatch(x)]
+        if status != 0 or not included:
+            if status == 0:
+                print("none of the files were found on this honeypot (Cowrie's downloads may have been cleaned up)", file=sys.stderr)
+            return 1
+        out = publish(tmp, datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    except OSError as e:
+        print("could not write the zip: %s" % (e.strerror or e), file=sys.stderr)
+        return 1
+    finally:
+        try:
+            os.close(tfd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    print("wrote %s (%d file%s, %.1f KB), password: %s" % (out, len(included), "" if len(included) == 1 else "s",
+                                                            os.path.getsize(out) / 1024.0, PASSWORD.decode()))
+    for s_ in wanted:
+        if s_ not in included:
+            print("not included: %s" % s_)
+    # The hashes really in the zip: paste them into Huginn (Files, Share with Sanesecurity) after sending it.
+    print("included: %s" % " ".join(included))
+    return 0
+
+
+def pack(wanted, dirfds, tfd, now):
+    # Find the files, then write the zip into the already open temp file, one member at a time. Returns the hashes in it.
+    found = find(set(wanted), dirfds)
     picked, total = [], 0
     for sha in wanted:
         if sha not in found:
@@ -214,17 +325,13 @@ def main(argv):
             continue
         total += found[sha][2]
         picked.append(sha)
-    if not picked:
-        print("none of the files were found on this honeypot (Cowrie's downloads may have been cleaned up)", file=sys.stderr)
-        return 1
-    now = time.time()
     included, manifest = [], []
 
     def members():
         for sha in picked:
-            path, name, _size = found[sha]
+            dfd, name, _size = found[sha]
             try:
-                fd, _st = open_plain(path)
+                fd, _st = open_plain(dfd, name)
             except OSError:
                 continue
             if fd is None:
@@ -243,36 +350,12 @@ def main(argv):
                 % (datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"), "\n".join(manifest)))
         yield "manifest.txt", text.encode("ascii", "replace")
 
-    try:
-        os.makedirs(OUT_DIR, mode=0o700, exist_ok=True)
-        os.chmod(OUT_DIR, 0o700)
-        fd, tmp = tempfile.mkstemp(prefix=".samples-", suffix=".tmp", dir=OUT_DIR)
-    except OSError as e:
-        print("cannot write to %s: %s" % (OUT_DIR, e.strerror or e), file=sys.stderr)
-        return 1
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            write_zip(fh, members(), now=now)
-        if not included:
-            print("none of the files could be read again (changed or removed meanwhile)", file=sys.stderr)
-            return 1
-        out = publish(tmp, datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y%m%d-%H%M%S"))
-    except OSError as e:
-        print("could not write the zip: %s" % (e.strerror or e), file=sys.stderr)
-        return 1
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    print("wrote %s (%d file%s, %.1f KB), password: %s" % (out, len(included), "" if len(included) == 1 else "s",
-                                                            os.path.getsize(out) / 1024.0, PASSWORD.decode()))
-    for s_ in wanted:
-        if s_ not in included:
-            print("not included: %s" % s_)
-    # The hashes really in the zip: paste them into Huginn (Files, Share with Sanesecurity) after sending it.
-    print("included: %s" % " ".join(included))
-    return 0
+    if not picked:
+        return []
+    fh = os.fdopen(os.dup(tfd), "wb")
+    with fh:
+        write_zip(fh, members(), now=now)
+    return included
 
 
 if __name__ == "__main__":

@@ -111,8 +111,9 @@ class ExportSymlinks(unittest.TestCase):
             os.symlink(os.path.join(d, "secret"), os.path.join(d, "log.json.2026-11-01"))
             with open(os.path.join(ROOT, "honeypot", "hp-export")) as fh:
                 src = fh.read()
-            func = src[src.index("catfiles() {"):src.index("\n}\n", src.index("catfiles() {")) + 3]
-            out = subprocess.run(["bash", "-c", func + '\ncatfiles "%s/log.json*"' % d], capture_output=True, text=True, timeout=20).stdout
+            self.assertIn("hp-readlogs", src)          # 0.49.1: the export reads logs through hp-readlogs
+            out = subprocess.run(["python3", "-I", os.path.join(ROOT, "honeypot", "hp-readlogs"), "%s/log.json*" % d, "0", "0"],
+                                 capture_output=True, text=True, timeout=20).stdout
             self.assertIn("REAL-LOG-LINE", out)
             self.assertNotIn("TOP-SECRET-LINE", out)
         finally:
