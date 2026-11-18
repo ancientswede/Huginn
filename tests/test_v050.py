@@ -136,5 +136,22 @@ class Scripts(unittest.TestCase):
             self.assertEqual(subprocess.run(["bash", "-n", os.path.join(ROOT, f)]).returncode, 0, f)
 
 
+class UpstreamFree(unittest.TestCase):
+    def test_upstream_meminfo_counts_as_in_place(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("patches_050", os.path.join(ROOT, "honeypot", "patches.py"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        f = os.path.join(d, "free.py")
+        with open(f, "w") as fh:
+            fh.write('meminfo = self.fs.file_contents("/proc/meminfo").decode(errors="replace")\n')
+        self.assertEqual(mod.cowrie_free(f), 3)
+        self.assertFalse(os.path.exists(f + ".orig"))           # nothing written
+        self.assertIn('self.fs.file_contents("/proc/meminfo")', src("honeypot/hp-export"))
+
+
 if __name__ == "__main__":
     unittest.main()

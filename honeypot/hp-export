@@ -174,7 +174,9 @@ SRC_UID=$(stat -c %u "$FIRST_COWRIE" 2>/dev/null || echo 0); SRC_GID=$(stat -c %
 asowner() { if [ "$SRC_UID" != 0 ]; then setpriv --reuid="$SRC_UID" --regid="$SRC_GID" --clear-groups --no-new-privs "$@"; else "$@"; fi; }
 mark() { if [ -f "$2" ] && [ ! -L "$2" ] && asowner grep -qsF "$3" "$2"; then echo "patch:$1 ok"; else echo "patch:$1 missing"; fi; }
 if [ -d "$src" ]; then
-  mark free "$src/commands/free.py" "Huginn patch"
+  # Newer Cowrie reads the persona's /proc/meminfo itself (upstream ae716fe): the patch is then not needed.
+  if [ -f "$src/commands/free.py" ] && [ ! -L "$src/commands/free.py" ] && asowner grep -qsF 'self.fs.file_contents("/proc/meminfo")' "$src/commands/free.py"; then
+    echo "patch:free ok"; else mark free "$src/commands/free.py" "Huginn patch"; fi
   mark proxy "$src/ssh/forwarding.py" "Huginn proxyreply"
   mark ping "$src/commands/ping.py" "Huginn ping v1"
   mark upload "$src/shell/server.py" "Huginn upload v1"

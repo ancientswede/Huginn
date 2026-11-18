@@ -5,8 +5,12 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.50.1"
+HUGINN_VERSION = "0.50.2"
 CHANGELOG = [
+    ('0.50.2', '2026-11-18',
+     'Ready for the newest Cowrie.\n'
+     '- Cowrie now reads the persona\'s memory figures itself, so Huginn\'s free patch is no longer needed there\n'
+     '- The honeypot status shows it as in place instead of missing after a Cowrie upgrade'),
     ('0.50.1', '2026-11-18',
      'Faster Search.\n'
      '- About twice as fast on common words (0.43 s to 0.22 s on 650,000 events)'),

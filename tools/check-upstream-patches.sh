@@ -11,7 +11,8 @@ FAIL=0
 check() {  # check NAME FILE COMMAND
   local rc=0
   python3 "$HERE/honeypot/patches.py" "$3" "$2" || rc=$?
-  if [ "$rc" = 0 ] && python3 -m py_compile "$2"; then echo "ok    $1"; else echo "FAIL  $1 (patches.py exit $rc)"; FAIL=1; fi
+  # 3 = nothing to do (upstream already does it, or an earlier patch is there)
+  if { [ "$rc" = 0 ] || [ "$rc" = 3 ]; } && python3 -m py_compile "$2"; then echo "ok    $1$( [ "$rc" = 3 ] && echo " (not needed)" )"; else echo "FAIL  $1 (patches.py exit $rc)"; FAIL=1; fi
 }
 
 git clone -q --depth 1 https://github.com/cowrie/cowrie "$W/cowrie"

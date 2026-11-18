@@ -62,7 +62,14 @@ def patch(path, pairs):
     return 0
 
 
+FREE_UPSTREAM = 'self.fs.file_contents("/proc/meminfo")'
+
+
 def cowrie_free(path):
+    # Cowrie itself reads the emulated /proc/meminfo since 2026-11 (commit ae716fe): nothing to patch then, and that
+    # counts as in place (3), so a Cowrie upgrade is not reported as a missing patch.
+    if FREE_UPSTREAM in open(path).read():
+        return 3
     return patch(path, [(FREE_OLD, FREE_NEW), (FREE_OLD2, FREE_NEW2)])
 
 
