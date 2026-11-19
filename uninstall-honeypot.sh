@@ -131,7 +131,9 @@ if [ "$PURGE" = 1 ]; then
       ok "removed user $u and /home/$u"
     fi
   done
-  rm -rf /var/log/hp-traps /root/huginn-honeypot-backups
+  # hp-traps runs as a systemd dynamic user: /var/log/hp-traps is only a link to /var/log/private/hp-traps, where the
+  # logs (attacker addresses) really are. Remove both, or --purge leaves them behind.
+  rm -rf /var/log/hp-traps /var/log/private/hp-traps /root/huginn-honeypot-backups
   ok "removed logs and backups"
 fi
 

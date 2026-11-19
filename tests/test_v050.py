@@ -131,6 +131,9 @@ class Scripts(unittest.TestCase):
         s = src("install-honeypot.sh")
         self.assertIn("with other options (or more than once)", s)
 
+    def test_purge_removes_traps_logs(self):
+        self.assertIn("/var/log/private/hp-traps", src("uninstall-honeypot.sh"))
+
     def test_scripts_parse(self):
         for f in ("honeypot/hp-export", "honeypot/setup-suricata.sh", "update-huginn.sh", "update-honeypot.sh", "install-honeypot.sh"):
             self.assertEqual(subprocess.run(["bash", "-n", os.path.join(ROOT, f)]).returncode, 0, f)

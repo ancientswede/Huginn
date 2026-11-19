@@ -5,8 +5,11 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.50.2"
+HUGINN_VERSION = "0.50.3"
 CHANGELOG = [
+    ('0.50.3', '2026-11-19',
+     'Uninstall fix.\n'
+     '- uninstall-honeypot.sh --purge now also deletes the hp-traps logs (they sit under /var/log/private)'),
     ('0.50.2', '2026-11-18',
      'Ready for the newest Cowrie.\n'
      '- Cowrie now reads the persona\'s memory figures itself, so Huginn\'s free patch is no longer needed there\n'
