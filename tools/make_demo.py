@@ -331,6 +331,16 @@ with con:
             continue
         codes = sorted(RD.sample([13, 15, 16, 17, 6, 8, 7], RD.choice([1, 1, 2]))) if RD.random() < 0.16 else []
         con.execute("INSERT OR REPLACE INTO dronebl(ip, checked, codes) VALUES(?,?,?)", (ip, NOW - RD.uniform(0, 6) * 86400, json.dumps(codes)))
+    # Made-up Spamhaus answers and abuse contacts (0.52). Contacts are documentation-style addresses, never real ones.
+    RS = random.Random(52)
+    for ip in ips:
+        if ":" in ip or RS.random() < 0.25:
+            continue
+        x = RS.random()
+        codes = [4] if x < 0.10 else [4, 10] if x < 0.14 else [10] if x < 0.30 else [2] if x < 0.32 else []
+        con.execute("INSERT OR REPLACE INTO spamhaus(ip, checked, codes) VALUES(?,?,?)", (ip, NOW - RS.uniform(0, 6) * 86400, json.dumps(codes)))
+        con.execute("INSERT OR REPLACE INTO abusecontact(ip, checked, email) VALUES(?,?,?)",
+                    (ip, NOW - RS.uniform(0, 20) * 86400, RS.choice(["abuse@example.net", "noc@example.org", "abuse@hosting.example", "security@isp.example"])))
     # Made-up Tor exits (0.48): a few attackers came through Tor. Recomputed below with the rest, which tags them.
     RT = random.Random(48)
     for ip in RT.sample(sorted(i for i in ips if ":" not in i), 9):

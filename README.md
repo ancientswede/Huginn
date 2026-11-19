@@ -109,6 +109,8 @@ Replies to connections that were made *to* the honeypot still work, because the 
   - whether [Project Honey Pot](https://www.projecthoneypot.org) lists it as a web spammer, e-mail harvester or suspicious visitor, with its threat score and when it was last seen there (optional, free key)
   - whether it came through a Tor exit node (the Tor Project's daily exit list): tagged `tor`, never counted as coming back and left off the blocklist unless you choose otherwise
   - whether [DroneBL](https://dronebl.org) lists it as a drone, botnet member, open proxy, brute forcer or compromised router (free, no key; tagged `dronebl`, the score is not changed)
+  - whether [Spamhaus](https://www.spamhaus.org) ZEN lists it as a spam source, an exploited or infected machine, a hijacked network or a home range (needs your own DNS resolver, see [Own DNS resolver](#own-dns-resolver-optional); tagged `spamhaus`, the score is not changed)
+  - where to report it: the abuse e-mail of its network from the free [Abusix Abuse Contact DB](https://abusix.com/contactdb), with a **Report** link that opens a ready e-mail
   - its netblock: the announced network block it comes from, the AS and owner behind it, registry and allocation date ([Team Cymru](https://www.team-cymru.com/ip-asn-mapping), no key), how many attackers came from the same block, and a list of the busiest blocks on Campaigns
   - every password they tried
   - every session as a terminal log, plus a **replay** that plays the session back exactly as they saw it
@@ -584,6 +586,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_HTTPBL_DNS` | system | DNS server for http:BL: `system` or an IPv4 address such as `1.1.1.1`. Pi-hole and many routers drop answers in 127.0.0.0/8 (DNS rebinding protection), and http:BL always answers there, so a public server is often needed. Can be changed on the Settings page |
 | `HUGINN_HTTPBL_DAILY` | `300` | Most http:BL lookups a day, top attackers first, each again after a week; `0` = off |
 | `HUGINN_DRONEBL_DAILY` | `2000` | Most DroneBL lookups a day (DNS, no key, IPv4 only), newest attackers first, each again after a week; `0` = off. Turn it off or pick a DNS server on the Settings page (Lookups). DroneBL answers in 127.0.0.x, which Pi-hole and many routers drop, so the server is tested first; until you choose one, the server chosen for Project Honey Pot is used |
+| `HUGINN_SPAMHAUS_DAILY` | `500` | Most Spamhaus ZEN lookups a day (IPv4), each address again after a week; `0` = off. Only through your own resolver: Spamhaus refuses public ones. The free mirrors are for non-commercial use at low volumes |
+| `HUGINN_ABUSIX_DAILY` | `2000` | Most abuse contact lookups a day (Abusix Abuse Contact DB over DNS, no key), each address again after 30 days; `0` = off. On or off together with netblocks on the Settings page |
 | `HUGINN_NETBLOCK_DAILY` | `5000` | Most netblock lookups a day (Team Cymru IP-to-ASN over DNS, no key): the announced block, its AS, owner, registry and allocation date, each address again after 30 days; `0` = off. Turn it off or pick a DNS server on the Settings page (Lookups). The question is plain DNS, so the address can be read on the way |
 | `HUGINN_METRICS_TOKEN` | – | Turns on `/metrics` with this bearer token (16+ characters). Otherwise turn metrics on in Settings |
 | `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line, for log tools such as Grafana Loki, Graylog or Elasticsearch |
@@ -607,10 +611,36 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 - **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
 - **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported. The only way out is a zip you make yourself with `hp-sample-zip` and send on.
 - **The honeypot's own tools never read as root what an attacker could redirect.** Logs, patch checks and captured files belong to the Cowrie and OpenCanary users, so the tools drop to that user before they open anything there. Someone who took over Cowrie cannot point them at another file.
-- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. The Tor exit list is only downloaded from check.torproject.org once a day; nothing is sent. Netblock lookups (Team Cymru) and DroneBL are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there.
+- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. The Tor exit list is only downloaded from check.torproject.org once a day; nothing is sent. Netblock lookups (Team Cymru), abuse contacts (Abusix), DroneBL and Spamhaus are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there. With your own resolver ([Own DNS resolver](#own-dns-resolver-optional)) no third-party resolver sees them: the questions go straight to each list's own servers.
 - **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
 
 **Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.
+
+## Own DNS resolver (optional)
+
+Huginn's DNS lookups (Project Honey Pot, Team Cymru, Abusix, DroneBL, Spamhaus) can go through any resolver. Your own one is the best choice:
+
+- **Privacy:** no public resolver sees which addresses you look up; the questions go straight to each list's servers.
+- **It passes the lists' answers:** Pi-hole and many routers drop answers in 127.0.0.0/8 (DNS rebinding protection), which is exactly how these lists answer.
+- **Spamhaus needs it:** Spamhaus refuses questions that come through Cloudflare, Quad9, Google and other public resolvers.
+
+[Unbound](https://www.nlnetlabs.nl/projects/unbound/about/) on the Huginn machine, answering only Huginn:
+
+```sh
+apt install unbound
+cat > /etc/unbound/unbound.conf.d/huginn.conf <<'CONF'
+server:
+    interface: 127.0.0.1
+    access-control: 0.0.0.0/0 refuse
+    access-control: 127.0.0.0/8 allow
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+CONF
+systemctl restart unbound
+```
+
+Then pick **Own resolver on this machine (127.0.0.1)** in each lookup on Settings, Lookups. The machine's own name resolution (`/etc/resolv.conf`) does not have to change. A resolver elsewhere on your LAN works too: type its address in the field next to the list.
 
 ## Metrics and Grafana (optional)
 

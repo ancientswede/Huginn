@@ -5,8 +5,16 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.51.0"
+HUGINN_VERSION = "0.52.0"
 CHANGELOG = [
+    ('0.52.0', '2026-11-19',
+     'Spamhaus, abuse contacts and your own DNS resolver.\n'
+     '- Spamhaus ZEN on the attacker page: spam source, exploited or infected machine, hijacked network or home range (tag spamhaus, no score change)\n'
+     '- Abuse contact per attacker (Abusix Abuse Contact DB), with a Report link that opens a ready e-mail\n'
+     '- Every DNS lookup can use any resolver: a new choice for 127.0.0.1 and a field for another address\n'
+     '- Spamhaus needs your own resolver (it refuses public ones): README explains Unbound in a few lines\n'
+     '- Campaigns: the DroneBL tab also counts Spamhaus lists\n'
+     '- From LinkedIn comments'),
     ('0.51.0', '2026-11-19',
      'DroneBL lookups.\n'
      '- Is the attacker a known drone, botnet member, open proxy, brute forcer or compromised router? (dronebl.org, free, no key)\n'
@@ -381,6 +389,8 @@ GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if 
 HB_KEY = os.environ.get("HUGINN_HTTPBL_KEY", "").strip()
 HB_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_HTTPBL_DAILY", "300") or 0)))
 DBL_DAILY = max(0, min(20000, int(os.environ.get("HUGINN_DRONEBL_DAILY", "2000") or 0)))
+SH_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_SPAMHAUS_DAILY", "500") or 0)))      # free mirrors: low volume only
+AB_DAILY = max(0, min(20000, int(os.environ.get("HUGINN_ABUSIX_DAILY", "2000") or 0)))
 # Which DNS server to ask: "system" (the normal resolver) or an IPv4 address. Pi-hole and many routers drop answers in
 # 127.0.0.0/8, which is all http:BL ever answers, so a public server is often needed. Changeable on the Settings page.
 HB_DNS = os.environ.get("HUGINN_HTTPBL_DNS", "").strip()
@@ -546,6 +556,8 @@ CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEX
 CREATE TABLE IF NOT EXISTS httpbl(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TEXT, asn TEXT, cc TEXT, registry TEXT, allocated TEXT);
 CREATE TABLE IF NOT EXISTS dronebl(ip TEXT PRIMARY KEY, checked REAL, codes TEXT);
+CREATE TABLE IF NOT EXISTS spamhaus(ip TEXT PRIMARY KEY, checked REAL, codes TEXT);
+CREATE TABLE IF NOT EXISTS abusecontact(ip TEXT PRIMARY KEY, checked REAL, email TEXT);
 CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
 CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
 CREATE TABLE IF NOT EXISTS tor(ip TEXT PRIMARY KEY, first REAL, last REAL);
@@ -1786,8 +1798,21 @@ def gn_lookup(con, limit=5):
 HB_KEY_RE = re.compile(r"[a-z]{12}")
 HB_TYPES = ((1, "suspicious"), (2, "harvester"), (4, "comment spammer"))
 HB_TEST_IP = "127.1.1.1"      # Project Honey Pot's test address: always answers 127.1.1.1 (for any key), so it tests the DNS path only
-HB_DNS_CHOICES = (("system", "System resolver"), ("1.1.1.1", "Cloudflare (1.1.1.1)"), ("9.9.9.9", "Quad9 (9.9.9.9)"),
-                  ("8.8.8.8", "Google (8.8.8.8)"))
+HB_DNS_CHOICES = (("system", "System resolver"), ("127.0.0.1", "Own resolver on this machine (127.0.0.1)"),
+                  ("1.1.1.1", "Cloudflare (1.1.1.1)"), ("9.9.9.9", "Quad9 (9.9.9.9)"), ("8.8.8.8", "Google (8.8.8.8)"))
+PUBLIC_DNS = {"1.1.1.1", "9.9.9.9", "8.8.8.8"}
+
+
+def dns_picker(fid, cur):
+    # The DNS server choice used by every DNS-based lookup: the list, or any other IPv4 resolver (a LAN Unbound, say).
+    opts = list(HB_DNS_CHOICES) + ([] if cur in dict(HB_DNS_CHOICES) else [(cur, cur)])
+    return ('<select id="%s" name=dns>%s</select><input name=dns_other inputmode=decimal maxlength=15 placeholder="or another IPv4 server" '
+            'aria-label="Another DNS server (IPv4 address)" class="sp-dns-other">'
+            % (fid, "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts)))
+
+
+def dns_from_form(f, current):
+    return (f.get("dns_other") or "").strip() or (f.get("dns") or "").strip() or current
 
 
 def hb_dns_ok(v):
@@ -2381,6 +2406,188 @@ def dbl_lookup(con, limit=40):
     return done
 
 
+# ---------------------------------------------------------------- Spamhaus ZEN and Abusix abuse contacts (0.52)
+# Spamhaus' free mirrors only answer resolvers on the asker's own network (an own Unbound, say): through a public resolver
+# they reply 127.255.255.254, and 127.255.255.252/255 mean a bad query or too many. Those are errors, never a listing.
+SH_ZONE = "zen.spamhaus.org"
+SH_RECHECK = 7 * 86400
+SH_CLASSES = {2: "SBL: spam source", 3: "SBL CSS: snowshoe spam", 4: "XBL: exploited or infected", 5: "XBL: exploited or infected",
+              6: "XBL: exploited or infected", 7: "XBL: exploited or infected", 9: "DROP: hijacked network",
+              10: "PBL: end-user range (ISP)", 11: "PBL: end-user range"}
+SH_BAD = {10, 11}            # PBL alone says "a home connection", not "did something": no tag for it
+SH_ERRORS = {252: "the query was malformed", 254: "Spamhaus refuses public DNS resolvers: use your own (Unbound, say)",
+             255: "too many queries for the free mirrors"}
+
+
+def sh_on(con=None):
+    return (get_meta(con or db(), "sh_on", "1") or "1") == "1"
+
+
+def sh_dns(con=None):
+    # Until chosen here: the DroneBL server (which follows Project Honey Pot's), as long as it is not a public resolver.
+    con = con or db()
+    v = get_meta(con, "sh_dns", "") or dbl_dns(con)
+    return v if hb_dns_ok(v) else "system"
+
+
+def sh_query(server, ip):
+    codes = []
+    for parts in dns_ask(server, ".".join(reversed(ip.split("."))) + "." + SH_ZONE, 1):
+        if len(parts) != 4 or parts[0] != 127:
+            raise OSError("unexpected DNS answer (does the resolver rewrite unknown names?)")
+        if parts[1:3] == [255, 255]:
+            raise OSError(SH_ERRORS.get(parts[3], "Spamhaus answered with error code %d" % parts[3]))
+        if parts[1:3] != [0, 0]:
+            raise OSError("unexpected DNS answer")
+        if parts[3] not in codes:
+            codes.append(parts[3])
+    return sorted(codes)[:8]
+
+
+def sh_test(server):
+    # "ok" when the test address answers, "public" when Spamhaus refuses the resolver, "blocked" when 127.x answers are
+    # dropped on the way, "error" otherwise.
+    try:
+        return "ok" if 2 in sh_query(server, "127.0.0.2") else "blocked"
+    except OSError as e:
+        return "public" if "public DNS" in str(e) else "error"
+    except Exception:
+        return "error"
+
+
+def sh_get(con, ip):
+    r = con.execute("SELECT checked, codes FROM spamhaus WHERE ip=?", (ip,)).fetchone()
+    if not r:
+        return None
+    try:
+        codes = [int(x) for x in json.loads(r[1] or "[]") if isinstance(x, int)]
+    except ValueError:
+        codes = []
+    names = []
+    for c in codes:
+        n = SH_CLASSES.get(c, "class %d" % c)
+        if n not in names:
+            names.append(n)
+    return {"listed": bool(codes), "codes": codes, "classes": names, "checked": r[0]}
+
+
+def sh_html(con, d, ip=""):
+    if ":" in ip:
+        return '<span class=muted>IPv4 only</span>'
+    if d is None:
+        return '<span class=muted>not looked up yet</span>' if sh_on(con) and SH_DAILY else "–"
+    if not d["listed"]:
+        return '<span class=muted>not listed · %s</span>' % esc(ago(d["checked"]))
+    pbl = {SH_CLASSES[c] for c in SH_BAD}
+    return '%s <span class=muted>· %s</span>' % (", ".join('<span class="tag %s">%s</span>' % ("" if n in pbl else "t-red", esc(n))
+                                                          for n in sorted(d["classes"], key=lambda n: n in pbl)), esc(ago(d["checked"])))
+
+
+def ab_on(con=None):
+    return (get_meta(con or db(), "ab_on", "1") or "1") == "1"
+
+
+AB_EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
+
+
+def ab_get(con, ip):
+    r = con.execute("SELECT checked, email FROM abusecontact WHERE ip=?", (ip,)).fetchone()
+    return {"email": r[1], "checked": r[0]} if r else None
+
+
+def ab_html(con, ip, a):
+    if a is None:
+        return '<span class=muted>not looked up yet</span>' if ab_on(con) and nb_on(con) and AB_DAILY else "–"
+    if not a["email"]:
+        return '<span class=muted>none found</span>'
+    r = con.execute("SELECT first, last, cmds, logins_ok + logins_fail, files FROM ips WHERE ip=?", (ip,)).fetchone()
+    when = ("between %s and %s (UTC)" % (fmt_ts(r[0]), fmt_ts(r[1]))) if r and r[0] else ""
+    body = ("Hello,\n\nthe address %s attacked my honeypot %s: %s login attempts, %s commands, %s files.\n\n"
+            "The abuse contact was found with the Abusix Abuse Contact DB (abusix.com/contactdb).\n"
+            % (ip, when, r[3] if r else "?", r[2] if r else "?", r[4] if r else "?"))
+    href = "mailto:%s?%s" % (a["email"], urllib.parse.urlencode({"subject": "Abuse from %s" % ip, "body": body}, quote_via=urllib.parse.quote))
+    return '<span class=mono>%s</span> · <a href="%s">Report</a>' % (esc(a["email"]), esc(href))
+
+
+def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limit=40, ok_test=("ok",)):
+    # One lookup round for a DNS list keyed by IPv4 address: newest attackers first, each again after `recheck`, the
+    # resolver tested first. Returns (looked up, addresses whose answer changed from empty to something or back).
+    k = {"spamhaus": "sh", "abusecontact": "ab"}[table]
+    if not on or not daily or float(get_meta(con, k + "_wait_until", "0") or 0) > time.time():
+        return 0, []
+    left, _t, _u = day_budget(con, k + "_day", daily)
+    if left <= 1:
+        return 0, []
+    now = time.time()
+    ips = [r[0] for r in con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?" % table, (now - recheck, 20 * max(1, min(limit, left - 1))))]
+    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
+    if not ips:
+        return 0, []
+    done, changed = 0, []
+    try:
+        server = nb_server(dns)
+        if test:
+            day_spend(con, k + "_day")
+            t = test(server)
+            if t not in ok_test:
+                msg = {"public": SH_ERRORS[254], "blocked": "the DNS server drops the answers (127.0.0.x): choose another on Settings, Lookups"}
+                set_meta(con, k + "_wait_until", time.time() + (6 * 3600 if t in msg else 3600))
+                set_meta(con, k + "_error", "%s %s" % (fmt_ts(time.time()), msg.get(t, "no answer from the DNS server")))
+                return 0, []
+        for ip in ips:
+            day_spend(con, k + "_day")
+            val = query(server, ip)
+            old = con.execute("SELECT %s FROM %s WHERE ip=?" % ("codes" if table == "spamhaus" else "email", table), (ip,)).fetchone()
+            with con:
+                con.execute("INSERT OR REPLACE INTO %s VALUES(?,?,?)" % table, (ip, time.time(), val))
+            if (old[0] if old else None) != val:
+                changed.append(ip)
+            done += 1
+            time.sleep(0.1)
+    except OSError as e:
+        pause = 24 * 3600 if any(x in str(e) for x in ("public DNS", "too many")) else 3600
+        set_meta(con, k + "_wait_until", time.time() + pause)
+        set_meta(con, k + "_error", "%s %s" % (fmt_ts(time.time()), str(e)[:140]))
+        return done, changed
+    except Exception as e:
+        set_meta(con, k + "_wait_until", time.time() + 3600)
+        set_meta(con, k + "_error", "%s %s" % (fmt_ts(time.time()), str(e)[:140]))
+        return done, changed
+    set_meta(con, k + "_error", "")
+    return done, changed
+
+
+def sh_lookup(con, limit=20):
+    dns = sh_dns(con)
+    if dns in PUBLIC_DNS:                      # Spamhaus answers these with an error code, so do not even ask
+        if get_meta(con, "sh_error", "") == "" and sh_on(con):
+            set_meta(con, "sh_error", "%s %s" % (fmt_ts(time.time()), SH_ERRORS[254]))
+        return 0
+    n, changed = dnslist_lookup(con, "Spamhaus", "spamhaus", sh_on(con), SH_DAILY, dns, SH_RECHECK,
+                                lambda srv, ip: json.dumps(sh_query(srv, ip)), sh_test, limit)
+    if changed:                                 # the spamhaus tag follows the answer
+        with con:
+            for ip in changed:
+                recompute_ip(con, ip)
+    return n
+
+
+def ab_query(server, ip):
+    for t in dns_ask(server, ".".join(reversed(ip.split("."))) + ".abuse-contacts.abusix.org", 16):
+        m = AB_EMAIL.search(str(t))
+        if m:
+            return m.group(0).lower()[:200]
+    return ""
+
+
+def ab_lookup(con, limit=40):
+    n, _changed = dnslist_lookup(con, "Abusix", "abusecontact", ab_on(con) and nb_on(con), AB_DAILY, nb_dns(con), 30 * 86400,
+                                 ab_query, None, limit)
+    return n
+
+
 def tty_path(sha):
     return os.path.join(TTY_DIR, sha + ".gz")
 
@@ -2692,7 +2899,7 @@ SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per c
 
 
 def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False,
-                   back=None, tor=False, dronebl=False):
+                   back=None, tor=False, dronebl=False, spamhaus=False):
     # back: return_info() of the IP, or None.
     stepped = bool(back and back[3] > back[2] and back[3] >= 3)
     s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids, stepped))
@@ -2733,6 +2940,8 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("tor")
     if dronebl:
         tags.append("dronebl")                 # a label only: it never adds to the score
+    if spamhaus:
+        tags.append("spamhaus")                # likewise
     return s, ",".join(tags)
 
 
@@ -2826,7 +3035,12 @@ def recompute_ip(con, ip):
     back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 and not tor else None
     dbl = con.execute("SELECT codes FROM dronebl WHERE ip=?", (ip,)).fetchone()
     dbl = bool(dbl and dbl[0] not in (None, "", "[]"))
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor, dbl)
+    shr = con.execute("SELECT codes FROM spamhaus WHERE ip=?", (ip,)).fetchone()
+    try:
+        shl = bool(shr and any(c not in SH_BAD for c in json.loads(shr[0] or "[]")))
+    except ValueError:
+        shl = False
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor, dbl, shl)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -3106,6 +3320,8 @@ def retention(con):
         # Lookups of attackers that are gone (Codex 047): their netblock and owner rows would still be counted.
         con.execute("DELETE FROM netblock WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM dronebl WHERE ip NOT IN (SELECT ip FROM ips)")
+        con.execute("DELETE FROM spamhaus WHERE ip NOT IN (SELECT ip FROM ips)")
+        con.execute("DELETE FROM abusecontact WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM asname WHERE asn NOT IN (SELECT asn FROM netblock WHERE asn IS NOT NULL)")
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('events_gen',?)", (str(time.time()),))   # caches start over
     con.execute("PRAGMA optimize")
@@ -3918,7 +4134,7 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
-        for f in (tor_refresh, vt_lookup, gn_lookup, hb_lookup, nb_lookup, dbl_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+        for f in (tor_refresh, vt_lookup, gn_lookup, hb_lookup, nb_lookup, dbl_lookup, sh_lookup, ab_lookup):        # each keeps to its own daily allowance and pauses itself on errors
             try:
                 f(con)
             except Exception as e:
@@ -4037,7 +4253,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "tor": "t-purple", "dronebl": "t-purple", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "tor": "t-purple", "dronebl": "t-purple", "spamhaus": "t-purple", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 # What each attacker tag means: the tooltip on every tag and the Help page read this one table.
@@ -4067,6 +4283,8 @@ TAG_HELP = {
            "Never counted as coming back, and left out of the blocklist unless chosen on Settings.",
     "dronebl": "DroneBL lists the address as a drone, botnet member, open proxy, brute forcer or compromised router. "
                "The attacker page says which. A label only: it does not change the score.",
+    "spamhaus": "Spamhaus lists the address as a spam source, exploited or infected machine (XBL) or hijacked network (DROP). "
+                "A listing as an end-user range (PBL) alone does not give this tag. A label only: it does not change the score.",
     "block": "You flagged this attacker: always on the blocklist.",
     "allow": "You flagged this attacker: never on the blocklist.",
 }
@@ -5346,13 +5564,17 @@ def v_ip(ip, qs=None):
                     ("Open ports", esc(e["ports"] or "–")), ("Shodan tags", esc(e["tags"] or "–")),
                     ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))),
                     ("Project Honey Pot", hb_html(hb_get(con, ip))), ("DroneBL", dbl_html(con, dbl_get(con, ip), ip)),
+                    ("Spamhaus", sh_html(con, sh_get(con, ip), ip)), ("Abuse contact", ab_html(con, ip, ab_get(con, ip))),
                     ("Looked up", esc(ago(e["fetched"])))])
     else:
         right = '<p class=muted>Lookup pending (country, network, Shodan) — runs in the background.</p>'
         if nbr:
             right += kv([("Netblock", nb_html(con, nbr)), ("Block owner", nb_owner_html(nbr))])
-        if dbl_get(con, ip):
-            right += kv([("DroneBL", dbl_html(con, dbl_get(con, ip), ip))])
+        extra = [(k, v) for k, g, v in (("DroneBL", dbl_get(con, ip), lambda d: dbl_html(con, d, ip)),
+                                         ("Spamhaus", sh_get(con, ip), lambda d: sh_html(con, d, ip)),
+                                         ("Abuse contact", ab_get(con, ip), lambda d: ab_html(con, ip, d))) if g for v in [v(g)]]
+        if extra:
+            right += kv(extra)
 
     fl = f["flag"] if f else ""
     flag_form = ('<form class="flagform" method=post action="/ip/%s/flag"><label>Blocklist</label><select name=flag>'
@@ -5582,6 +5804,10 @@ def export_ip(ip):
         "project_honeypot": hb_get(con, ip),
         "dronebl": ({"listed": d["listed"], "classes": d["classes"], "codes": d["codes"], "looked_up": iso(d["checked"])}
                     if (d := dbl_get(con, ip)) else None),
+        "spamhaus": ({"listed": d["listed"], "classes": d["classes"], "codes": d["codes"], "looked_up": iso(d["checked"])}
+                     if (d := sh_get(con, ip)) else None),
+        "abuse_contact": ({"email": d["email"] or None, "source": "Abusix Abuse Contact DB", "looked_up": iso(d["checked"])}
+                          if (d := ab_get(con, ip)) else None),
         "tor_exit": ({k: iso(v) for k, v in tor_get(con, ip).items()} if tor_get(con, ip) else None),
         "netblock": ({k: v for k, v in nb.items() if k not in ("ip", "checked", "name")} | {"owner": nb.get("name"), "looked_up": iso(nb["checked"])}) if nb else None,
     }
@@ -6071,6 +6297,11 @@ def v_help():
         row("Netblock", "The announced network block the address belongs to (for example 45.148.10.0/24), from Team Cymru over DNS, and how many "
             "attackers came from the same block. Click it for all of them. Block owner is the AS that announces it, its registry and the date "
             "the block was allocated: a young block is often a fresh rented range. Campaigns lists the busiest blocks. No key needed; on by default."),
+        row("Spamhaus", "Whether Spamhaus ZEN lists the IPv4 address: SBL (spam source), XBL (exploited or infected machine), DROP "
+            "(hijacked network) or PBL (a home or end-user range, which is no accusation). SBL, XBL and DROP give the tag spamhaus; "
+            "the score does not change. Needs your own DNS resolver, since Spamhaus refuses public ones."),
+        row("Abuse contact", "Where to report the address: the abuse e-mail of its network, from the free Abusix Abuse Contact DB "
+            "(over DNS). Report opens an e-mail with the facts filled in and the reference to Abusix their terms ask for."),
         row("DroneBL", "Whether DroneBL (a free DNS list, no key) has the IPv4 address as a drone, botnet member, open proxy, brute "
             "forcer or compromised router, and which. Tagged dronebl; it does not change the score. Each address again after a week. "
             "Campaigns, DroneBL counts the attackers per class."),
@@ -6656,6 +6887,26 @@ def v_campaigns(qs=None):
                   + tbl('<th>DroneBL class</th><th class=num>IPs</th><th class=num>IPs 7d</th><th>Last</th>', drows)) if drows else none_yet(
         "No attacker listed on DroneBL yet" if dbl_done[0] else ("Attackers are being looked up on DroneBL in the background" if dbl_on(con) and DBL_DAILY
                                                                  else "DroneBL lookups are off (Settings, Lookups)"))
+    scl = {}
+    for ip, codes, last in con.execute("SELECT d.ip, d.codes, i.last FROM spamhaus d JOIN ips i USING(ip) WHERE d.codes NOT IN ('', '[]')"):
+        try:
+            names = {SH_CLASSES.get(c, "class %d" % c) for c in json.loads(codes) if isinstance(c, int)}
+        except ValueError:
+            continue
+        for n in names:
+            x = scl.setdefault(n, [0, 0, 0])
+            x[0] += 1
+            x[1] += 1 if (last or 0) >= wk else 0
+            x[2] = max(x[2], last or 0)
+    sh_done = con.execute("SELECT COUNT(*), SUM(codes NOT IN ('', '[]')) FROM spamhaus").fetchone()
+    shrows = "".join('<tr><td><span class="tag">%s</span></td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>'
+                    % (esc(n), num(x[0]), num(x[1]) if x[1] else '<span class=muted>–</span>', esc(ago(x[2])))
+                    for n, x in sorted(scl.items(), key=lambda kv: (-kv[1][0], kv[0])))
+    sh_html_t = '<h3 class="sp-gap">Spamhaus</h3>' + ((('<p class="muted small">%s of %s looked-up attackers are on Spamhaus ZEN. '
+                                                        '<a href="/ips?tag=spamhaus&amp;days=all">Show those with SBL, XBL or DROP</a>.</p>' % (num(sh_done[1] or 0), num(sh_done[0])))
+                                                       + tbl('<th>Spamhaus list</th><th class=num>IPs</th><th class=num>IPs 7d</th><th>Last</th>', shrows)) if shrows else none_yet(
+        "No attacker listed on Spamhaus yet" if sh_done[0] else ("Attackers are being looked up on Spamhaus in the background" if sh_on(con) and SH_DAILY
+                                                                 else "Spamhaus lookups are off (Settings, Lookups)")))
     # 0.47.1: one tab per grouping instead of one long page. Each tab is a plain #link, so without JavaScript (and in the
     # static demo) it jumps to the section; with it, only the chosen section shows and the choice is remembered.
     tabs = [
@@ -6663,7 +6914,7 @@ def v_campaigns(qs=None):
                                                           if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet"))),
         ("hassh", "SSH clients", len(hs), tbl('<th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th>', hrows) if hrows else none_yet("No SSH clients yet")),
         ("netblocks", "Netblocks", len(nbs), nb_html_t),
-        ("dronebl", "DroneBL", len(dcl), dbl_html_t),
+        ("dronebl", "DroneBL & Spamhaus", len(dcl) + len(scl), dbl_html_t + sh_html_t),
         ("web", "Web attacks", len(wa), tbl('<th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th>', warows) if warows else none_yet("No web attacks recognised yet")),
         ("ids", "IDS alerts", len(ir), ids_html),
         ("mail", "Mail clients", len(hl), tbl('<th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th>', hlrows) if hlrows else none_yet("No mail clients yet")),
@@ -6989,13 +7240,15 @@ def metrics_text(con, now=None):
                 ("httpbl", "hb_day", HB_DAILY if hb_key(con) else 0, bool(hb_key(con)), "hb_error", "hb_wait_until"),
                 ("netblock", "nb_day", NB_DAILY if nb_on(con) else 0, False, "nb_error", "nb_wait_until"),
                 ("dronebl", "dbl_day", DBL_DAILY if dbl_on(con) else 0, False, "dbl_error", "dbl_wait_until"),
+                ("spamhaus", "sh_day", SH_DAILY if sh_on(con) else 0, False, "sh_error", "sh_wait_until"),
+                ("abusix", "ab_day", AB_DAILY if ab_on(con) and nb_on(con) else 0, False, "ab_error", "ab_wait_until"),
                 ("malwarebazaar", None, 0, bool(mb_key(con)), "mb_error", "mb_wait_until")):
             used = day_budget(con, budget, daily)[2] if budget else 0
             paused = float(get_meta(con, wait, "0") or 0) > now
             lk.append((svc, used, daily, key_set, 1 if (get_meta(con, err, "") or "").strip() else 0, paused))
         metric("lookups_used_today", "gauge", "Outside lookups made today (UTC).", [({"service": x[0]}, x[1]) for x in lk if x[0] != "malwarebazaar"])
         metric("lookups_daily_limit", "gauge", "Most lookups Huginn makes a day.", [({"service": x[0]}, x[2]) for x in lk if x[0] != "malwarebazaar"])
-        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk if x[0] not in ("netblock", "dronebl")])
+        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk if x[0] not in ("netblock", "dronebl", "spamhaus", "abusix")])
         metric("lookup_error", "gauge", "1 if the last lookup failed.", [({"service": x[0]}, x[4]) for x in lk])
         metric("lookup_paused", "gauge", "1 while lookups are paused (allowance used up or refused key).", [({"service": x[0]}, 1 if x[5] else 0) for x in lk])
         size = sum(os.path.getsize(DB_PATH + x) for x in ("", "-wal") if os.path.exists(DB_PATH + x))
@@ -7248,12 +7501,14 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "nboff": ("netblock", "Netblock lookups are off. What was already looked up stays."),
                "dblon": ("dronebl", "Saved. DroneBL answers through this DNS server; attackers are looked up in the background."),
                "dbloff": ("dronebl", "DroneBL lookups are off. What was already looked up stays."),
+               "shon": ("spamhaus", "Saved. Spamhaus answers through this DNS server; attackers are looked up in the background."),
+               "shoff": ("spamhaus", "Spamhaus lookups are off. What was already looked up stays."),
                "tor": ("tor", "Saved."), "toron": ("tor", "Saved. The Tor exit list is being downloaded and attackers are tagged."),
                "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
                "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
-SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "dronebl", "tor", "metrics", "about"}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "dronebl", "spamhaus", "tor", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
 COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
@@ -7292,7 +7547,7 @@ def v_settings(ok="", err="", at=""):
         top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
     elif err:
         # The error itself stands at its form further down; up here only where to find it.
-        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "dronebl": "DroneBL", "tor": "Tor exit nodes", "honeypot": "Logout message",
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "dronebl": "DroneBL", "spamhaus": "Spamhaus", "tor": "Tor exit nodes", "honeypot": "Logout message",
                  "notifications": "Notifications"}
         top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
 
@@ -7475,15 +7730,13 @@ def key_form(provider, label, saved, ph_new, invalid=False):
 def hb_form(con, saved, invalid=False):
     # The Project Honey Pot form: which DNS server to ask, and the key (empty keeps a saved key, to change only the server).
     cur = hb_dns(con)
-    opts = list(HB_DNS_CHOICES) + ([] if cur in dict(HB_DNS_CHOICES) else [(cur, cur)])
     bad = ' aria-invalid=true aria-describedby="err-httpbl"' if invalid else ""
     return ('<form method=post action="/settings/httpbl" class="sp-key"><label for="sp-httpbl-dns">DNS server</label>'
-            '<div class="sp-keyrow"><select id="sp-httpbl-dns" name=dns>%s</select></div>'
+            '<div class="sp-keyrow">%s</div>'
             '<label for="sp-httpbl-key" class="sp-gap">Access key</label>'
             '<div class="sp-keyrow"><input type=password id="sp-httpbl-key" name=key autocomplete=off spellcheck=false maxlength=128 placeholder="%s"%s>'
             '<button>Save and test</button></div></form>'
-            % ("".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
-               "Leave empty to keep the saved key" if saved else "Paste key", bad))
+            % (dns_picker("sp-httpbl-dns", cur), "Leave empty to keep the saved key" if saved else "Paste key", bad))
 
 
 def remove_form(provider, saved):
@@ -7558,15 +7811,18 @@ def lookups_card(flash=lambda s: "", at="", err=""):
           '<p>The announced network block each attacker comes from, its owner, registry and allocation date (Team Cymru, over DNS). '
           'Sends IP addresses, no key needed.</p>%s%s'
           '<form method=post action="/settings/netblock" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up netblocks</label>'
-          '<label for="sp-netblock-dns" class="sp-gap">DNS server</label><div class="sp-keyrow"><select id="sp-netblock-dns" name=dns>%s</select>'
+          '<label class="sp-check"><input type=checkbox name=abuse value=1%s> Also look up abuse contacts (Abusix)</label>'
+          '<label for="sp-netblock-dns" class="sp-gap">DNS server</label><div class="sp-keyrow">%s'
           '<button>Save</button></div></form>'
           '<p class="sp-help">Each address is looked up again after 30 days. Up to %s lookups a day (HUGINN_NETBLOCK_DAILY). '
+          'Abuse contacts come from the free <a href="https://abusix.com/contactdb" target="_blank" rel="noopener noreferrer">Abusix Abuse Contact DB</a> '
+          '(same DNS server); a report written with one should say so, and the Report link does. '
           'DNS is not encrypted, so the address can be read on the way.</p></div>'
           % (sp_status("On", "on") if on and NB_DAILY else sp_status("Off"), flash("netblock"),
              ('<p class="sp-usage">DNS %s · %s / %s lookups today · %s of %s attackers looked up · %s blocks</p>'
               % (esc(hb_dns_label(cur)), num(used), num(NB_DAILY), num(nn[0]), num(nn[2]), num(nn[1]))) if on else "",
-             lasterr("nb_error"), " checked" if on else "",
-             "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
+             lasterr("nb_error"), " checked" if on else "", " checked" if ab_on(con) else "",
+             dns_picker("sp-netblock-dns", cur),
              num(NB_DAILY)))
 
     on = dbl_on(con)
@@ -7579,7 +7835,7 @@ def lookups_card(flash=lambda s: "", at="", err=""):
            '(<a href="https://dronebl.org" target="_blank" rel="noopener noreferrer">dronebl.org</a>, over DNS). Sends IPv4 addresses, no key needed. '
            'A label on the attacker page, it does not change the score.</p>%s%s'
            '<form method=post action="/settings/dronebl" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up on DroneBL</label>'
-           '<label for="sp-dronebl-dns" class="sp-gap">DNS server</label><div class="sp-keyrow"><select id="sp-dronebl-dns" name=dns>%s</select>'
+           '<label for="sp-dronebl-dns" class="sp-gap">DNS server</label><div class="sp-keyrow">%s'
            '<button>Save</button></div></form>'
            '<p class="sp-help">DroneBL answers in 127.0.0.x, which Pi-hole and many routers drop: Saving tests the DNS server first. '
            'Each address is looked up again after a week, up to %s lookups a day (HUGINN_DRONEBL_DAILY). DNS is not encrypted, so the address can be read on the way.</p></div>'
@@ -7587,8 +7843,29 @@ def lookups_card(flash=lambda s: "", at="", err=""):
               ('<p class="sp-usage">DNS %s · %s / %s lookups today · %s attackers looked up · %s listed</p>'
                % (esc(hb_dns_label(cur)), num(used), num(DBL_DAILY), num(dn[0]), num(dn[1]))) if on else "",
               lasterr("dbl_error"), " checked" if on else "",
-              "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
+              dns_picker("sp-dronebl-dns", cur),
               num(DBL_DAILY)))
+
+    on = sh_on(con)
+    _left, _t, used = day_budget(con, "sh_day", SH_DAILY)
+    sn = con.execute("SELECT COUNT(*), COALESCE(SUM(codes NOT IN ('', '[]')), 0) FROM spamhaus").fetchone()
+    cur = sh_dns(con)
+    shp = ('<div class="sp-panel" id="spamhaus"><div class="sp-ph"><h3>Spamhaus</h3>%s</div>%s'
+           '<p>Whether an attacker is on Spamhaus ZEN: a spam source (SBL), an exploited or infected machine (XBL), a hijacked network '
+           '(DROP), or a home or end-user range (PBL). Free for non-commercial use, IPv4 only, a label that does not change the score.</p>'
+           '<p><b>Needs your own DNS resolver.</b> Spamhaus refuses questions that come through Cloudflare, Quad9, Google and other public '
+           'resolvers. Run <a href="https://www.nlnetlabs.nl/projects/unbound/about/" target="_blank" rel="noopener noreferrer">Unbound</a> '
+           'on this machine and choose 127.0.0.1 (see README, Own DNS resolver).</p>%s%s'
+           '<form method=post action="/settings/spamhaus" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up on Spamhaus</label>'
+           '<label for="sp-spamhaus-dns" class="sp-gap">DNS server</label><div class="sp-keyrow">%s'
+           '<button>Save</button></div></form>'
+           '<p class="sp-help">Saving tests the server with Spamhaus\' test address. Up to %s lookups a day (HUGINN_SPAMHAUS_DAILY), each address '
+           'again after a week: the free mirrors are for low volumes.</p></div>'
+           % (sp_status("On", "on") if on and SH_DAILY and cur not in PUBLIC_DNS else sp_status("Off · Needs own resolver") if on else sp_status("Off"),
+              flash("spamhaus"),
+              ('<p class="sp-usage">DNS %s · %s / %s lookups today · %s attackers looked up · %s listed</p>'
+               % (esc(hb_dns_label(cur)), num(used), num(SH_DAILY), num(sn[0]), num(sn[1]))) if on else "",
+              lasterr("sh_error"), " checked" if on else "", dns_picker("sp-spamhaus-dns", cur), num(SH_DAILY)))
 
     on, inbl = tor_on(con), tor_bl(con)
     fetched = float(get_meta(con, "tor_fetched", "0") or 0)
@@ -7605,7 +7882,7 @@ def lookups_card(flash=lambda s: "", at="", err=""):
                   ("%s exit addresses, list updated %s" % (num(int(float(get_meta(con, "tor_count", "0") or 0))), ago(fetched))) if fetched else "list not downloaded yet",
                   num(tn))) if on else "",
               lasterr("tor_error"), " checked" if on else "", " checked" if inbl else ""))
-    return vt + mb + gn + hb + nb + dbl + tor
+    return vt + mb + gn + hb + nb + dbl + shp + tor
 
 
 SETTINGS_SCOPES = ("appearance", "views", "notifications")
@@ -8508,9 +8785,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings/httpbl":
             f = self.form()
             key = (f.get("key") or "").strip().lower()
-            dns = (f.get("dns") or "").strip() or hb_dns(con)
+            dns = dns_from_form(f, hb_dns(con))
             if not hb_dns_ok(dns):
-                return self.send(400, v_settings(at="httpbl", err="Choose a DNS server from the list."))
+                return self.send(400, v_settings(at="httpbl", err="Choose a DNS server from the list, or type an IPv4 address."))
             if not key:
                 key = hb_key(con)
                 if not key:
@@ -8532,22 +8809,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect(settings_url("hb"))
         if path == "/settings/netblock":
             f = self.form()
-            dns = (f.get("dns") or "").strip() or nb_dns(con)
+            dns = dns_from_form(f, nb_dns(con))
             if not hb_dns_ok(dns):
-                return self.send(400, v_settings(at="netblock", err="Choose a DNS server from the list."))
+                return self.send(400, v_settings(at="netblock", err="Choose a DNS server from the list, or type an IPv4 address."))
             on = f.get("on") == "1"
             if on and dns == "system" and not system_dns():
                 return self.send(400, v_settings(at="netblock", err="This system has no name server in /etc/resolv.conf. Choose a public DNS server."))
             set_meta(con, "nb_on", "1" if on else "0")
+            set_meta(con, "ab_on", "1" if f.get("abuse") == "1" else "0")
             set_meta(con, "nb_dns", dns)
             set_meta(con, "nb_wait_until", "0")
             set_meta(con, "nb_error", "")
             return self.redirect(settings_url("nbon" if on else "nboff"))
         if path == "/settings/dronebl":
             f = self.form()
-            dns = (f.get("dns") or "").strip() or dbl_dns(con)
+            dns = dns_from_form(f, dbl_dns(con))
             if not hb_dns_ok(dns):
-                return self.send(400, v_settings(at="dronebl", err="Choose a DNS server from the list."))
+                return self.send(400, v_settings(at="dronebl", err="Choose a DNS server from the list, or type an IPv4 address."))
             on = f.get("on") == "1"
             if on:
                 try:
@@ -8566,6 +8844,29 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "dbl_wait_until", "0")
             set_meta(con, "dbl_error", "")
             return self.redirect(settings_url("dblon" if on else "dbloff"))
+        if path == "/settings/spamhaus":
+            f = self.form()
+            dns = dns_from_form(f, sh_dns(con))
+            if not hb_dns_ok(dns):
+                return self.send(400, v_settings(at="spamhaus", err="Choose a DNS server from the list, or type an IPv4 address."))
+            on = f.get("on") == "1"
+            if on:
+                if dns in PUBLIC_DNS:
+                    return self.send(400, v_settings(at="spamhaus", err="Spamhaus refuses public resolvers such as %s. Choose your own resolver (127.0.0.1 with Unbound, or one on your LAN). Nothing was saved." % hb_dns_label(dns)))
+                try:
+                    res = sh_test(nb_server(dns))
+                except OSError:
+                    return self.send(400, v_settings(at="spamhaus", err="This system has no name server in /etc/resolv.conf. Choose your own resolver."))
+                if res != "ok":
+                    return self.send(400 if res != "error" else 502, v_settings(at="spamhaus", err={
+                        "public": "Spamhaus refused %s as a public resolver (it may forward to one). Use your own resolver that asks Spamhaus directly, such as Unbound. Nothing was saved." % hb_dns_label(dns),
+                        "blocked": "The DNS server dropped Spamhaus' answer (127.0.0.x), as Pi-hole and many routers do. Choose another. Nothing was saved.",
+                    }.get(res, "Could not reach the DNS server (%s). Nothing was saved, try again." % hb_dns_label(dns))))
+            set_meta(con, "sh_on", "1" if on else "0")
+            set_meta(con, "sh_dns", dns)
+            set_meta(con, "sh_wait_until", "0")
+            set_meta(con, "sh_error", "")
+            return self.redirect(settings_url("shon" if on else "shoff"))
         if path == "/settings/tor":
             f = self.form()
             was = tor_tagging(con)
