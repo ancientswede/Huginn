@@ -5,8 +5,12 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.52.1"
+HUGINN_VERSION = "0.52.2"
 CHANGELOG = [
+    ('0.52.2', '2026-11-19',
+     'DNS lookups recover by themselves.\n'
+     '- DroneBL and Spamhaus try their test question once more before pausing\n'
+     '- A resolver that did not answer in time pauses them for 15 minutes, not an hour'),
     ('0.52.1', '2026-11-19',
      'Help and filters know the new tags.\n'
      '- Help explains dronebl and spamhaus\n'
@@ -2334,12 +2338,23 @@ def dbl_query(server, ip):
     return sorted(codes)[:8]
 
 
+DNS_TRANSIENT = 15 * 60          # pause after "no answer" or SERVFAIL: a resolver that had to start from scratch, usually
+
+
+def dns_transient(e):
+    return "no answer from DNS server" in str(e) or "error code 2" in str(e)
+
+
 def dbl_test(server):
-    # "ok" when the test address answers, "blocked" when its answer is dropped on the way, "error" when DNS fails.
-    try:
-        return "ok" if dbl_query(server, "127.0.0.2") else "blocked"
-    except Exception:
-        return "error"
+    # "ok" when the test address answers, "blocked" when its answer is dropped on the way, "error" when DNS fails. One more
+    # try after a short wait: an own resolver with a cold cache can need longer than one question allows (0.52.2).
+    for i in range(2):
+        try:
+            return "ok" if dbl_query(server, "127.0.0.2") else "blocked"
+        except Exception:
+            if i == 0:
+                time.sleep(2)
+    return "error"
 
 
 def dbl_get(con, ip):
@@ -2384,7 +2399,7 @@ def dbl_lookup(con, limit=40):
         day_spend(con, "dbl_day")
         t = dbl_test(server)
         if t != "ok":
-            set_meta(con, "dbl_wait_until", time.time() + (6 * 3600 if t == "blocked" else 3600))
+            set_meta(con, "dbl_wait_until", time.time() + (6 * 3600 if t == "blocked" else DNS_TRANSIENT))
             set_meta(con, "dbl_error", "%s %s" % (fmt_ts(time.time()), "the DNS server drops DroneBL's answers (127.0.0.x): choose a public "
                                                   "DNS server on Settings, Lookups" if t == "blocked" else "no answer from the DNS server"))
             return 0
@@ -2399,7 +2414,7 @@ def dbl_lookup(con, limit=40):
             done += 1
             time.sleep(0.1)
     except Exception as e:
-        set_meta(con, "dbl_wait_until", time.time() + 3600)
+        set_meta(con, "dbl_wait_until", time.time() + (DNS_TRANSIENT if dns_transient(e) else 3600))
         set_meta(con, "dbl_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
         return done
     if listed:                                  # the dronebl tag follows the answer
@@ -2450,13 +2465,18 @@ def sh_query(server, ip):
 
 def sh_test(server):
     # "ok" when the test address answers, "public" when Spamhaus refuses the resolver, "blocked" when 127.x answers are
-    # dropped on the way, "error" otherwise.
-    try:
-        return "ok" if 2 in sh_query(server, "127.0.0.2") else "blocked"
-    except OSError as e:
-        return "public" if "public DNS" in str(e) else "error"
-    except Exception:
-        return "error"
+    # dropped on the way, "error" otherwise (after one more try, see dbl_test).
+    for i in range(2):
+        try:
+            return "ok" if 2 in sh_query(server, "127.0.0.2") else "blocked"
+        except OSError as e:
+            if "public DNS" in str(e):
+                return "public"
+        except Exception:
+            pass
+        if i == 0:
+            time.sleep(2)
+    return "error"
 
 
 def sh_get(con, ip):
@@ -2537,7 +2557,7 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
             t = test(server)
             if t not in ok_test:
                 msg = {"public": SH_ERRORS[254], "blocked": "the DNS server drops the answers (127.0.0.x): choose another on Settings, Lookups"}
-                set_meta(con, k + "_wait_until", time.time() + (6 * 3600 if t in msg else 3600))
+                set_meta(con, k + "_wait_until", time.time() + (6 * 3600 if t in msg else DNS_TRANSIENT))
                 set_meta(con, k + "_error", "%s %s" % (fmt_ts(time.time()), msg.get(t, "no answer from the DNS server")))
                 return 0, []
         for ip in ips:
@@ -2551,7 +2571,7 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
             done += 1
             time.sleep(0.1)
     except OSError as e:
-        pause = 24 * 3600 if any(x in str(e) for x in ("public DNS", "too many")) else 3600
+        pause = 24 * 3600 if any(x in str(e) for x in ("public DNS", "too many")) else DNS_TRANSIENT if dns_transient(e) else 3600
         set_meta(con, k + "_wait_until", time.time() + pause)
         set_meta(con, k + "_error", "%s %s" % (fmt_ts(time.time()), str(e)[:140]))
         return done, changed

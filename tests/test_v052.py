@@ -86,6 +86,27 @@ class Lookups(Mem):
         self.assertEqual(d["abuse_contact"]["email"], "abuse@example.net")
 
 
+class Transient(Mem):
+    def test_test_question_retried_and_short_pause(self):
+        calls = []
+
+        def flaky(server, name, qtype=1, **kw):
+            calls.append(name)
+            if len(calls) == 1:
+                raise OSError("no answer from DNS server 127.0.0.1")
+            return [[127, 0, 0, 1]]
+        with mock.patch.object(app, "dns_ask", flaky), mock.patch.object(app.time, "sleep", lambda s: None):
+            self.assertEqual(app.dbl_test("127.0.0.1"), "ok")
+        self.assertEqual(len(calls), 2)
+        with mock.patch.object(app, "dns_ask", side_effect=OSError("no answer from DNS server 127.0.0.1")), \
+                mock.patch.object(app.time, "sleep", lambda s: None), mock.patch.object(app, "nb_server", lambda c: c):
+            with self.con:
+                self.con.execute("INSERT INTO ips(ip,first,last,score) VALUES(?,?,?,?)", ("45.10.20.50", time.time(), time.time(), 1))
+            app.dbl_lookup(self.con)
+        wait = float(app.get_meta(self.con, "dbl_wait_until")) - time.time()
+        self.assertTrue(0 < wait <= app.DNS_TRANSIENT + 5, wait)
+
+
 class TagLists(unittest.TestCase):
     def test_help_and_filter_list_new_tags(self):
         h = app.v_help()
