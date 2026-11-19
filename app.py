@@ -5,8 +5,12 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.52.0"
+HUGINN_VERSION = "0.52.1"
 CHANGELOG = [
+    ('0.52.1', '2026-11-19',
+     'Help and filters know the new tags.\n'
+     '- Help explains dronebl and spamhaus\n'
+     '- Attackers can be filtered on dronebl, spamhaus and ids-alert'),
     ('0.52.0', '2026-11-19',
      'Spamhaus, abuse contacts and your own DNS resolver.\n'
      '- Spamhaus ZEN on the attacker page: spam source, exploited or infected machine, hijacked network or home range (tag spamhaus, no score change)\n'
@@ -5214,7 +5218,7 @@ def v_ips(qs, mobile=False):
     form = ('<form class="filters" method=get action="/ips"><input name=q value="%s" placeholder="IP, network, country code, ASN, netblock">'
             '<select name=days>%s</select><select name=tag>%s</select><input type=hidden name=sort value="%s">%s%s<button>Filter</button></form>'
             % (esc(q), opts(days, [("1", "Last 24h"), ("7", "Last 7 days"), ("30", "Last 30 days"), ("90", "Last 90 days"), ("all", "All time")]),
-               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "tor", "research", "block", "allow"]]), esc(sort),
+               opts(tag, [("", "Any tag")] + [(t, t) for t in ["took-bait", "read-bait", "shell", "dropper", "proxy", "exploit", "sshole-probe", "web-exploit", "web-probe", "robots-trap", "ids-alert", "bruteforce", "multi-service", "tarpitted", "returned", "stepped-up", "tor", "dronebl", "spamhaus", "research", "block", "allow"]]), esc(sort),
                (('<input type=hidden name=cc value="%s"><span class="chip on">Country %s <a href="%s" title="Remove country filter">×</a></span>' % (esc(ccf), esc(ccf), esc(link(cc="", p=0)))) if ccf else "")
                + (('<input type=hidden name=net value="%s"><span class="chip on">Netblock %s <a href="%s" title="Remove netblock filter">×</a></span>' % (esc(netf), esc(netf), esc(link(net="", p=0)))) if netf else ""),
                '<input type=hidden name=n value="%d">' % size if size != size_default else ""))
@@ -6262,7 +6266,7 @@ def v_help():
     personas = sorted(set(PERSONA.values()))
     tags = [row(tag(t), esc(TAG_HELP[t])) for t in ("shell", "dropper", "proxy", "exploit", "bruteforce", "human-like", "took-bait", "read-bait",
                                                     "sshole-probe", "web-exploit", "web-probe", "robots-trap", "ids-alert", "multi-service", "tarpitted",
-                                                    "returned", "stepped-up", "tor", "research", "block", "allow")]
+                                                    "returned", "stepped-up", "tor", "dronebl", "spamhaus", "research", "block", "allow")]
     if personas:
         tags.append(row(" ".join(tag(p) for p in personas), "Persona: which fake machine a session hit. Set by the installer (HUGINN_PERSONAS)."))
     sessions = [

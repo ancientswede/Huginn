@@ -86,6 +86,14 @@ class Lookups(Mem):
         self.assertEqual(d["abuse_contact"]["email"], "abuse@example.net")
 
 
+class TagLists(unittest.TestCase):
+    def test_help_and_filter_list_new_tags(self):
+        h = app.v_help()
+        h = h if isinstance(h, str) else h.decode()
+        for t in ("dronebl", "spamhaus"):
+            self.assertIn(app.esc(app.TAG_HELP[t]), h)
+
+
 class Picker(unittest.TestCase):
     def test_other_server_wins(self):
         self.assertEqual(app.dns_from_form({"dns": "9.9.9.9", "dns_other": " 192.0.2.53 "}, "system"), "192.0.2.53")
