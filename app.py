@@ -5,8 +5,16 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.50.3"
+HUGINN_VERSION = "0.51.0"
 CHANGELOG = [
+    ('0.51.0', '2026-11-19',
+     'DroneBL lookups.\n'
+     '- Is the attacker a known drone, botnet member, open proxy, brute forcer or compromised router? (dronebl.org, free, no key)\n'
+     '- Shown on the attacker page and in the JSON export, with the tag dronebl (no change to the score)\n'
+     '- Campaigns has a DroneBL tab with attackers per class\n'
+     '- On by default; turn off or pick a DNS server on Settings, Lookups\n'
+     '- The DNS server is tested first, since Pi-hole and many routers drop the answers\n'
+     '- From a LinkedIn comment'),
     ('0.50.3', '2026-11-19',
      'Uninstall fix.\n'
      '- uninstall-honeypot.sh --purge now also deletes the hp-traps logs (they sit under /var/log/private)'),
@@ -372,6 +380,7 @@ GN_DAILY = max(0, min(5000, int(os.environ["HUGINN_GREYNOISE_DAILY"] or 0))) if 
 # be pasted on the Settings page. The question goes through the normal DNS resolver, so key and address travel unencrypted.
 HB_KEY = os.environ.get("HUGINN_HTTPBL_KEY", "").strip()
 HB_DAILY = max(0, min(5000, int(os.environ.get("HUGINN_HTTPBL_DAILY", "300") or 0)))
+DBL_DAILY = max(0, min(20000, int(os.environ.get("HUGINN_DRONEBL_DAILY", "2000") or 0)))
 # Which DNS server to ask: "system" (the normal resolver) or an IPv4 address. Pi-hole and many routers drop answers in
 # 127.0.0.0/8, which is all http:BL ever answers, so a public server is often needed. Changeable on the Settings page.
 HB_DNS = os.environ.get("HUGINN_HTTPBL_DNS", "").strip()
@@ -536,6 +545,7 @@ CREATE TABLE IF NOT EXISTS capped_seen(h TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS greynoise(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS httpbl(ip TEXT PRIMARY KEY, checked REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS netblock(ip TEXT PRIMARY KEY, checked REAL, prefix TEXT, asn TEXT, cc TEXT, registry TEXT, allocated TEXT);
+CREATE TABLE IF NOT EXISTS dronebl(ip TEXT PRIMARY KEY, checked REAL, codes TEXT);
 CREATE INDEX IF NOT EXISTS nb_prefix ON netblock(prefix);
 CREATE TABLE IF NOT EXISTS asname(asn TEXT PRIMARY KEY, checked REAL, name TEXT);
 CREATE TABLE IF NOT EXISTS tor(ip TEXT PRIMARY KEY, first REAL, last REAL);
@@ -2259,6 +2269,118 @@ def nb_lookup(con, limit=50):
     return done
 
 
+# ---------------------------------------------------------------- DroneBL (0.51)
+# A free DNS list of drones, botnets, open proxies and brute forcers (dronebl.org), no key. The last number of the answer
+# names the class. IPv4 only. Answers are in 127.0.0.0/8, which Pi-hole and many routers drop (DNS rebinding protection),
+# so every round first asks for DroneBL's test address 127.0.0.2: no answer there means the resolver hides them.
+DBL_ZONE = "dnsbl.dronebl.org"
+DBL_RECHECK = 7 * 86400
+DBL_CLASSES = {1: "test entry", 2: "test entry", 3: "IRC drone", 5: "bottler", 6: "spambot or drone", 7: "DDoS drone", 8: "SOCKS proxy",
+               9: "HTTP proxy", 10: "proxy chain", 11: "web page proxy", 12: "open DNS resolver", 13: "brute force attacker",
+               14: "open Wingate proxy", 15: "compromised router or gateway", 16: "autorooting worm",
+               17: "botnet (found automatically)", 18: "DNS/MX host name on IRC", 19: "abused VPN", 255: "uncategorised"}
+
+
+def dbl_on(con=None):
+    return (get_meta(con or db(), "dbl_on", "1") or "1") == "1"
+
+
+def dbl_dns(con=None):
+    # Until chosen here: the server picked for Project Honey Pot (the same kind of DNS list, and one that already passes
+    # its 127.x answers), otherwise the system's.
+    con = con or db()
+    v = get_meta(con, "dbl_dns", "") or get_meta(con, "hb_dns", "") or "system"
+    return v if hb_dns_ok(v) else "system"
+
+
+def dbl_query(server, ip):
+    # The class numbers DroneBL lists the address under ([] = not listed). Raises OSError when DNS fails or the answer is
+    # not DroneBL's (anything outside 127.0.0.x is a resolver making something up).
+    codes = []
+    for parts in dns_ask(server, ".".join(reversed(ip.split("."))) + "." + DBL_ZONE, 1):
+        if len(parts) != 4 or parts[0] != 127 or parts[1] != 0 or parts[2] != 0:
+            raise OSError("unexpected DNS answer (does the resolver rewrite unknown names?)")
+        if parts[3] not in codes:
+            codes.append(parts[3])
+    return sorted(codes)[:8]
+
+
+def dbl_test(server):
+    # "ok" when the test address answers, "blocked" when its answer is dropped on the way, "error" when DNS fails.
+    try:
+        return "ok" if dbl_query(server, "127.0.0.2") else "blocked"
+    except Exception:
+        return "error"
+
+
+def dbl_get(con, ip):
+    r = con.execute("SELECT checked, codes FROM dronebl WHERE ip=?", (ip,)).fetchone()
+    if not r:
+        return None
+    try:
+        codes = [int(x) for x in json.loads(r[1] or "[]") if isinstance(x, int)]
+    except ValueError:
+        codes = []
+    return {"listed": bool(codes), "codes": codes, "classes": [DBL_CLASSES.get(c, "class %d" % c) for c in codes], "checked": r[0]}
+
+
+def dbl_html(con, d, ip=""):
+    if ":" in ip:
+        return '<span class=muted>IPv4 only</span>'
+    if d is None:
+        return '<span class=muted>not looked up yet</span>' if dbl_on(con) and DBL_DAILY else "–"
+    if not d["listed"]:
+        return '<span class=muted>not listed</span> <span class=muted>· %s</span>' % esc(ago(d["checked"]))
+    return '%s <span class=muted>· %s</span>' % (", ".join('<span class="tag t-purple">%s</span>' % esc(c) for c in d["classes"]), esc(ago(d["checked"])))
+
+
+def dbl_lookup(con, limit=40):
+    # Newest attackers first, IPv4 only, each again after a week. Stays under DBL_DAILY; pauses an hour on errors and six when
+    # the resolver drops DroneBL's answers (then every attacker would look "not listed").
+    if not dbl_on(con) or not DBL_DAILY or float(get_meta(con, "dbl_wait_until", "0") or 0) > time.time():
+        return 0
+    left, _t, _u = day_budget(con, "dbl_day", DBL_DAILY)
+    if left <= 1:
+        return 0
+    now = time.time()
+    ips = [r[0] for r in con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN dronebl d USING(ip) WHERE i.ip NOT LIKE '%:%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?", (now - DBL_RECHECK, 20 * max(1, min(limit, left - 1))))]
+    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
+    if not ips:
+        return 0
+    done, listed = 0, []
+    try:
+        server = nb_server(dbl_dns(con))
+        day_spend(con, "dbl_day")
+        t = dbl_test(server)
+        if t != "ok":
+            set_meta(con, "dbl_wait_until", time.time() + (6 * 3600 if t == "blocked" else 3600))
+            set_meta(con, "dbl_error", "%s %s" % (fmt_ts(time.time()), "the DNS server drops DroneBL's answers (127.0.0.x): choose a public "
+                                                  "DNS server on Settings, Lookups" if t == "blocked" else "no answer from the DNS server"))
+            return 0
+        for ip in ips:
+            day_spend(con, "dbl_day")
+            codes = dbl_query(server, ip)
+            old = dbl_get(con, ip)
+            with con:
+                con.execute("INSERT OR REPLACE INTO dronebl(ip, checked, codes) VALUES(?,?,?)", (ip, time.time(), json.dumps(codes)))
+            if bool(codes) != bool(old and old["listed"]):
+                listed.append(ip)
+            done += 1
+            time.sleep(0.1)
+    except Exception as e:
+        set_meta(con, "dbl_wait_until", time.time() + 3600)
+        set_meta(con, "dbl_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
+        return done
+    if listed:                                  # the dronebl tag follows the answer
+        with con:
+            for ip in listed:
+                recompute_ip(con, ip)
+    set_meta(con, "dbl_error", "")
+    return done
+
+
 def tty_path(sha):
     return os.path.join(TTY_DIR, sha + ".gz")
 
@@ -2570,7 +2692,7 @@ SCORE_HELP = ("1 seen, +2 login attempts, +2 brute force (10 or more), +½ per c
 
 
 def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, protos, took=False, read=False, sshole=False, web="", ids=False,
-                   back=None, tor=False):
+                   back=None, tor=False, dronebl=False):
     # back: return_info() of the IP, or None.
     stepped = bool(back and back[3] > back[2] and back[3] >= 3)
     s = sum(v for _k, v in score_parts(sess, lo, lf, cmds, files, tcpip, expl, csvcs, took, read, sshole, web, ids, stepped))
@@ -2609,6 +2731,8 @@ def score_and_tags(sess, lo, lf, cmds, files, tcpip, expl, csvcs, tarpit_s, prot
         tags.append("stepped-up")
     if tor:
         tags.append("tor")
+    if dronebl:
+        tags.append("dronebl")                 # a label only: it never adds to the score
     return s, ",".join(tags)
 
 
@@ -2700,7 +2824,9 @@ def recompute_ip(con, ip):
     tor = tor_tagging(con) and tor_is(con, ip, max(lasts))
     # A Tor exit is shared by many users: a later visit is most likely someone else, so it never counts as coming back.
     back = return_info(con, ip, rd) if max(lasts) - min(firsts) > rd * 86400 and not tor else None
-    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor)
+    dbl = con.execute("SELECT codes FROM dronebl WHERE ip=?", (ip,)).fetchone()
+    dbl = bool(dbl and dbl[0] not in (None, "", "[]"))
+    score, tags = score_and_tags(s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"], csvcs, t["secs"], protos, took, read, sshole, web, ids, back, tor, dbl)
     con.execute("INSERT OR REPLACE INTO ips VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ip, min(firsts), max(lasts), s["n"], s["lo"], s["lf"], s["c"], s["fi"], s["t"], s["x"],
                  c["n"] + cp[0], ",".join(csvcs), t["secs"], ",".join(sorted(set(protos))), score, tags))
@@ -2979,6 +3105,7 @@ def retention(con):
             recompute_ip(con, ip)
         # Lookups of attackers that are gone (Codex 047): their netblock and owner rows would still be counted.
         con.execute("DELETE FROM netblock WHERE ip NOT IN (SELECT ip FROM ips)")
+        con.execute("DELETE FROM dronebl WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM asname WHERE asn NOT IN (SELECT asn FROM netblock WHERE asn IS NOT NULL)")
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('events_gen',?)", (str(time.time()),))   # caches start over
     con.execute("PRAGMA optimize")
@@ -3791,7 +3918,7 @@ def enrich_loop():
                 time.sleep(2)
         except Exception as e:
             set_meta(con, "last_enrich_error", "%s %s" % (fmt_ts(time.time()), str(e)[:200]))
-        for f in (tor_refresh, vt_lookup, gn_lookup, hb_lookup, nb_lookup):        # each keeps to its own daily allowance and pauses itself on errors
+        for f in (tor_refresh, vt_lookup, gn_lookup, hb_lookup, nb_lookup, dbl_lookup):        # each keeps to its own daily allowance and pauses itself on errors
             try:
                 f(con)
             except Exception as e:
@@ -3910,7 +4037,7 @@ def num(n):
 TAG_CLASS = {"dropper": "t-red", "exploit": "t-red", "proxy": "t-orange", "shell": "t-yellow",
              "bruteforce": "t-blue", "multi-service": "t-purple", "tarpitted": "t-teal", "research": "t-grey",
              "block": "t-red", "allow": "t-green", "human-like": "t-orange", "took-bait": "t-red", "read-bait": "t-orange",
-             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "tor": "t-purple", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
+             "sshole-probe": "t-red", "web-exploit": "t-red", "web-probe": "t-yellow", "robots-trap": "t-orange", "ids-alert": "t-red", "returned": "t-blue", "stepped-up": "t-red", "tor": "t-purple", "dronebl": "t-purple", "server": "t-blue", "camera": "t-teal", "nas": "t-purple", "router": "t-teal"}
 
 
 # What each attacker tag means: the tooltip on every tag and the Help page read this one table.
@@ -3938,6 +4065,8 @@ TAG_HELP = {
                   "commands, left files or used the honeypot as a proxy.",
     "tor": "The address was a Tor exit node when it attacked (Tor Project's list): someone using Tor, not the owner of the address. "
            "Never counted as coming back, and left out of the blocklist unless chosen on Settings.",
+    "dronebl": "DroneBL lists the address as a drone, botnet member, open proxy, brute forcer or compromised router. "
+               "The attacker page says which. A label only: it does not change the score.",
     "block": "You flagged this attacker: always on the blocklist.",
     "allow": "You flagged this attacker: never on the blocklist.",
 }
@@ -5216,11 +5345,14 @@ def v_ip(ip, qs=None):
                     ("Reverse DNS", '<span class=mono>%s</span>' % esc(e["rdns"] or "–")), ("Hostnames", esc(e["hostnames"] or "–")),
                     ("Open ports", esc(e["ports"] or "–")), ("Shodan tags", esc(e["tags"] or "–")),
                     ("Known CVEs", esc((e["vulns"] or "–")[:400])), ("GreyNoise", gn_html(gn_get(con, ip))),
-                    ("Project Honey Pot", hb_html(hb_get(con, ip))), ("Looked up", esc(ago(e["fetched"])))])
+                    ("Project Honey Pot", hb_html(hb_get(con, ip))), ("DroneBL", dbl_html(con, dbl_get(con, ip), ip)),
+                    ("Looked up", esc(ago(e["fetched"])))])
     else:
         right = '<p class=muted>Lookup pending (country, network, Shodan) — runs in the background.</p>'
         if nbr:
             right += kv([("Netblock", nb_html(con, nbr)), ("Block owner", nb_owner_html(nbr))])
+        if dbl_get(con, ip):
+            right += kv([("DroneBL", dbl_html(con, dbl_get(con, ip), ip))])
 
     fl = f["flag"] if f else ""
     flag_form = ('<form class="flagform" method=post action="/ip/%s/flag"><label>Blocklist</label><select name=flag>'
@@ -5448,6 +5580,8 @@ def export_ip(ip):
                         "port": x["port"], "hits": x["n"], "first": iso(x["first"]), "last": iso(x["last"])}
                        for x in con.execute("SELECT * FROM ids WHERE ip=? ORDER BY first", (ip,))],
         "project_honeypot": hb_get(con, ip),
+        "dronebl": ({"listed": d["listed"], "classes": d["classes"], "codes": d["codes"], "looked_up": iso(d["checked"])}
+                    if (d := dbl_get(con, ip)) else None),
         "tor_exit": ({k: iso(v) for k, v in tor_get(con, ip).items()} if tor_get(con, ip) else None),
         "netblock": ({k: v for k, v in nb.items() if k not in ("ip", "checked", "name")} | {"owner": nb.get("name"), "looked_up": iso(nb["checked"])}) if nb else None,
     }
@@ -5937,6 +6071,9 @@ def v_help():
         row("Netblock", "The announced network block the address belongs to (for example 45.148.10.0/24), from Team Cymru over DNS, and how many "
             "attackers came from the same block. Click it for all of them. Block owner is the AS that announces it, its registry and the date "
             "the block was allocated: a young block is often a fresh rented range. Campaigns lists the busiest blocks. No key needed; on by default."),
+        row("DroneBL", "Whether DroneBL (a free DNS list, no key) has the IPv4 address as a drone, botnet member, open proxy, brute "
+            "forcer or compromised router, and which. Tagged dronebl; it does not change the score. Each address again after a week. "
+            "Campaigns, DroneBL counts the attackers per class."),
         row("Tor", "Once a day Huginn downloads the Tor Project's list of exit addresses. An attacker listed there within 30 days of its "
             "attack is tagged tor: someone using Tor, not the owner of the address. It never counts as coming back and stays off the "
             "blocklist unless chosen on Settings, Lookups (or tor=1 on a feed). On by default; nothing is sent."),
@@ -6497,6 +6634,28 @@ def v_campaigns(qs=None):
                  if nbrows else none_yet("No block with more than one attacker yet" if nb_done else
                                          ("Netblocks are being looked up in the background" if nb_on(con) else "Netblock lookups are off (Settings, Lookups)")))
     tbl = lambda head, rows: '<table class="wide"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>' % (head, rows)
+    # 0.51: what DroneBL says about the attackers, per class (one address can be in several).
+    wk = time.time() - 7 * 86400
+    dcl = {}
+    for ip, codes, last in con.execute("SELECT d.ip, d.codes, i.last FROM dronebl d JOIN ips i USING(ip) WHERE d.codes NOT IN ('', '[]')"):
+        try:
+            cs = [c for c in json.loads(codes) if isinstance(c, int)]
+        except ValueError:
+            continue
+        for c in cs:
+            x = dcl.setdefault(c, [0, 0, 0])
+            x[0] += 1
+            x[1] += 1 if (last or 0) >= wk else 0
+            x[2] = max(x[2], last or 0)
+    dbl_done = con.execute("SELECT COUNT(*), SUM(codes NOT IN ('', '[]')) FROM dronebl").fetchone()
+    drows = "".join('<tr><td><span class="tag t-purple">%s</span></td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>'
+                    % (esc(DBL_CLASSES.get(c, "class %d" % c)), num(x[0]), num(x[1]) if x[1] else '<span class=muted>–</span>', esc(ago(x[2])))
+                    for c, x in sorted(dcl.items(), key=lambda kv: (-kv[1][0], kv[0])))
+    dbl_html_t = (('<p class="muted small">%s of %s looked-up attackers are on DroneBL. <a href="/ips?tag=dronebl&amp;days=all">Show them</a>.</p>'
+                   % (num(dbl_done[1] or 0), num(dbl_done[0])))
+                  + tbl('<th>DroneBL class</th><th class=num>IPs</th><th class=num>IPs 7d</th><th>Last</th>', drows)) if drows else none_yet(
+        "No attacker listed on DroneBL yet" if dbl_done[0] else ("Attackers are being looked up on DroneBL in the background" if dbl_on(con) and DBL_DAILY
+                                                                 else "DroneBL lookups are off (Settings, Lookups)"))
     # 0.47.1: one tab per grouping instead of one long page. Each tab is a plain #link, so without JavaScript (and in the
     # static demo) it jumps to the section; with it, only the chosen section shows and the choice is remembered.
     tabs = [
@@ -6504,6 +6663,7 @@ def v_campaigns(qs=None):
                                                           if srows else none_yet("No command scripts in the last 7 days" if active else "No command scripts yet"))),
         ("hassh", "SSH clients", len(hs), tbl('<th>HASSH</th><th>Client version</th><th class=num>IPs</th><th class=num>Sessions</th><th>Last</th>', hrows) if hrows else none_yet("No SSH clients yet")),
         ("netblocks", "Netblocks", len(nbs), nb_html_t),
+        ("dronebl", "DroneBL", len(dcl), dbl_html_t),
         ("web", "Web attacks", len(wa), tbl('<th>Attack</th><th>What it is</th><th class=num>Severity</th><th class=num>IPs</th><th class=num>Requests</th><th>Last</th>', warows) if warows else none_yet("No web attacks recognised yet")),
         ("ids", "IDS alerts", len(ir), ids_html),
         ("mail", "Mail clients", len(hl), tbl('<th>HELO name</th><th class=num>IPs</th><th class=num>Times</th><th>Last</th>', hlrows) if hlrows else none_yet("No mail clients yet")),
@@ -6828,13 +6988,14 @@ def metrics_text(con, now=None):
                 ("greynoise", "gn_day", gn_daily(con), bool(gn_key(con)), "gn_error", "gn_wait_until"),
                 ("httpbl", "hb_day", HB_DAILY if hb_key(con) else 0, bool(hb_key(con)), "hb_error", "hb_wait_until"),
                 ("netblock", "nb_day", NB_DAILY if nb_on(con) else 0, False, "nb_error", "nb_wait_until"),
+                ("dronebl", "dbl_day", DBL_DAILY if dbl_on(con) else 0, False, "dbl_error", "dbl_wait_until"),
                 ("malwarebazaar", None, 0, bool(mb_key(con)), "mb_error", "mb_wait_until")):
             used = day_budget(con, budget, daily)[2] if budget else 0
             paused = float(get_meta(con, wait, "0") or 0) > now
             lk.append((svc, used, daily, key_set, 1 if (get_meta(con, err, "") or "").strip() else 0, paused))
         metric("lookups_used_today", "gauge", "Outside lookups made today (UTC).", [({"service": x[0]}, x[1]) for x in lk if x[0] != "malwarebazaar"])
         metric("lookups_daily_limit", "gauge", "Most lookups Huginn makes a day.", [({"service": x[0]}, x[2]) for x in lk if x[0] != "malwarebazaar"])
-        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk if x[0] != "netblock"])
+        metric("lookup_key_set", "gauge", "1 if a key is set for the service.", [({"service": x[0]}, 1 if x[3] else 0) for x in lk if x[0] not in ("netblock", "dronebl")])
         metric("lookup_error", "gauge", "1 if the last lookup failed.", [({"service": x[0]}, x[4]) for x in lk])
         metric("lookup_paused", "gauge", "1 while lookups are paused (allowance used up or refused key).", [({"service": x[0]}, 1 if x[5] else 0) for x in lk])
         size = sum(os.path.getsize(DB_PATH + x) for x in ("", "-wal") if os.path.exists(DB_PATH + x))
@@ -7085,12 +7246,14 @@ SETTINGS_OK = {"1": ("", "Settings saved."), "appearance": ("appearance", "Appea
                "hb": ("httpbl", "Saved. Project Honey Pot answers through this DNS server. It cannot confirm the key itself: if no attacker is ever listed, check the key."), "hbdel": ("httpbl", "Project Honey Pot key removed."),
                "nbon": ("netblock", "Saved. Netblocks are looked up in the background, newest attackers first."),
                "nboff": ("netblock", "Netblock lookups are off. What was already looked up stays."),
+               "dblon": ("dronebl", "Saved. DroneBL answers through this DNS server; attackers are looked up in the background."),
+               "dbloff": ("dronebl", "DroneBL lookups are off. What was already looked up stays."),
                "tor": ("tor", "Saved."), "toron": ("tor", "Saved. The Tor exit list is being downloaded and attackers are tagged."),
                "mon": ("metrics", "Metrics are on. Add the job to Prometheus."),
                "moff": ("metrics", "Metrics are off."), "mtok": ("metrics", "New metrics token. Update it in Prometheus."),
                "byeon": ("honeypot", "Logout message is on."), "byeoff": ("honeypot", "Logout message is off."),
                "idson": ("honeypot", "Suricata is starting. Loading the rules takes about a minute."), "idsoff": ("honeypot", "Suricata is off.")}
-SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "tor", "metrics", "about"}
+SETTINGS_ANCHORS = {"appearance", "views", "notifications", "honeypot", "virustotal", "malwarebazaar", "greynoise", "httpbl", "netblock", "dronebl", "tor", "metrics", "about"}
 # Settings-only wording for shared lists (the keys and the labels on other pages stay as they are).
 CARD_LABELS = {"hero": "Summary banner"}
 COL_LABELS = {"cc": "Country code", "sessions": "Sessions", "cmds": "Commands"}
@@ -7129,7 +7292,7 @@ def v_settings(ok="", err="", at=""):
         top += '<p class="sp-err" role="alert">%s</p>' % esc(err)
     elif err:
         # The error itself stands at its form further down; up here only where to find it.
-        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "tor": "Tor exit nodes", "honeypot": "Logout message",
+        names = {"virustotal": "VirusTotal", "malwarebazaar": "MalwareBazaar", "greynoise": "GreyNoise", "httpbl": "Project Honey Pot", "netblock": "Netblocks", "dronebl": "DroneBL", "tor": "Tor exit nodes", "honeypot": "Logout message",
                  "notifications": "Notifications"}
         top += '<p class="sp-err">Not saved. <a href="#err-%s">See %s</a>.</p>' % (at, esc(names.get(at, at)))
 
@@ -7406,6 +7569,27 @@ def lookups_card(flash=lambda s: "", at="", err=""):
              "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
              num(NB_DAILY)))
 
+    on = dbl_on(con)
+    _left, _t, used = day_budget(con, "dbl_day", DBL_DAILY)
+    dn = con.execute("SELECT COUNT(*), COALESCE(SUM(codes NOT IN ('', '[]')), 0) FROM dronebl").fetchone()
+    cur = dbl_dns(con)
+    opts = list(HB_DNS_CHOICES) + ([] if cur in dict(HB_DNS_CHOICES) else [(cur, cur)])
+    dbl = ('<div class="sp-panel" id="dronebl"><div class="sp-ph"><h3>DroneBL</h3>%s</div>%s'
+           '<p>Whether an attacker is a known drone, botnet member, open proxy, brute forcer or compromised router '
+           '(<a href="https://dronebl.org" target="_blank" rel="noopener noreferrer">dronebl.org</a>, over DNS). Sends IPv4 addresses, no key needed. '
+           'A label on the attacker page, it does not change the score.</p>%s%s'
+           '<form method=post action="/settings/dronebl" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up on DroneBL</label>'
+           '<label for="sp-dronebl-dns" class="sp-gap">DNS server</label><div class="sp-keyrow"><select id="sp-dronebl-dns" name=dns>%s</select>'
+           '<button>Save</button></div></form>'
+           '<p class="sp-help">DroneBL answers in 127.0.0.x, which Pi-hole and many routers drop: Saving tests the DNS server first. '
+           'Each address is looked up again after a week, up to %s lookups a day (HUGINN_DRONEBL_DAILY). DNS is not encrypted, so the address can be read on the way.</p></div>'
+           % (sp_status("On", "on") if on and DBL_DAILY else sp_status("Off"), flash("dronebl"),
+              ('<p class="sp-usage">DNS %s · %s / %s lookups today · %s attackers looked up · %s listed</p>'
+               % (esc(hb_dns_label(cur)), num(used), num(DBL_DAILY), num(dn[0]), num(dn[1]))) if on else "",
+              lasterr("dbl_error"), " checked" if on else "",
+              "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == cur else "", esc(lbl)) for v, lbl in opts),
+              num(DBL_DAILY)))
+
     on, inbl = tor_on(con), tor_bl(con)
     fetched = float(get_meta(con, "tor_fetched", "0") or 0)
     tn = con.execute("SELECT COUNT(*) FROM ips WHERE (','||COALESCE(tags,'')||',') LIKE '%,tor,%'").fetchone()[0]
@@ -7421,7 +7605,7 @@ def lookups_card(flash=lambda s: "", at="", err=""):
                   ("%s exit addresses, list updated %s" % (num(int(float(get_meta(con, "tor_count", "0") or 0))), ago(fetched))) if fetched else "list not downloaded yet",
                   num(tn))) if on else "",
               lasterr("tor_error"), " checked" if on else "", " checked" if inbl else ""))
-    return vt + mb + gn + hb + nb + tor
+    return vt + mb + gn + hb + nb + dbl + tor
 
 
 SETTINGS_SCOPES = ("appearance", "views", "notifications")
@@ -8359,6 +8543,29 @@ class Handler(BaseHTTPRequestHandler):
             set_meta(con, "nb_wait_until", "0")
             set_meta(con, "nb_error", "")
             return self.redirect(settings_url("nbon" if on else "nboff"))
+        if path == "/settings/dronebl":
+            f = self.form()
+            dns = (f.get("dns") or "").strip() or dbl_dns(con)
+            if not hb_dns_ok(dns):
+                return self.send(400, v_settings(at="dronebl", err="Choose a DNS server from the list."))
+            on = f.get("on") == "1"
+            if on:
+                try:
+                    res = dbl_test(nb_server(dns))
+                except OSError:
+                    return self.send(400, v_settings(at="dronebl", err="This system has no name server in /etc/resolv.conf. Choose a public DNS server."))
+                if res == "blocked":
+                    return self.send(400, v_settings(at="dronebl", err=(
+                        "Your DNS resolver dropped DroneBL's answer. Pi-hole and many routers do this to stop DNS rebinding. "
+                        "Choose a public DNS server and try again. Nothing was saved.") if dns == "system" else (
+                        "No answer from DroneBL through %s. Try another DNS server. Nothing was saved." % hb_dns_label(dns))))
+                if res == "error":
+                    return self.send(502, v_settings(at="dronebl", err="Could not reach the DNS server (%s). Nothing was saved, try again." % hb_dns_label(dns)))
+            set_meta(con, "dbl_on", "1" if on else "0")
+            set_meta(con, "dbl_dns", dns)
+            set_meta(con, "dbl_wait_until", "0")
+            set_meta(con, "dbl_error", "")
+            return self.redirect(settings_url("dblon" if on else "dbloff"))
         if path == "/settings/tor":
             f = self.form()
             was = tor_tagging(con)
