@@ -1,6 +1,6 @@
 # Huginn in a container (part of Huginn, AGPL-3.0-or-later). Only the Huginn side: the honeypot itself belongs on its
 # own isolated VM/LXC (install-honeypot.sh), never next to your other containers.
-#   docker compose up -d          (see docker-compose.yml and "Run Huginn in Docker" in README.md)
+#   docker compose up -d          (see docker-compose.yml and "Run Huginn in Docker" in docs/install.md)
 FROM python:3.13-slim
 
 LABEL org.opencontainers.image.title="Huginn" \

@@ -1,0 +1,15 @@
+# Security model
+
+[← Back to the README](../README.md)
+
+- **The honeypot stays isolated.** Huginn connects *to* the honeypot. The honeypot needs no route to your LAN, and the key can only print logs. If the honeypot is ever fully compromised, the attacker gets that log export and nothing else.
+- **Attacker data is untrusted.** Everything attackers typed is escaped. The UI has a strict Content-Security-Policy (no inline scripts).
+- **Logins:** one password (scrypt), HttpOnly SameSite=Strict cookies, at most 5 failed logins per 15 minutes per IP, same-origin checks on every form.
+- **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.
+- **Suricata (optional) runs on the honeypot, never on the Huginn machine.** Only its alerts are exported, as fixed fields; Huginn checks each one again before it is stored.
+- **Captured files never leave the honeypot.** Only their analysis (type, architecture, embedded IPs and URLs) is exported. The only way out is a zip you make yourself with `hp-sample-zip` and send on.
+- **The honeypot's own tools never read as root what an attacker could redirect.** Logs, patch checks and captured files belong to the Cowrie and OpenCanary users, so the tools drop to that user before they open anything there. Someone who took over Cowrie cannot point them at another file.
+- **Enrichment** sends attacker IPs, and nothing else, to ipwho.is and internetdb.shodan.io, and to GreyNoise unless `HUGINN_GREYNOISE_DAILY=0`. Set `HUGINN_ENRICH=0` to turn it all off. File lookups (MalwareBazaar, VirusTotal) send only SHA-256 hashes and only with a key. Lookups use HTTPS and never follow redirects, so a key only goes to its own service. The exception is Project Honey Pot (only with a key): http:BL is a DNS list, so the key and the attacker's IPv4 address go unencrypted through your normal DNS resolver. The Tor exit list is only downloaded from check.torproject.org once a day; nothing is sent. Netblock lookups (Team Cymru), abuse contacts (Abusix), DroneBL and Spamhaus are DNS too: the attacker's address goes unencrypted to the DNS server chosen on the Settings page; turn them off there. With your own resolver ([Own DNS resolver](integrations.md#own-dns-resolver-optional)) no third-party resolver sees them: the questions go straight to each list's own servers.
+- **Metrics** (`/metrics`) are off by default, need a bearer token and hold counts only, never addresses or anything attackers typed.
+
+**Privacy:** IP addresses count as personal data in many jurisdictions, also when they belong to attackers. Huginn deletes history older than `HUGINN_RETENTION_DAYS` (unless you set it to `0`). Pick a retention you can justify.

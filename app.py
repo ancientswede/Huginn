@@ -466,7 +466,7 @@ def ntfy_post(body, title, prio=3):
     urllib.request.urlopen(req, timeout=10).read()
 PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
-# Automatic copies of the database: how many to keep (0 = off) and how often. See "Database backups" in README.md.
+# Automatic copies of the database: how many to keep (0 = off) and how often. See "Database backups" in docs/operations.md.
 BACKUP_KEEP = max(0, min(30, int(os.environ.get("HUGINN_DB_BACKUPS", "3"))))
 BACKUP_HOURS = max(1, int(os.environ.get("HUGINN_DB_BACKUP_HOURS", "24")))
 BACKUP_RETRY = 6 * 3600                  # after a failure, try again this much later
@@ -7740,7 +7740,7 @@ def ids_card():
             info, button = "", form(True, "Turn on Suricata")
         else:
             info = ('<p class="sp-help">Set it up once on the honeypot: <span class=mono>./update-honeypot.sh --suricata-on</span> '
-                    '(installs Suricata and its rules, about 500 MB of memory; without internet there, see README). After that it can be turned on and off here.</p>')
+                    '(installs Suricata and its rules, about 500 MB of memory; without internet there, see Suricata IDS in docs/integrations.md). After that it can be turned on and off here.</p>')
     else:
         badge = sp_status("Not running", "warn") if running is False else sp_status("On", "on")
         rules = st.get("rules")
@@ -7893,7 +7893,7 @@ def lookups_card(flash=lambda s: "", at="", err=""):
            '(DROP), or a home or end-user range (PBL). Free for non-commercial use, IPv4 only, a label that does not change the score.</p>'
            '<p><b>Needs your own DNS resolver.</b> Spamhaus refuses questions that come through Cloudflare, Quad9, Google and other public '
            'resolvers. Run <a href="https://www.nlnetlabs.nl/projects/unbound/about/" target="_blank" rel="noopener noreferrer">Unbound</a> '
-           'on this machine and choose 127.0.0.1 (see README, Own DNS resolver).</p>%s%s'
+           'on this machine and choose 127.0.0.1 (see Own DNS resolver in docs/integrations.md).</p>%s%s'
            '<form method=post action="/settings/spamhaus" class="sp-key"><label class="sp-check"><input type=checkbox name=on value=1%s> Look up on Spamhaus</label>'
            '<label for="sp-spamhaus-dns" class="sp-gap">DNS server</label><div class="sp-keyrow">%s'
            '<button>Save</button></div></form>'

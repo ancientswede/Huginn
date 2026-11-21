@@ -594,7 +594,7 @@ cat <<EOF
   2. Back here:  hp-add-huginn-key '<that line>'
   3. FIRST prove this machine is isolated (it also checks your router itself):
        ./tools/check-isolation.sh <a LAN machine> <another LAN machine>:445
-     Read "Read this before you open any ports" in README.md.
+     Read docs/isolation.md ("Read this before you open any ports").
   4. Only then, in your router, forward these TCP ports from the internet to this machine:
        $FWD
      (never forward $ADMIN_PORT)
