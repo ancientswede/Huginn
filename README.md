@@ -657,7 +657,7 @@ Huginn can serve counts for [Prometheus](https://prometheus.io) on `/metrics`, f
 
 1. **Settings > Metrics > Turn on.** Huginn makes a token and shows the address, the token and a ready Prometheus job (or set `HUGINN_METRICS_TOKEN` in `.env`, 16+ characters, for automated setups).
 2. Add the job to `prometheus.yml` (example: [`examples/prometheus-huginn.yml`](examples/prometheus-huginn.yml)) and reload Prometheus.
-3. In Grafana: **Dashboards > New > Import** and upload [`examples/grafana/huginn-dashboard.json`](examples/grafana/huginn-dashboard.json), then pick your Prometheus data source. The dashboard is built by `tools/grafana-dashboard.py`: change the script, not the JSON.
+3. In Grafana: **Dashboards > New > Import**, enter the id **26093** ([Huginn on grafana.com](https://grafana.com/grafana/dashboards/26093-huginn/)) or upload [`examples/grafana/huginn-dashboard.json`](examples/grafana/huginn-dashboard.json), then pick your Prometheus data source. The dashboard is built by `tools/grafana-dashboard.py`: change the script, not the JSON.
 
 What is in it: events per source, kind and decoy service (a counter for `rate()`, and the last 24 hours), active and new attackers, SSH/Telnet sessions and logins, captured files, blocklist size, repeated decoy tries not stored, sync time and errors, collection problems, lookup allowances used and paused, database size and the last backup. **Never addresses, usernames, passwords or commands**: one label per attacker would also give Prometheus a new time series for every address. Details stay in Huginn. **New token** in Settings stops the old one at once.
 
