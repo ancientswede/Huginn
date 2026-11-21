@@ -53,7 +53,7 @@ if [ -n "$GOODBYE" ]; then
   exit 0
 fi
 [ -x /usr/local/bin/hp-export ] || die "hp-export is not installed — run install-honeypot.sh first."
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-add-huginn-key honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -95,6 +95,9 @@ say "Huginn's honeypot scripts"
 for f in hp-readlogs hp-export hp-fileinfo hp-sample-zip; do
   if cmp -s "$HERE/honeypot/$f" "/usr/local/bin/$f"; then ok "$f unchanged"; else install -m 755 "$HERE/honeypot/$f" "/usr/local/bin/$f"; ok "$f updated"; fi
 done
+# The key helper: older honeypots have the copy their installer wrote, without the check for a key with wider rights.
+if cmp -s "$HERE/honeypot/hp-add-huginn-key" /usr/local/sbin/hp-add-huginn-key; then ok "hp-add-huginn-key unchanged"
+else install -m 755 "$HERE/honeypot/hp-add-huginn-key" /usr/local/sbin/hp-add-huginn-key; ok "hp-add-huginn-key updated"; fi
 if [ -d /opt/hp-traps ]; then
   if cmp -s "$HERE/honeypot/hp-traps.py" /opt/hp-traps/hp-traps.py; then ok "hp-traps unchanged"
   else install -m 644 "$HERE/honeypot/hp-traps.py" /opt/hp-traps/hp-traps.py; ok "hp-traps updated"; restart_ok hp-traps; fi

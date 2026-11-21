@@ -44,7 +44,7 @@ echo "    the export for Huginn, Huginn's SSH key and the personas/bait in /etc/
 if [ "$PURGE" = 1 ]; then echo "    --purge: Cowrie/OpenCanary, their users, logs and captured files are deleted too."
 else echo "    Logs and captured files are kept in /home/cowrie, /home/opencanary and /var/log/hp-traps."; fi
 if [ "$RESTORE_SSH" = 1 ]; then echo "    --restore-ssh: admin SSH goes back to port 22 only (port ${ADMIN_PORT:-?} stops working)."
-elif [ -n "$ADMIN_PORT" ]; then echo "    Your admin SSH stays on port $ADMIN_PORT, and port 22 is the real sshd again."; fi
+elif [ -n "$ADMIN_PORT" ]; then echo "    Your admin SSH stays on port $ADMIN_PORT (the ports sshd really listens on are shown at the end)."; fi
 if [ "$YES" != 1 ]; then
   read -r -p "    Type 'remove' to continue: " a </dev/tty || a=""
   [ "$a" = remove ] || { echo "    Nothing was changed."; exit 0; }
@@ -147,6 +147,10 @@ if [ "$RESTORE_SSH" = 1 ] && [ -f "$ADMIN_CONF" ]; then
 fi
 
 say "Done"
+# What sshd really listens on now, not what it should: the installer may have taken it off port 22 (Codex rc2 L5).
+SSHD_PORTS=$(ss -ltnpH 2>/dev/null | awk '/"sshd"/ {n = split($4, a, ":"); print a[n]}' | sort -un | paste -sd, - || true)
+if [ -n "$SSHD_PORTS" ]; then echo "    sshd listens on port(s): $SSHD_PORTS. Use one of them to log in again."
+else warn "could not see which ports sshd listens on: check with ss -ltnp before you log out."; fi
 echo "    Delete the port forwards to this machine in your router."
 [ "$PURGE" = 1 ] || echo "    Logs and captured files are still in /home/cowrie, /home/opencanary and /var/log/hp-traps (--purge removes them)."
 if [ "$RESTORE_SSH" != 1 ] && [ -n "$ADMIN_PORT" ]; then

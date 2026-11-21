@@ -112,7 +112,7 @@ for p in 22 23 2222 25 587 110 143 21 80 443 8080 5432 1080 $COWRIE_SSH $COWRIE_
   [ "$p" = "$ADMIN_PORT" ] && die "--admin-port $ADMIN_PORT collides with a honeypot port."
 done
 case "$PERSONA" in ask|server|nas|none) ;; *) die "--persona must be server, nas or none." ;; esac
-for f in honeypot/hp-export honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
+for f in honeypot/hp-export honeypot/hp-add-huginn-key honeypot/hp-fileinfo honeypot/hp-sample-zip honeypot/hp-readlogs honeypot/hp-traps.py honeypot/patches.py honeypot/webreply.py honeypot/personas.py honeypot/hp-logclean honeypot/hp-identity honeypot/setup-identity.sh honeypot/setup-housekeeping.sh honeypot/setup-sandbox.sh honeypot/setup-suricata.sh systemd/hp-traps.service systemd/hp-suricata-rules.service systemd/hp-suricata-rules.timer; do
   [ -f "$HERE/$f" ] || die "Missing $f — run this from the Huginn repository folder."
 done
 
@@ -538,33 +538,7 @@ elif [ -f "$CAM/etc/cowrie.cfg" ] && ! grep -q "$CAM" /etc/default/hp-export; th
   sed -i "s#^COWRIE_DIRS=\"\(.*\)\"#COWRIE_DIRS=\"\1 $CAM\"#" /etc/default/hp-export
   ok "added the camera persona to /etc/default/hp-export"
 fi
-cat > /usr/local/sbin/hp-add-huginn-key <<'EOF'
-#!/bin/bash
-# Adds Huginn's public key to root's authorized_keys, locked to the read-only export.
-# Usage: hp-add-huginn-key 'ssh-ed25519 AAAA... huginn'
-set -euo pipefail
-key="$*"
-[[ "$key" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)\ [A-Za-z0-9+/=]{40,}(\ [A-Za-z0-9@._:-]{1,64})?$ ]] || { echo "That does not look like one SSH public key line." >&2; exit 1; }
-blob="$(echo "$key" | awk '{print $2}')"
-install -d -m 700 /root/.ssh
-touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-# The key is matched as its own field, and a line that has it must be exactly the locked one: an older line with the
-# same key and wider rights (a plain admin key, say) is a conflict to sort out by hand, never "already present".
-match=$(awk -v b="$blob" '{for (i = 1; i <= NF; i++) if ($i == b) {print; break}}' /root/.ssh/authorized_keys)
-if [ -n "$match" ]; then
-  if [ "$(printf '%s\n' "$match" | wc -l)" = 1 ] && [[ "$match" == 'restrict,command="/usr/local/bin/hp-export" '* ]]; then
-    echo "Key is already present, locked to hp-export."; exit 0
-  fi
-  echo "This key is already in /root/.ssh/authorized_keys with other options (or more than once):" >&2
-  printf '%s\n' "$match" | cut -c1-80 | sed 's/^/  /' >&2
-  echo "Remove those lines first (or use another key for Huginn), then run this again." >&2
-  exit 1
-fi
-cp -p /root/.ssh/authorized_keys "/root/.ssh/authorized_keys.bak-$(date +%s)"
-echo "restrict,command=\"/usr/local/bin/hp-export\" $key" >> /root/.ssh/authorized_keys
-echo "Added. This key can only run /usr/local/bin/hp-export (no shell, no forwarding)."
-EOF
-chmod 755 /usr/local/sbin/hp-add-huginn-key
+install -m 755 "$HERE/honeypot/hp-add-huginn-key" /usr/local/sbin/hp-add-huginn-key
 bash "$HERE/honeypot/setup-housekeeping.sh"
 bash "$HERE/honeypot/setup-sandbox.sh"
 bash "$HERE/honeypot/setup-identity.sh" || warn "web identity not set up: run hp-identity set synology later"

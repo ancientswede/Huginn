@@ -35,13 +35,20 @@ sed -e "s/@VERSION@/$DEBVER/" -e "s/@SIZE@/$SIZE/" "$ROOT/packaging/deb/control"
 dpkg-deb --root-owner-group -Zxz --build "$PKG" "$OUT/huginn_all.deb" >/dev/null
 
 # Without the repository there is nothing to build from, so the build line has to go.
+# "latest" only moves for stable releases, so the files of a release candidate default to that candidate's own image;
+# otherwise they would start an older stable image (Codex rc2 M28). A stable release keeps latest, so pull updates it.
+TAG=latest
+[[ "$VER" != *-* ]] || TAG="$VER"
 sed -e '/^    build: \.$/d' \
+    -e "s|\${HUGINN_TAG:-latest}|\${HUGINN_TAG:-$TAG}|" \
     -e 's|^#   cp docker/.env.example .env |#   cp huginn.env.example .env |' "$ROOT/docker-compose.yml" > "$OUT/docker-compose.yml"
 if grep -qE '^ +build:|docker/\.env' "$OUT/docker-compose.yml"; then
   echo "docker-compose.yml still refers to the repository" >&2
   exit 1
 fi
-install -m 644 "$ROOT/docker/.env.example" "$OUT/huginn.env.example"
+grep -qF "huginn:\${HUGINN_TAG:-$TAG}" "$OUT/docker-compose.yml" || { echo "docker-compose.yml does not default to $TAG" >&2; exit 1; }
+sed -e "s|^# HUGINN_TAG=latest$|# HUGINN_TAG=$TAG|" "$ROOT/docker/.env.example" > "$OUT/huginn.env.example"
+chmod 644 "$OUT/huginn.env.example"
 
 (cd "$OUT" && sha256sum huginn_all.deb docker-compose.yml huginn.env.example > SHA256SUMS)
 echo "Huginn $VER: $OUT"

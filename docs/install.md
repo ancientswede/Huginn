@@ -101,7 +101,7 @@ docker compose logs huginn           # shows the honeypot's key fingerprint and 
 
 Everything Huginn keeps lives in the `huginn-data` volume: the database, session recordings, its SSH key and the honeypot's host key. The container runs as an unprivileged user with a read-only file system and no capabilities.
 
-- **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. To build it yourself, clone the repository, use its `docker-compose.yml` and run `docker compose up -d --build`. Pin a version with `HUGINN_TAG=0.13.0` in `.env`.
+- **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. To build it yourself, clone the repository, use its `docker-compose.yml` and run `docker compose up -d --build`. Pin a version with `HUGINN_TAG=1.0.0` in `.env`. The files of a release candidate run that candidate's image, not `latest`.
 - **Update:** `docker compose pull && docker compose up -d`. The volume is kept.
 - **Extra bait values:** `docker compose cp bait.json huginn:/data/bait.json`, then `docker compose restart huginn`.
 - **Honeypot reinstalled** (new host key): `docker compose exec huginn rm /data/.ssh/known_hosts`, then `docker compose restart huginn` and compare the new fingerprint.

@@ -128,8 +128,10 @@ class Scripts(unittest.TestCase):
         self.assertIn('pip" install -q "opencanary==$BEFORE"', s)
 
     def test_l6_key_conflict(self):
-        s = src("install-honeypot.sh")
-        self.assertIn("with other options (or more than once)", s)
+        self.assertIn("with other options (or more than once)", src("honeypot/hp-add-huginn-key"))
+        # Codex rc2 M9: one file, installed by both the installer and the updater.
+        for f in ("install-honeypot.sh", "update-honeypot.sh"):
+            self.assertIn('install -m 755 "$HERE/honeypot/hp-add-huginn-key" /usr/local/sbin/hp-add-huginn-key', src(f), f)
 
     def test_purge_removes_traps_logs(self):
         self.assertIn("/var/log/private/hp-traps", src("uninstall-honeypot.sh"))

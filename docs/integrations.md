@@ -9,7 +9,7 @@ Huginn can push a short summary to [ntfy](https://ntfy.sh), the phone app, when 
 - **During install:** `install-huginn.sh` asks whether you want ntfy, suggests a random topic name and sends a test notification.
 - **Later:** add `HUGINN_NTFY_URL` to `/opt/huginn/.env` (and `HUGINN_NTFY_TOKEN` if your server uses access control), then run `systemctl restart huginn`.
 - **Choose which events** you get, or send a test, on the **Settings** page.
-- **Your own ntfy server** in the homelab is the most private option. On the public `ntfy.sh`, anyone who guesses the topic name can read your messages, so use a long random name like the one the installer suggests. The messages only contain counts and attacker IPs, never your own addresses.
+- **Your own ntfy server** in the homelab is the most private option. On the public `ntfy.sh`, anyone who guesses the topic name can read your messages, so use a long random name like the one the installer suggests. The messages only contain counts and attacker IPs. If `HUGINN_PUBLIC_URL` is set, each message also links to that address, so the ntfy server learns it; the installer only sets it when the ntfy server is on your own network.
 
 ## Suricata IDS (optional)
 

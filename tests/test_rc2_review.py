@@ -1,5 +1,7 @@
 # 1.0.0-rc2: fixes from the Codex review before 1.0 (huginn-totalgranskning-rc2).
-import gzip, http.server, json, os, tempfile, threading, time, unittest
+import gzip, http.server, json, os, tempfile, threading, time, unittest, urllib.parse
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 from tests.helpers import app
@@ -240,6 +242,191 @@ class SmallFixes(unittest.TestCase):
         self.assertTrue(check("https://huginn.example", "http", proxy=False))   # an untrusted proxy's header means nothing
         self.assertFalse(check("ftp://huginn.example"))
         self.assertFalse(check("https://evil.example", "https"))
+
+
+class TrapLimits(unittest.TestCase):
+    # M34: POP3 and IMAP had no total time and shared every place, so long sessions could close the other traps.
+    def setUp(self):
+        from tests.test_slowreply import ROOT as R, load
+        d = tempfile.mkdtemp()
+        os.environ["LOGS_DIRECTORY"] = d
+        self.t = load("hp_traps_rc2", os.path.join(str(R), "honeypot", "hp-traps.py"))
+
+    def talk(self, service, keep=3.0):
+        import asyncio
+
+        async def run():
+            srv = await asyncio.start_server(self.t.make(service), "127.0.0.1", 0)
+            r, w = await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+            reader = asyncio.ensure_future(r.read())
+            start = time.monotonic()
+            while not reader.done() and time.monotonic() - start < keep:
+                try:
+                    w.write(b"NOOP\r\n"); await w.drain()
+                except (ConnectionError, OSError):
+                    break
+                await asyncio.sleep(0.2)
+            try:
+                got = await asyncio.wait_for(reader, 5)
+            except (ConnectionError, OSError):
+                got = b""                         # closed on us: nothing was answered
+            took = time.monotonic() - start
+            w.close(); srv.close(); await srv.wait_closed()
+            return took, got
+        return asyncio.run(run())
+
+    def test_pop3_session_ends(self):
+        self.t.TRAP_MAX_SECS = 1.0
+        took, got = self.talk("pop3")
+        self.assertTrue(got)                       # the banner came
+        self.assertLess(took, 2.5)
+
+    def test_one_trap_cannot_take_every_place(self):
+        self.t._per["imap"] = self.t.TRAP_MAX_CONN
+        _took, got = self.talk("imap", keep=0.5)
+        self.assertEqual(got, b"")                 # IMAP is full: closed at once
+        self.t.TRAP_MAX_SECS = 0.5
+        _took, got = self.talk("pop3", keep=1.0)
+        self.assertTrue(got)                       # POP3 still answers
+
+
+class Health(unittest.TestCase):
+    # M1: /healthz said ok while a collection problem was open, and a failed ntfy send kept the problem from being saved.
+    def test_healthz_follows_the_problems(self):
+        import http.client
+        from http.server import ThreadingHTTPServer
+        con = app.connect()
+        app.set_meta(con, "last_ingest", time.time())
+        self.addCleanup(app.set_meta, con, "health_now", "{}")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+
+        def status():
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+            c.request("GET", "/healthz", headers={"Host": "127.0.0.1"})
+            r = c.getresponse(); body = json.loads(r.read()); c.close()
+            return r.status, body["ok"]
+        app.set_meta(con, "health_now", json.dumps({"canary": "OpenCanary quiet for 2 days"}))
+        self.assertEqual(status(), (503, False))
+        app.set_meta(con, "health_now", "{}")
+        self.assertEqual(status(), (200, True))
+
+
+class HealthAlerts(Mem):
+    def test_failed_alert_is_tried_again(self):
+        def down(*a):
+            raise OSError("ntfy down")
+        with mock.patch.object(app, "protection_missing", lambda c: ["traps"]), mock.patch.object(app, "NTFY_URL", "http://127.0.0.1:9/x"), \
+                mock.patch.object(app, "settings", lambda c=None: {"notify": True}), mock.patch.object(app, "ntfy_post", down), \
+                mock.patch.object(app, "health_sources", lambda c, n: {}):
+            app.health_check(self.con)
+        self.assertIn("prot:traps", json.loads(app.get_meta(self.con, "health_now")))
+        self.assertNotIn("prot:traps", json.loads(app.get_meta(self.con, "health_alerted")))
+        sent = []
+        with mock.patch.object(app, "protection_missing", lambda c: ["traps"]), mock.patch.object(app, "NTFY_URL", "http://127.0.0.1:9/x"), \
+                mock.patch.object(app, "settings", lambda c=None: {"notify": True}), mock.patch.object(app, "ntfy_post", lambda *a: sent.append(a)), \
+                mock.patch.object(app, "health_sources", lambda c, n: {}):
+            app.health_check(self.con)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("prot:traps", json.loads(app.get_meta(self.con, "health_alerted")))
+
+
+class Budgets(Mem):
+    def test_day_take_stops_at_the_cap(self):
+        # M25: booking is read and written in one locked step.
+        self.assertTrue(app.day_take(self.con, "vt_day", 2))
+        self.assertTrue(app.day_take(self.con, "vt_day", 2))
+        self.assertFalse(app.day_take(self.con, "vt_day", 2))
+        self.assertEqual(app.day_budget(self.con, "vt_day", 2)[2], 2)
+
+    def test_abusix_allowance_of_one(self):
+        # L1: with no resolver test to pay for, an allowance of one is one lookup, not zero.
+        now = time.time()
+        with self.con:
+            self.con.execute("INSERT INTO ips(ip,first,last,score) VALUES('45.10.20.70',?,?,1)", (now, now))
+        asked = []
+        with mock.patch.object(app, "nb_server", lambda d: "x"), mock.patch.object(app.time, "sleep", lambda s: None):
+            n, _ = app.dnslist_lookup(self.con, "Abusix", "abusecontact", True, 1, "9.9.9.9", 86400,
+                                      lambda srv, ip: asked.append(ip) or "abuse@example.net", None)
+        self.assertEqual((n, asked), (1, ["45.10.20.70"]))
+
+    def test_vt_queue_skips_broken_hashes(self):
+        # L6: three broken values at the top no longer keep a real file out of the queue.
+        now = time.time()
+        good = "ab" * 32
+        with self.con:
+            for i, b in enumerate(["not-a-hash-%d" % i for i in range(3)] + [good]):
+                self.con.execute("INSERT INTO events(h, ts, ip, src, kind, session, a, b) VALUES(?,?,?,?,?,?,?,?)",
+                                 ("vt%d" % i, now - (0 if b != good else 3600), "45.10.20.71", "cowrie", "file", "s", "/tmp/x", b))
+        asked = []
+        with mock.patch.object(app, "vt_key", lambda c: "k" * 64), mock.patch.object(app, "api_urlopen", lambda r, timeout: asked.append(r.full_url) or (_ for _ in ()).throw(OSError("off"))), \
+                mock.patch.object(app.time, "sleep", lambda s: None):
+            app.vt_lookup(self.con, limit=3)
+        self.assertTrue(asked and asked[0].endswith(good))
+
+
+class DnsTags(Mem):
+    def test_answer_and_tag_change_together(self):
+        # M10: a timeout on the next address no longer leaves the first one listed without its tag.
+        now = time.time()
+        app.store(self.con, [("d|%d" % i, now - i, ip, "cowrie", "cmd", "s-d%d" % i, "id", None)
+                             for i, ip in enumerate(("45.10.20.80", "45.10.20.81"))])
+        answers = iter([[3], OSError("timeout")])
+
+        def q(srv, ip):
+            x = next(answers)
+            if isinstance(x, Exception):
+                raise x
+            return x
+        with mock.patch.object(app, "dbl_on", lambda c: True), mock.patch.object(app, "nb_server", lambda d: "x"), \
+                mock.patch.object(app, "dbl_test", lambda s: "ok"), mock.patch.object(app, "dbl_query", q), \
+                mock.patch.object(app.time, "sleep", lambda s: None):
+            app.dbl_lookup(self.con)
+        listed = [r[0] for r in self.con.execute("SELECT ip FROM dronebl WHERE codes!='[]'")]
+        self.assertEqual(len(listed), 1)
+        tags = self.con.execute("SELECT tags FROM ips WHERE ip=?", (listed[0],)).fetchone()[0] or ""
+        self.assertIn("dronebl", tags)
+
+
+class Report(Mem):
+    def test_abuse_mail_times_are_utc(self):
+        # L2: the report says UTC, so the times in it are UTC whatever HUGINN_TZ is.
+        t = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc).timestamp()
+        app.store(self.con, [("r|1", t, "45.10.20.90", "cowrie", "cmd", "s-r", "id", None)])
+        with mock.patch.object(app, "TZ", ZoneInfo("Europe/Stockholm")):
+            html = app.ab_html(self.con, "45.10.20.90", {"email": "abuse@example.net"})
+        self.assertIn("2026-10-20 12:00", urllib.parse.unquote(html))
+        self.assertNotIn("2026-10-20 14:00", urllib.parse.unquote(html))
+
+
+class Builds(unittest.TestCase):
+    def test_demo_has_none_of_the_machines_settings(self):
+        # L3: the demo is published; the build machine's ntfy server ended up in settings.html.
+        import subprocess, sys
+        from tests.helpers import ROOT as R
+        out = tempfile.mkdtemp()
+        env = dict(os.environ, HUGINN_NTFY_URL="http://ntfy-marker-rc2.lan/topic", HUGINN_MASK="mask-marker-rc2")
+        subprocess.run([sys.executable, os.path.join(str(R), "tools", "make_demo.py"), os.path.join(out, "d"), "--base", "/"],
+                       env=env, check=True, capture_output=True, timeout=300)
+        for root, _d, files in os.walk(out):
+            for f in files:
+                with open(os.path.join(root, f), "rb") as fh:
+                    data = fh.read()
+                self.assertNotIn(b"marker-rc2", data, f)
+
+    def test_release_candidate_files_run_their_own_image(self):
+        # M28: latest only moves for stable releases.
+        import subprocess
+        from tests.helpers import ROOT as R
+        if subprocess.run(["which", "dpkg-deb"], capture_output=True).returncode:
+            self.skipTest("needs dpkg-deb")
+        out = tempfile.mkdtemp()
+        subprocess.run(["bash", os.path.join(str(R), "tools", "build-release.sh"), out], check=True, capture_output=True, timeout=300)
+        compose = open(os.path.join(out, "docker-compose.yml")).read()
+        want = app.HUGINN_VERSION if "-" in app.HUGINN_VERSION else "latest"
+        self.assertIn("huginn:${HUGINN_TAG:-%s}" % want, compose)
 
 if __name__ == "__main__":
     unittest.main()

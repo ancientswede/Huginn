@@ -17,10 +17,13 @@ SMTP_WAIT = (1.0, 2.5)    # seconds to "queue" a message, after it is fully rece
 SMTP_MAX_SECS = 600       # a mail session never lasts longer than this, whatever it is doing (DATA, AUTH, a slow reader)
 SMTP_MAX_MAILS = 50       # nor takes more messages
 SMTP_MAX_CONN = 150       # mail may use at most half of MAX_CONN, so it cannot crowd out the other traps
+TRAP_MAX_CONN = 150       # the same for each other trap (POP3, IMAP, PostgreSQL, SOCKS5): no single one can take every place
+TRAP_MAX_SECS = 600       # and no session of theirs lasts longer than this, even one that keeps sending (Codex rc2 M34)
 MAX_LOG_DAY = 200 * 1024 * 1024  # stop logging for the day past this size, so a flood cannot fill the disk
 HOSTNAME = os.environ.get("TRAPS_HOSTNAME", "mail.example.com")
 _active = 0
 _mail = 0
+_per = {}       # open sessions per trap (not mail)
 
 
 def log(peer, service, event, **kw):
@@ -355,13 +358,17 @@ def make(service):
         global _active, _mail
         peer = w.get_extra_info("peername") or ("?", 0)
         mail = service in ("smtp", "submission")
-        if _active >= MAX_CONN or (mail and _mail >= SMTP_MAX_CONN):
+        if _active >= MAX_CONN or (mail and _mail >= SMTP_MAX_CONN) or (not mail and _per.get(service, 0) >= TRAP_MAX_CONN):
             w.close(); return
         _active += 1
         _mail += mail
+        _per[service] = _per.get(service, 0) + 1
         try:
             log(peer, service, "connect")
-            await HANDLERS[service](r, w, peer, service)
+            if mail:                                   # SMTP has its own limit and says goodbye in SMTP
+                await HANDLERS[service](r, w, peer, service)
+            else:
+                await asyncio.wait_for(HANDLERS[service](r, w, peer, service), TRAP_MAX_SECS)
         except (ConnectionError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError, ValueError):
             pass
         except Exception as e:
@@ -372,6 +379,7 @@ def make(service):
         finally:
             _active -= 1
             _mail -= mail
+            _per[service] -= 1
             try:
                 w.close()
             except Exception:

@@ -17,6 +17,9 @@ args = ap.parse_args()
 BASE = "/" + args.base.strip("/") + "/" if args.base.strip("/") else "/"
 
 work = tempfile.mkdtemp(prefix="huginn-demo-")
+# The demo is published: none of the build machine's own settings (ntfy server, keys, mask, public URL) may end up in it.
+for k in [k for k in os.environ if k.startswith("HUGINN_")]:
+    del os.environ[k]
 os.environ.update({"HUGINN_BASE": work, "HUGINN_DEMO": "1", "HUGINN_TZ": "UTC", "HUGINN_ENRICH": "0",
                    "HUGINN_PERSONAS": "2225=server,2323=camera", "HUGINN_HP_HOST": "honeypot.example",
                    "HUGINN_BAIT_FILE": os.path.join(work, "bait.json")})

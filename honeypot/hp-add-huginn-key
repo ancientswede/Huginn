@@ -1,0 +1,25 @@
+#!/bin/bash
+# Part of Huginn (AGPL-3.0-or-later). Installed by install-honeypot.sh and update-honeypot.sh as /usr/local/sbin/hp-add-huginn-key.
+# Adds Huginn's public key to root's authorized_keys, locked to the read-only export.
+# Usage: hp-add-huginn-key 'ssh-ed25519 AAAA... huginn'
+set -euo pipefail
+key="$*"
+[[ "$key" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)\ [A-Za-z0-9+/=]{40,}(\ [A-Za-z0-9@._:-]{1,64})?$ ]] || { echo "That does not look like one SSH public key line." >&2; exit 1; }
+blob="$(echo "$key" | awk '{print $2}')"
+install -d -m 700 /root/.ssh
+touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+# The key is matched as its own field, and a line that has it must be exactly the locked one: an older line with the
+# same key and wider rights (a plain admin key, say) is a conflict to sort out by hand, never "already present".
+match=$(awk -v b="$blob" '{for (i = 1; i <= NF; i++) if ($i == b) {print; break}}' /root/.ssh/authorized_keys)
+if [ -n "$match" ]; then
+  if [ "$(printf '%s\n' "$match" | wc -l)" = 1 ] && [[ "$match" == 'restrict,command="/usr/local/bin/hp-export" '* ]]; then
+    echo "Key is already present, locked to hp-export."; exit 0
+  fi
+  echo "This key is already in /root/.ssh/authorized_keys with other options (or more than once):" >&2
+  printf '%s\n' "$match" | cut -c1-80 | sed 's/^/  /' >&2
+  echo "Remove those lines first (or use another key for Huginn), then run this again." >&2
+  exit 1
+fi
+cp -p /root/.ssh/authorized_keys "/root/.ssh/authorized_keys.bak-$(date +%s)"
+echo "restrict,command=\"/usr/local/bin/hp-export\" $key" >> /root/.ssh/authorized_keys
+echo "Added. This key can only run /usr/local/bin/hp-export (no shell, no forwarding)."

@@ -157,9 +157,23 @@ if [ -n "$NTFY" ] && ! grep -q "^HUGINN_NTFY_URL=." /opt/huginn/.env; then
   {
     echo "HUGINN_NTFY_URL=$NTFY"
     [ -n "$NTFY_TOKEN" ] && echo "HUGINN_NTFY_TOKEN=$NTFY_TOKEN"
-    grep -q "^HUGINN_PUBLIC_URL=." /opt/huginn/.env || echo "HUGINN_PUBLIC_URL=http://$(hostname -I | awk '{print $1}'):$WEB_PORT"
+    # The link to Huginn in each message holds this machine's address, so it is only added for an ntfy server on your own network.
+    if ! grep -q "^HUGINN_PUBLIC_URL=." /opt/huginn/.env && NTFY_URL="$NTFY" python3 - <<'PYEOF2'
+import ipaddress, os, socket, sys, urllib.parse
+host = urllib.parse.urlsplit(os.environ["NTFY_URL"]).hostname or ""
+try:
+    addrs = {ipaddress.ip_address(a[4][0].split("%")[0]) for a in socket.getaddrinfo(host, None)}
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if addrs and all(a.is_private or a.is_loopback for a in addrs) else 1)
+PYEOF2
+    then
+      echo "HUGINN_PUBLIC_URL=http://$(hostname -I | awk '{print $1}'):$WEB_PORT"
+    fi
   } >> /opt/huginn/.env
   ok "ntfy notifications on (HUGINN_NTFY_URL in /opt/huginn/.env)"
+  grep -q "^HUGINN_PUBLIC_URL=." /opt/huginn/.env || \
+    warn "the messages carry no link to Huginn, so your own address never reaches $NTFY; to add one, set HUGINN_PUBLIC_URL in /opt/huginn/.env"
 fi
 if [ ! -f /opt/huginn/.ssh/honeypot_ro ]; then
   runuser -u huginn -- ssh-keygen -q -t ed25519 -N "" -C "huginn@$(hostname)" -f /opt/huginn/.ssh/honeypot_ro
@@ -200,7 +214,7 @@ if [ "${N:-0}" -lt 7 ]; then
 
       hp-add-huginn-key '$PUB huginn'
 
-    It allows this key to run the read-only log export and nothing else.
+    It allows this key to run hp-export (the logs, plus the logout note and Suricata on/off) and nothing else.
     Waiting for it (up to $WAIT_MIN minutes)...
 EOF
   END=$(( $(date +%s) + WAIT_MIN * 60 ))

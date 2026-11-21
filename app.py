@@ -28,7 +28,16 @@ CHANGELOG = [
      '- import and ingest-once refuse to run without the settings in .env; the docs give a systemd-run command that loads them\n'
      '- The manual install copies static/ (web attack rules, map); the Account page shows how many web rules are loaded\n'
      '- HUGINN_C2_EXCLUDE matches an IPv6 address however it is written; an AS name is only stored for the AS number that was asked\n'
-     '- Behind a trusted proxy that reports https, a form from the http address is refused; the retention limits are documented'),
+     '- Behind a trusted proxy that reports https, a form from the http address is refused; the retention limits are documented\n'
+     '- /healthz answers 503 while a collection problem is open, and an alert that could not be sent is tried again\n'
+     '- A DroneBL or Spamhaus answer and the tag it gives are saved together; VirusTotal\'s daily allowance is booked atomically\n'
+     '- An Abusix allowance of 1 a day is one lookup, not zero; broken file hashes no longer hold up the VirusTotal queue\n'
+     '- Search checks loose file records in one query instead of one per file\n'
+     '- hp-traps: POP3, IMAP, PostgreSQL and SOCKS5 sessions have a total time limit and a share of the places each, like SMTP\n'
+     '- update-honeypot.sh also updates hp-add-huginn-key; the uninstaller shows the ports sshd really listens on\n'
+     '- The installer only adds a link to Huginn in ntfy messages when the ntfy server is on your own network\n'
+     '- The abuse report gives its times in UTC; the demo build ignores the machine\'s own HUGINN_ settings\n'
+     '- The Docker files of a release candidate run that candidate\'s image instead of latest; the docs say what the export key can do'),
     ('1.0.0-rc1', '2026-11-21',
      'First release candidate for 1.0.\n'
      '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
@@ -1650,9 +1659,26 @@ def day_budget(con, key, cap):
     return max(0, cap - used), today, used
 
 
+def day_take(con, key, cap):
+    # Book one call if today's allowance has room. Read and write in one locked transaction, so the background lookups and
+    # a test from the web page can never both take the last call or count over each other.
+    if con.in_transaction:
+        left, today, used = day_budget(con, key, cap)
+        if left <= 0:
+            return False
+        set_meta(con, key, "%s:%d" % (today, used + 1))
+        return True
+    with con:
+        con.execute("BEGIN IMMEDIATE")
+        left, today, used = day_budget(con, key, cap)
+        if left <= 0:
+            return False
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (key, "%s:%d" % (today, used + 1)))
+    return True
+
+
 def day_spend(con, key):
-    _left, today, used = day_budget(con, key, 0)
-    set_meta(con, key, "%s:%d" % (today, used + 1))
+    day_take(con, key, 1 << 30)
 
 
 def vt_lookup(con, limit=3, pause=16):
@@ -1666,7 +1692,8 @@ def vt_lookup(con, limit=3, pause=16):
     now = time.time()
     shas = [r[0] for r in con.execute(
         "SELECT x.sha FROM (SELECT sha, mtime t FROM files UNION SELECT b, MAX(ts) FROM events WHERE kind='file' AND b IS NOT NULL GROUP BY b) x "
-        "LEFT JOIN vt v ON v.sha=x.sha WHERE v.sha IS NULL OR (v.data LIKE '%\"found\": false%' AND v.checked<?) OR v.checked<? "
+        "LEFT JOIN vt v ON v.sha=x.sha WHERE length(x.sha)=64 AND x.sha NOT GLOB '*[^0-9a-f]*' "     # broken values never hold the queue
+        "AND (v.sha IS NULL OR (v.data LIKE '%\"found\": false%' AND v.checked<?) OR v.checked<?) "
         "GROUP BY x.sha ORDER BY (v.sha IS NULL) DESC, MAX(x.t) DESC LIMIT ?", (now - 7 * 86400, now - 30 * 86400, min(limit, left)))]
     done = 0
     for sha in shas:
@@ -1675,7 +1702,8 @@ def vt_lookup(con, limit=3, pause=16):
         if done:
             time.sleep(pause)                      # free tier: 4 a minute
         req = urllib.request.Request("https://www.virustotal.com/api/v3/files/" + sha, headers={"x-apikey": key, "User-Agent": UA})
-        day_spend(con, "vt_day")
+        if not day_take(con, "vt_day", VT_DAILY):    # a key test from the web page may have taken the last one
+            break
         try:
             with api_urlopen(req, timeout=20) as r:
                 d = json.loads(r.read(4 * 1024 * 1024))
@@ -2464,7 +2492,7 @@ def dbl_lookup(con, limit=40):
         min(limit, left - 1))
     if not ips:
         return 0
-    done, listed = 0, []
+    done = 0
     try:
         server = nb_server(dbl_dns(con))
         day_spend(con, "dbl_day")
@@ -2478,20 +2506,16 @@ def dbl_lookup(con, limit=40):
             day_spend(con, "dbl_day")
             codes = dbl_query(server, ip)
             old = dbl_get(con, ip)
-            with con:
+            with con:                           # the answer and the dronebl tag change together, so an error later cannot split them
                 con.execute("INSERT OR REPLACE INTO dronebl(ip, checked, codes) VALUES(?,?,?)", (ip, time.time(), json.dumps(codes)))
-            if bool(codes) != bool(old and old["listed"]):
-                listed.append(ip)
+                if bool(codes) != bool(old and old["listed"]):
+                    recompute_ip(con, ip)
             done += 1
             time.sleep(0.1)
     except Exception as e:
         set_meta(con, "dbl_wait_until", time.time() + (DNS_TRANSIENT if dns_transient(e) else 3600))
         set_meta(con, "dbl_error", "%s %s" % (fmt_ts(time.time()), str(e)[:120]))
         return done
-    if listed:                                  # the dronebl tag follows the answer
-        with con:
-            for ip in listed:
-                recompute_ip(con, ip)
     set_meta(con, "dbl_error", "")
     return done
 
@@ -2596,7 +2620,8 @@ def ab_html(con, ip, a):
     if not a["email"]:
         return '<span class=muted>none found</span>'
     r = con.execute("SELECT first, last, cmds, logins_ok + logins_fail, files FROM ips WHERE ip=?", (ip,)).fetchone()
-    when = ("between %s and %s (UTC)" % (fmt_ts(r[0]), fmt_ts(r[1]))) if r and r[0] else ""
+    utc = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M")     # the mail says UTC, so it is UTC
+    when = ("between %s and %s (UTC)" % (utc(r[0]), utc(r[1]))) if r and r[0] else ""
     body = ("Hello,\n\nthe address %s attacked my honeypot %s: %s login attempts, %s commands, %s files.\n\n"
             "The abuse contact was found with the Abusix Abuse Contact DB (abusix.com/contactdb).\n"
             % (ip, when, r[3] if r else "?", r[2] if r else "?", r[4] if r else "?"))
@@ -2611,13 +2636,14 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
     if not on or not daily or float(get_meta(con, k + "_wait_until", "0") or 0) > time.time():
         return 0, []
     left, _t, _u = day_budget(con, k + "_day", daily)
-    if left <= 1:
+    spare = 1 if test else 0                    # the resolver test costs one; Abusix has none (Codex rc2 L1)
+    if left <= spare:
         return 0, []
     now = time.time()
     ips = first_sendable(con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE %s AND i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
         "ORDER BY (d.ip IS NULL) DESC, i.last DESC" % (table, LOOKUP_ACTIVE_SQL), (now - LOOKUP_ACTIVE, now - LOOKUP_ACTIVE, now - recheck)),
-        min(limit, left - 1))
+        min(limit, left - spare))
     if not ips:
         return 0, []
     done, changed = 0, []
@@ -2635,10 +2661,12 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
             day_spend(con, k + "_day")
             val = query(server, ip)
             old = con.execute("SELECT %s FROM %s WHERE ip=?" % ("codes" if table == "spamhaus" else "email", table), (ip,)).fetchone()
-            with con:
+            with con:                           # the answer and the tag it gives change together
                 con.execute("INSERT OR REPLACE INTO %s VALUES(?,?,?)" % table, (ip, time.time(), val))
-            if (old[0] if old else None) != val:
-                changed.append(ip)
+                if (old[0] if old else None) != val:
+                    changed.append(ip)
+                    if table == "spamhaus":
+                        recompute_ip(con, ip)
             done += 1
             time.sleep(0.1)
     except OSError as e:
@@ -2660,12 +2688,8 @@ def sh_lookup(con, limit=20):
         if get_meta(con, "sh_error", "") == "" and sh_on(con):
             set_meta(con, "sh_error", "%s %s" % (fmt_ts(time.time()), SH_ERRORS[254]))
         return 0
-    n, changed = dnslist_lookup(con, "Spamhaus", "spamhaus", sh_on(con), SH_DAILY, dns, SH_RECHECK,
+    n, _changed = dnslist_lookup(con, "Spamhaus", "spamhaus", sh_on(con), SH_DAILY, dns, SH_RECHECK,
                                 lambda srv, ip: json.dumps(sh_query(srv, ip)), sh_test, limit)
-    if changed:                                 # the spamhaus tag follows the answer
-        with con:
-            for ip in changed:
-                recompute_ip(con, ip)
     return n
 
 
@@ -3684,13 +3708,22 @@ def health_check(con, now=None):
         log("warning", "collection_problem", issues[k], check=k)
     for k in back:
         log("info", "collection_back", health_label(k), check=k)
+    set_meta(con, "health_now", json.dumps(issues))      # /healthz and Account first, whatever happens to the alert
+    sent = {k: v for k, v in alerted.items() if k in issues}
     if NTFY_URL and settings(con)["notify"]:
-        if new:
-            ntfy_post("\n".join(issues[k] for k in new), "Huginn: collection problem", 4)
-        if back:
-            ntfy_post("Back to normal: " + ", ".join(health_label(k) for k in back), "Huginn: collection is back", 2)
-    set_meta(con, "health_alerted", json.dumps({k: alerted.get(k, now) for k in issues}))
-    set_meta(con, "health_now", json.dumps(issues))
+        # Only a problem whose alert went out is marked as alerted, so a failed send is tried again next time.
+        try:
+            if new:
+                ntfy_post("\n".join(issues[k] for k in new), "Huginn: collection problem", 4)
+            sent.update((k, now) for k in new)
+            if back:
+                ntfy_post("Back to normal: " + ", ".join(health_label(k) for k in back), "Huginn: collection is back", 2)
+        except Exception as e:
+            log("warning", "ntfy_failed", "Could not send the collection alert: %s" % str(e)[:200])
+            sent.update((k, alerted[k]) for k in back if k in alerted)   # say "back" again next time
+    else:
+        sent.update((k, now) for k in new)
+    set_meta(con, "health_alerted", json.dumps(sent))
     return issues
 
 
@@ -6553,9 +6586,12 @@ def v_search(qs):
         g["ips"].add(ip)
         g["l"] = max(g["l"], ts)
     meta = {r["sha"]: r for r in con.execute("SELECT * FROM files")}
-    for sha, f in meta.items():
-        if sha not in seen_f and (f["mtime"] or 0) >= since and not con.execute("SELECT 1 FROM events WHERE kind='file' AND b=? LIMIT 1", (sha,)).fetchone():
-            seen_f[sha] = {"names": set(), "ips": set(), "l": f["mtime"] or 0, "only_meta": True}
+    loose = [sha for sha, f in meta.items() if sha not in seen_f and (f["mtime"] or 0) >= since]
+    if loose:                                   # one pass over the file events, not one query per file
+        older = {r[0] for r in con.execute("SELECT DISTINCT b FROM events WHERE kind='file' AND b IS NOT NULL")}
+        for sha in loose:
+            if sha not in older:                # only in the metadata: an older file event would be outside the period
+                seen_f[sha] = {"names": set(), "ips": set(), "l": meta[sha]["mtime"] or 0, "only_meta": True}
     found = []
     for sha, g in seen_f.items():
         f = meta.get(sha)
@@ -8700,11 +8736,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             con = db()
             li = float(get_meta(con, "last_ingest", "0") or 0)
-            ok = (time.time() - li) < POLL * 3
             try:
                 problems = sorted(json.loads(get_meta(con, "health_now", "{}")))
             except ValueError:
                 problems = []
+            ok = (time.time() - li) < POLL * 3 and not problems     # 503 whenever something is wrong, as the stability promise says
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
                                                              "collection_problems": problems}), "application/json")
         if not self.host_ok():
@@ -8910,9 +8946,8 @@ class Handler(BaseHTTPRequestHandler):
             if not VT_KEY_RE.fullmatch(key):
                 return self.send(400, v_settings(at="virustotal", err="That does not look like a VirusTotal API key (64 characters, 0-9 and a-f)."))
             # The test is a lookup too: it is booked before it is made and never goes past the daily limit (Codex 049 L5).
-            if day_budget(con, "vt_day", VT_DAILY)[0] <= 0:
+            if not day_take(con, "vt_day", VT_DAILY):
                 return self.send(429, v_settings(at="virustotal", err="Today's VirusTotal allowance is used up, so the key cannot be tested. Try again tomorrow (UTC)."))
-            day_spend(con, "vt_day")
             res = vt_test(key)
             if res == "bad":
                 return self.send(400, v_settings(at="virustotal", err="VirusTotal refused that key. Nothing was saved."))
