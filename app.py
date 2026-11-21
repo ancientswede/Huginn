@@ -17,7 +17,13 @@ CHANGELOG = [
      '- The honeypot installer checks that the real sshd has left port 22 (IPv6 too); check-isolation.sh tests IPv6 and reports untested targets\n'
      '- Debian package: a failed upgrade is reported to dpkg instead of being marked as done\n'
      '- update-honeypot.sh --suricata-on on an old honeypot installs hp-readlogs first; the export warns if it is missing\n'
-     '- uninstall-huginn.sh only removes a folder that holds Huginn; the demo builder never wipes a folder that is not a demo'),
+     '- uninstall-huginn.sh only removes a folder that holds Huginn; the demo builder never wipes a folder that is not a demo\n'
+     '- Countries: an attacker whose location lookup failed (ipwho.is over its free allowance) is asked again after a day, '
+     'Huginn pauses an hour when ipwho.is says too many, and the card says "Not known yet" instead of an empty row\n'
+     '- IPv6 attacker pages and their exports open from Huginn\'s own links; the C2 feed follows v6=0\n'
+     '- Every spelling of an IPv4-mapped address is read as the IPv4 address, and multicast is never an attacker\n'
+     '- A login that races a password change cannot outlive it; a form that is too large changes nothing (413)\n'
+     '- DNS lists also look up known addresses with a fresh IDS alert, and private addresses in test mode no longer hold up public ones'),
     ('1.0.0-rc1', '2026-11-21',
      'First release candidate for 1.0.\n'
      '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
@@ -462,6 +468,10 @@ def log(level, event, msg="", **fields):
             pass
 
 
+class BadBody(Exception):
+    """A POST body Huginn will not read: no valid Content-Length, or over the limit."""
+
+
 def ntfy_post(body, title, prio=3):
     # One place that talks to ntfy (alerts and the test button). Never logs the token.
     h = {"Title": title, "Priority": str(prio), "Tags": "honey_pot", "User-Agent": UA}
@@ -705,16 +715,16 @@ def norm_ip(s):
     if not s:
         return None
     s = str(s).strip()
-    if s.lower().startswith("::ffff:"):
-        s = s[7:]
     try:
-        a = ipaddress.ip_address(s)
+        a = ipaddress.ip_address(s)     # "::ffff:1.2.3.4" and "::ffff:102:304" both become 1.2.3.4 below
     except ValueError:
         return None
     if a.version == 6 and a.scope_id:   # "addr%anything" may hold line breaks, which would end up in firewall feeds
         return None
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
+    if a.is_multicast:                  # never a source: Python counts some IPv6 multicast as global
+        return None
     if not is_public(a) and not (ALLOW_PRIVATE and a.is_private and not a.is_loopback):  # private addresses are dropped unless testing
         return None
     return str(a)
@@ -1771,6 +1781,22 @@ def gn_html(g):
                                                 ' <span class=muted>last seen %s</span>' % esc(g["last"]) if g.get("last") else "")
 
 
+def first_sendable(rows, n):
+    # The first n addresses in query order that may be sent (Codex rc2 M15): read on until the batch is full, so a run
+    # of private addresses at the top of the queue (test mode) cannot keep public ones from ever being looked up.
+    out = []
+    try:
+        for r in rows if n > 0 else ():
+            if sendable_ip(r[0]):
+                out.append(r[0])
+                if len(out) >= n:
+                    break
+    finally:
+        if hasattr(rows, "close"):
+            rows.close()             # no half-read statement left open on the connection
+    return out
+
+
 def sendable_ip(ip):
     # Only public addresses ever go to an outside service (test mode can store LAN addresses).
     try:
@@ -2062,10 +2088,9 @@ def hb_lookup(con, limit=20):
         return 0
     left, _t, _u = day_budget(con, "hb_day", HB_DAILY)
     now = time.time()
-    ips = [r[0] for r in con.execute(
+    ips = first_sendable(con.execute(
         "SELECT i.ip FROM ips i LEFT JOIN httpbl h USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%:%' AND (h.ip IS NULL OR h.checked<?) "
-        "ORDER BY (h.ip IS NULL) DESC, i.score DESC, i.last DESC LIMIT ?", (now - 30 * 86400, now - 7 * 86400, 50 * max(1, min(limit, left))))]
-    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left)]       # see gn_lookup (Codex 049 M11)
+        "ORDER BY (h.ip IS NULL) DESC, i.score DESC, i.last DESC", (now - 30 * 86400, now - 7 * 86400)), min(limit, left))
     done = 0
     for ip in ips:
         day_spend(con, "hb_day")
@@ -2330,6 +2355,8 @@ DBL_RECHECK = 7 * 86400
 # DNS lists only ask about attackers seen in the last 30 days, like GreyNoise and http:BL: otherwise the weekly recheck of
 # every address ever seen grows with the database until it eats the daily allowance before new attackers get a turn.
 LOOKUP_ACTIVE = 30 * 86400
+# Active = seen by a service, or a fresh IDS alert from an address Huginn already knows (Codex rc2 M16).
+LOOKUP_ACTIVE_SQL = "(i.last>=? OR EXISTS(SELECT 1 FROM ids x WHERE x.ip=i.ip AND x.last>=?))"
 DBL_CLASSES = {1: "test entry", 2: "test entry", 3: "IRC drone", 5: "bottler", 6: "spambot or drone", 7: "DDoS drone", 8: "SOCKS proxy",
                9: "HTTP proxy", 10: "proxy chain", 11: "web page proxy", 12: "open DNS resolver", 13: "brute force attacker",
                14: "open Wingate proxy", 15: "compromised router or gateway", 16: "autorooting worm",
@@ -2409,10 +2436,10 @@ def dbl_lookup(con, limit=40):
     if left <= 1:
         return 0
     now = time.time()
-    ips = [r[0] for r in con.execute(
-        "SELECT i.ip FROM ips i LEFT JOIN dronebl d USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%:%' AND (d.ip IS NULL OR d.checked<?) "
-        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?", (now - LOOKUP_ACTIVE, now - DBL_RECHECK, 20 * max(1, min(limit, left - 1))))]
-    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
+    ips = first_sendable(con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN dronebl d USING(ip) WHERE %s AND i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC" % LOOKUP_ACTIVE_SQL, (now - LOOKUP_ACTIVE, now - LOOKUP_ACTIVE, now - DBL_RECHECK)),
+        min(limit, left - 1))
     if not ips:
         return 0
     done, listed = 0, []
@@ -2565,10 +2592,10 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
     if left <= 1:
         return 0, []
     now = time.time()
-    ips = [r[0] for r in con.execute(
-        "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
-        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?" % table, (now - LOOKUP_ACTIVE, now - recheck, 20 * max(1, min(limit, left - 1))))]
-    ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
+    ips = first_sendable(con.execute(
+        "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE %s AND i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC" % (table, LOOKUP_ACTIVE_SQL), (now - LOOKUP_ACTIVE, now - LOOKUP_ACTIVE, now - recheck)),
+        min(limit, left - 1))
     if not ips:
         return 0, []
     done, changed = 0, []
@@ -3992,10 +4019,17 @@ def rdns_confirmed(name, ip):
     return 0
 
 
+class GeoBusy(Exception):
+    """ipwho.is answered 429: over the free allowance for now."""
+
+
+GEO_PAUSE = 3600
+
+
 def enrich_ip(ip):
     d = {"cc": None, "country": None, "city": None, "asn": None, "org": None, "isp": None, "rdns": None,
          "ports": None, "tags": None, "vulns": None, "hostnames": None, "rdns_ok": None}
-    ok = 0
+    ok = 0                          # 1 only when the location lookup worked: Shodan alone leaves the country empty
     try:
         j = http_json("https://ipwho.is/%s?fields=success,country,country_code,city,connection" % urllib.parse.quote(ip))
         if j.get("success"):
@@ -4005,6 +4039,9 @@ def enrich_ip(ip):
             d.update(cc=cc if re.fullmatch(r"[A-Z]{2}", cc) else None, country=ext_text(j.get("country"), 60), city=ext_text(j.get("city"), 60),
                      asn=asn if re.fullmatch(r"\d{1,10}", asn) else None, org=ext_text(conn.get("org")), isp=ext_text(conn.get("isp")))
             ok = 1
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise GeoBusy()         # over ipwho.is' free allowance: the caller pauses instead of asking again and again
     except Exception:
         pass
     try:
@@ -4014,7 +4051,6 @@ def enrich_ip(ip):
                  tags=",".join(lst("tags", 20, r"[A-Za-z0-9_.-]{1,40}")) or None,
                  vulns=",".join(lst("vulns", 40, r"(CVE|cve)-\d{4}-\d{3,7}")) or None,
                  hostnames=",".join(lst("hostnames", 10, r"[A-Za-z0-9_.-]{1,253}")) or None)
-        ok = 1
     except Exception:
         pass
     try:
@@ -4190,13 +4226,28 @@ def enrich_loop():
             now = time.time()
             todo = [r[0] for r in con.execute(
                 "SELECT i.ip FROM ips i LEFT JOIN enrich e USING(ip) WHERE e.ip IS NULL OR e.fetched < ? "
-                "ORDER BY (e.ip IS NULL) DESC, i.last DESC LIMIT 25", (now - ENRICH_TTL,))]
+                "OR (e.cc IS NULL AND e.fetched < ?) "      # no country yet (ipwho.is was busy): try again after a day
+                "ORDER BY (e.ip IS NULL) DESC, i.last DESC LIMIT 25", (now - ENRICH_TTL, now - 86400))]
+            if float(get_meta(con, "geo_wait_until", "0") or 0) > now:
+                todo = []                                   # ipwho.is said "too many": wait, the other lookups go on
             for ip in todo:
                 if not ipaddress.ip_address(ip).is_global:  # test mode (HUGINN_ALLOW_PRIVATE): never send LAN addresses out
                     with con:
                         con.execute("INSERT OR REPLACE INTO enrich(ip,fetched,ok) VALUES(?,?,1)", (ip, time.time()))
                     continue
-                d, ok, research = enrich_ip(ip)
+                try:
+                    d, ok, research = enrich_ip(ip)
+                except GeoBusy:
+                    set_meta(con, "geo_wait_until", str(time.time() + GEO_PAUSE))
+                    set_meta(con, "last_enrich_error", "%s ipwho.is: over the free allowance (429), paused for an hour" % fmt_ts(time.time()))
+                    break                                   # nothing stored: these addresses are asked again later
+                if not ok:
+                    # No location this time: keep what an earlier lookup found, and ask again in a day.
+                    old = con.execute("SELECT cc, country, city, asn, org, isp FROM enrich WHERE ip=?", (ip,)).fetchone()
+                    if old:
+                        for k, v in zip(("cc", "country", "city", "asn", "org", "isp"), old):
+                            if d[k] is None:
+                                d[k] = v
                 research = research_now(con, ip, research)       # keep a benign GreyNoise answer
                 fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:
@@ -4483,7 +4534,7 @@ def script_diffs(lists, n=2):
 
 
 def ip_link(ip, anchor=""):
-    return '<a class="mono" href="/ip/%s%s">%s</a>' % (esc(urllib.parse.quote(ip)), esc(anchor), esc(ip))
+    return '<a class="mono" href="/ip/%s%s">%s</a>' % (esc(urllib.parse.quote(ip, safe=":")), esc(anchor), esc(ip))
 
 
 def ext(url, label):
@@ -4722,7 +4773,9 @@ def v_overview(qs=None):
                      if crows else none_yet("No SSH/Telnet logins in the last 7 days")))
 
     ccs = con.execute("SELECT COALESCE(e.cc,'??') cc, MAX(e.country) country, COUNT(*) n FROM ips i LEFT JOIN enrich e USING(ip) WHERE i.last>=?" + hs + " GROUP BY cc ORDER BY n DESC LIMIT 10", [d7] + ha).fetchall()
-    ccrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td></tr>" % (cc_html(r["cc"]), esc(r["country"] or ""), num(r["n"])) for r in ccs)
+    ccrows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s</td></tr>"
+                     % ((cc_html(None), '<span class=muted>Not known yet</span>', num(r["n"])) if r["cc"] == "??" else
+                        (cc_html(r["cc"]), esc(r["country"] or ""), num(r["n"]))) for r in ccs)
     allcc = {r[0]: r[1] for r in con.execute("SELECT e.cc, COUNT(*) FROM ips i JOIN enrich e USING(ip) WHERE i.last>=? AND e.cc IS NOT NULL" + hs + " GROUP BY e.cc", [d7] + ha)
              if r[0] and re.fullmatch(r"[A-Z]{2}", r[0])}
     cc_html_ = ('<div class="card"><h3>Countries, 7 days <span class="vtabs"><button type=button data-cview="map">Map</button>'
@@ -5617,8 +5670,8 @@ def v_ip(ip, qs=None):
         tags += "," + f["flag"]
 
     # Summary
-    links = " · ".join(['<a href="/ip/%s/export.json">Export JSON</a>' % esc(urllib.parse.quote(ip)),
-                        '<a href="/ip/%s/export.csv" title="Only the raw events: lookups, IDS alerts and sessions are in the JSON export">Export events (CSV)</a>' % esc(urllib.parse.quote(ip)),
+    links = " · ".join(['<a href="/ip/%s/export.json">Export JSON</a>' % esc(urllib.parse.quote(ip, safe=":")),
+                        '<a href="/ip/%s/export.csv" title="Only the raw events: lookups, IDS alerts and sessions are in the JSON export">Export events (CSV)</a>' % esc(urllib.parse.quote(ip, safe=":")),
                         ext("https://www.abuseipdb.com/check/" + ip, "AbuseIPDB"), ext("https://viz.greynoise.io/ip/" + ip, "GreyNoise"),
                         ext("https://www.shodan.io/host/" + ip, "Shodan"), ext("https://www.virustotal.com/gui/ip-address/" + ip, "VirusTotal"),
                         ext("https://ipinfo.io/" + ip, "ipinfo"), ext("https://www.projecthoneypot.org/ip_" + ip, "Project Honey Pot"),
@@ -5652,7 +5705,7 @@ def v_ip(ip, qs=None):
     flag_form = ('<form class="flagform" method=post action="/ip/%s/flag"><label>Blocklist</label><select name=flag>'
                  '<option value=""%s>Automatic (by score)</option><option value=block%s>Always block</option><option value=allow%s>Never block</option></select>'
                  '<input name=note maxlength=200 placeholder="Note" value="%s"><button>Save</button></form>'
-                 % (esc(urllib.parse.quote(ip)), " selected" if not fl else "", " selected" if fl == "block" else "", " selected" if fl == "allow" else "", esc(f["note"] if f else "")))
+                 % (esc(urllib.parse.quote(ip, safe=":")), " selected" if not fl else "", " selected" if fl == "block" else "", " selected" if fl == "allow" else "", esc(f["note"] if f else "")))
 
     # Activity, 30 days
     days = [datetime.fromtimestamp(now - i * 86400, TZ).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
@@ -5758,12 +5811,12 @@ def v_ip(ip, qs=None):
                                                   "%d cmds" % s["cmds"] if s["cmds"] else "", "%d files" % s["files"] if s["files"] else "",
                                                   "%d proxy" % s["tcpip"] if s["tcpip"] else ""] if x) or "connect only"),
                       esc(clean(s["version"] or "", 60)), human + (attack_chips(tech, 4) if tech else ""))
-                   + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] and s["cmds"] else ""))
+                   + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] and s["cmds"] else ""))
         meta_ = '<div class="smeta">Session <span class=mono>%s</span>%s%s' % (
             esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (esc(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
             (' · script <a class=mono href="/campaign/script/%s">%s</a>' % (esc(s["cmdhash"]), esc(s["cmdhash"]))) if s["cmdhash"] else "") \
             + ((' · terminal <span class=mono>%s</span>' % esc(s["termsize"].replace("x", "×"))) if s["termsize"] else "") \
-            + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip)))) if s["tty"] else "")
+            + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] else "")
         meta_ += "</div>"
         return ('<details class="sess" id="s-%s"><summary>%s%s</summary>%s<div class="term">%s</div></details>'
                 % (esc(s["session"]), summary, more, meta_, "".join(lines) or '<div class="ln muted">No interaction recorded.</div>'))
@@ -5795,7 +5848,7 @@ def v_ip(ip, qs=None):
                               esc(" · " + ", ".join(vers[:3]) + (" +%d" % (len(vers) - 3) if len(vers) > 3 else "")) if vers else "",
                               "".join(sess_block(x) for x in grp)))
     chip = lambda key, label, n: '<a class="chip%s" href="/ip/%s%s#sessions">%s <span class=muted>%s</span></a>' % (
-        " on" if key == sf else "", esc(urllib.parse.quote(ip)), "" if key == "all" else "?s=" + key, esc(label), num(n))
+        " on" if key == sf else "", esc(urllib.parse.quote(ip, safe=":")), "" if key == "all" else "?s=" + key, esc(label), num(n))
     chips = ('<div class="chips">%s%s%s</div>' % (chip("all", "All", sc[0]), chip("cmds", "With commands", sc[1]), chip("logins", "With logins", sc[2]))
              if sc[0] > 1 else "")
     shown = len(sess)
@@ -7194,7 +7247,7 @@ def render_feed(fmt, ips, with_v6=True):
             s += ["/ipv6 firewall address-list remove [find list=huginn]" if v6 else ":do { /ipv6 firewall address-list remove [find list=huginn] } on-error={}"] + ["/ipv6 firewall address-list add list=huginn address=%s" % i for i in v6]
         return "\n".join(s) + "\n", "text/plain"
     if fmt == "c2":
-        c2 = c2_list(db())
+        c2 = [i for i in c2_list(db()) if with_v6 or ":" not in i]
         return ("# Huginn C2 / malware hosts, %s, %d entries\n" % (now, len(c2))) + "".join("%s\n" % i for i in sorted(c2)), "text/plain"
     if fmt == "csv":
         # Real CSV quoting: no value (country, tags) can ever start a new row in a firewall's import.
@@ -8555,8 +8608,9 @@ class Handler(BaseHTTPRequestHandler):
             n = -1
         if n < 0 or n > 20000:
             # Never read an unknown or huge body (a negative length would wait forever); drop the connection instead.
+            # Codex rc2 M11: and never act on it. An empty form would read as "everything off" on some routes.
             self.close_connection = True
-            return {}
+            raise BadBody()
         raw = self.rfile.read(n).decode("utf-8", "replace")
         self._body_read = True
         parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
@@ -8600,6 +8654,8 @@ class Handler(BaseHTTPRequestHandler):
         self._body_read = False
         try:
             self.route_post()
+        except BadBody:
+            self.send(413, "The form was too large or had no valid length. Nothing was changed.", "text/plain")
         except Exception as e:
             log("error", "http_error", repr(e), method="POST", path=log_path(self.path))
             self.close_connection = True
@@ -8666,7 +8722,10 @@ class Handler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(m.group(1), tok):
                 return self.send(404, "Not found", "text/plain")
             mn, days, research, v6, tor = bl_params(qs)
-            body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6, tor), v6)
+            if m.group(2) == "c2":       # its own list (not the attackers): only the address family filter applies
+                body, ctype = render_feed("c2", [], v6)
+            else:
+                body, ctype = render_feed(m.group(2), blocklist_ips(db(), mn, days, research, v6, tor), v6)
             return self.send(200, body, ctype + "; charset=utf-8")
         if path == "/login":
             if not get_meta(db(), "pw"):
@@ -8678,7 +8737,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, v_overview(qs))
         if path == "/ips":
             return self.send(200, v_ips(qs, mobile="Mobi" in self.headers.get("User-Agent", "")))
-        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/export\.(json|csv)", path)
+        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.%]{3,90})/export\.(json|csv)", path)
         if m:
             try:
                 xip = str(ipaddress.ip_address(urllib.parse.unquote(m.group(1))))
@@ -8692,7 +8751,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps(data, indent=1, ensure_ascii=False), "application/json; charset=utf-8",
                                  headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
             return self.send(200, export_csv(data), "text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="%s"' % fn})
-        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})", path)
+        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.%]{3,90})", path)
         if m:
             out = v_ip(urllib.parse.unquote(m.group(1)), qs)
             return self.send(200, out) if out else self.send(404, page("Not found", "<h1>Not found</h1><p class=muted>No data for that IP.</p>"))
@@ -8783,6 +8842,12 @@ class Handler(BaseHTTPRequestHandler):
             log("info", "login", client=ip)
             tok = secrets.token_urlsafe(32)
             with con:
+                # Codex rc2 M4: the slow check ran outside the lock. Only add the session if the password it checked is
+                # still the current one, so a login that raced a password change cannot outlive it.
+                con.execute("BEGIN IMMEDIATE")
+                if get_meta(con, "pw") != stored:
+                    con.rollback()
+                    return self.send(401, v_login("The password was just changed. Log in again."))
                 con.execute("INSERT INTO logins VALUES(?,?)", (hashlib.sha256(tok.encode()).hexdigest(), time.time() + SESSION_DAYS * 86400))
             ck = "huginn_s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (tok, SESSION_DAYS * 86400, "; Secure" if self.cookie_secure() else "")
             return self.redirect("/", {"Set-Cookie": ck})
@@ -9035,8 +9100,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, v_account(cur, err="New password must be at least 10 characters."))
             if new != f.get("repeat", ""):
                 return self.send(400, v_account(cur, err="New passwords do not match."))
-            set_meta(con, "pw", hash_pw(new))
-            with con:
+            h = hash_pw(new)
+            with con:                    # the new password and the logout of other sessions in one step
+                con.execute("BEGIN IMMEDIATE")
+                con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('pw',?)", (h,))
                 con.execute("DELETE FROM logins WHERE token_hash!=?", (cur,))
             return self.redirect("/account?ok=pw")
         if path == "/account/logout-others":
@@ -9067,7 +9134,7 @@ class Handler(BaseHTTPRequestHandler):
             if not mark_shared(con, self.form().get("shas"), on=path == "/files/shared"):
                 return self.send(400, "Bad value", "text/plain")
             return self.redirect("/files")
-        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.]{3,45})/flag", path)
+        m = re.fullmatch(r"/ip/([0-9A-Fa-f:.%]{3,90})/flag", path)
         if m:
             try:
                 ip = str(ipaddress.ip_address(urllib.parse.unquote(m.group(1))))
@@ -9081,7 +9148,7 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute("INSERT OR REPLACE INTO flags VALUES(?,?,?,?)", (ip, flag, note, time.time()))
                 else:
                     con.execute("DELETE FROM flags WHERE ip=?", (ip,))
-            return self.redirect("/ip/" + urllib.parse.quote(ip))
+            return self.redirect("/ip/" + urllib.parse.quote(ip, safe=":"))
         if path == "/blocklist/rotate":
             set_meta(con, "feed_token", secrets.token_urlsafe(24))
             return self.redirect("/blocklist")
@@ -9252,8 +9319,10 @@ def set_password():
     if getpass.getpass("Repeat: ") != p1:
         sys.exit("Passwords do not match.")
     con = connect()
-    set_meta(con, "pw", hash_pw(p1))
+    h = hash_pw(p1)
     with con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('pw',?)", (h,))
         con.execute("DELETE FROM logins")
     print("Password set. All existing sessions logged out.")
 
