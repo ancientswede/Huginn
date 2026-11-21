@@ -94,7 +94,7 @@ def _fake_http(ipwho):
 
 
 class CountryLookup(Mem):
-    # Jonas 2026-11-21: 1 813 attackers without a country. ipwho.is answered 429, Shodan answered, and the row was
+    # Seen live 2026-11-21: 1 813 attackers without a country. ipwho.is answered 429, Shodan answered, and the row was
     # stored as done with no country for 14 days.
     def lookup(self, ipwho):
         with mock.patch.object(app, "http_json", _fake_http(ipwho)), \
