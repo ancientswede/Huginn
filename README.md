@@ -76,7 +76,7 @@ Huginn also comes as a **Debian package** and a **Docker image**. All of it, ste
 
 ## Documentation
 
-| | |
+| Page | What is in it |
 |---|---|
 | [Before you open any ports](docs/isolation.md) | Isolating the honeypot, VLAN and Proxmox examples, how to test it |
 | [What Huginn does](docs/features.md) | Every page and feature, with screenshots |
