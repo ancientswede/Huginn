@@ -23,7 +23,12 @@ CHANGELOG = [
      '- IPv6 attacker pages and their exports open from Huginn\'s own links; the C2 feed follows v6=0\n'
      '- Every spelling of an IPv4-mapped address is read as the IPv4 address, and multicast is never an attacker\n'
      '- A login that races a password change cannot outlive it; a form that is too large changes nothing (413)\n'
-     '- DNS lists also look up known addresses with a fresh IDS alert, and private addresses in test mode no longer hold up public ones'),
+     '- DNS lists also look up known addresses with a fresh IDS alert, and private addresses in test mode no longer hold up public ones\n'
+     '- import reads the honeypot\'s gzipped logs, and says so when a file cannot be read or holds no events\n'
+     '- import and ingest-once refuse to run without the settings in .env; the docs give a systemd-run command that loads them\n'
+     '- The manual install copies static/ (web attack rules, map); the Account page shows how many web rules are loaded\n'
+     '- HUGINN_C2_EXCLUDE matches an IPv6 address however it is written; an AS name is only stored for the AS number that was asked\n'
+     '- Behind a trusted proxy that reports https, a form from the http address is refused; the retention limits are documented'),
     ('1.0.0-rc1', '2026-11-21',
      'First release candidate for 1.0.\n'
      '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
@@ -387,7 +392,13 @@ DEMO = os.environ.get("HUGINN_DEMO", "0") == "1"
 def is_public(a):
     return a.is_global or (DEMO and any(a in n for n in DEMO_NETS))
 ALLOWED_HOSTS = {x.strip().lower() for x in os.environ.get("HUGINN_ALLOWED_HOSTS", "").split(",") if x.strip()}  # empty = any Host
-C2_EXCLUDE = {x.strip() for x in os.environ.get("HUGINN_C2_EXCLUDE", "").split(",") if x.strip()}
+def _canon_ip(x):
+    # "2001:0db8:0000::0001" and "2001:db8::1" are the same address; compare the short form the feeds use.
+    try:
+        return str(ipaddress.ip_address(x))
+    except ValueError:
+        return x
+C2_EXCLUDE = {_canon_ip(x.strip()) for x in os.environ.get("HUGINN_C2_EXCLUDE", "").split(",") if x.strip()}
 C2_MIN_SOURCES = 2      # attackers choose what they download: one attacker alone never puts an address on the C2 list
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
@@ -903,6 +914,14 @@ def web_rules():
             rules.sort(key=lambda x: (-x[0], not x[1]))
             _web.update(rules=rules, sig=sig, error=err)
         return _web["rules"], _web["sig"]
+
+
+def web_rules_note():
+    rules, _sig = web_rules()
+    if rules:
+        return "%s rules" % num(len(rules))
+    return '<span class=err>none loaded, web requests are not classified: %s is missing or broken (%s)</span>' % (
+        esc(WEB_RULES_FILE), esc(_web["error"] or "no rules"))
 
 
 def web_fields(b):
@@ -2266,10 +2285,13 @@ def nb_parse(ip, txts):
     return {"prefix": str(best[0]), "asn": best[1], "cc": best[2], "registry": best[3], "allocated": best[4]}
 
 
-def nb_asname(txts):
+def nb_asname(txts, asn=None):
     # "13335 | US | arin | 2010-07-14 | CLOUDFLARENET - Cloudflare, Inc., US": the owner is the last field.
+    # Only the row for the AS number that was asked about counts, so a wrong answer never names another network.
     for t in txts:
         f = [x.strip() for x in str(t).split("|")]
+        if asn is not None and f[0] != str(asn):
+            continue
         if len(f) >= 5 and f[-1]:
             return ext_text(f[-1], 120)
     return None
@@ -2334,7 +2356,7 @@ def nb_lookup(con, limit=50):
             (now - NB_RECHECK, min(20, left)))]
         for asn in asns:
             day_spend(con, "nb_day")
-            name = nb_asname(dns_ask(server, "AS%s.asn.cymru.com" % asn, 16))
+            name = nb_asname(dns_ask(server, "AS%s.asn.cymru.com" % asn, 16), asn)
             with con:
                 con.execute("INSERT OR REPLACE INTO asname VALUES(?,?,?)", (asn, time.time(), name))
             time.sleep(0.1)
@@ -7515,6 +7537,7 @@ def v_account(cur, ok="", err=""):
     status = kv([("Version", esc(HUGINN_VERSION)), ("Last sync", "%s <span class=muted>(%s new rows, %ss)</span>" % (esc(ago(li)), esc(get_meta(con, "last_ingest_new", "0")), esc(get_meta(con, "last_ingest_secs", "–")))),
                  ("Sync error", esc(get_meta(con, "last_error", "") or "none")), ("Export warning", esc(get_meta(con, "last_export_warn", "") or "none")), ("Lookup error", esc(get_meta(con, "last_enrich_error", "") or "none")),
                  ("New page error", esc(get_meta(con, "last_seen_error", "") or "none")),
+                 ("Web attack rules", web_rules_note()),
                  ("History since", esc(fmt_ts(counts[4]))), ("Retention", "everything is kept" if RETENTION_DAYS == 0 else "%d days" % RETENTION_DAYS),
                  ("Database", "%.1f MB · %s events · %s sessions · %s IPs (%s looked up)" % (size / 1048576, num(counts[0]), num(counts[1]), num(counts[2]), num(counts[3]))),
                  ("Session recordings", disk_note()),
@@ -8599,7 +8622,12 @@ class Handler(BaseHTTPRequestHandler):
             if not ref:
                 return False
             o = ref
-        return urllib.parse.urlsplit(o).netloc == (self.headers.get("Host") or "")
+        u = urllib.parse.urlsplit(o)
+        if u.netloc != (self.headers.get("Host") or "") or u.scheme not in ("http", "https"):
+            return False
+        # The scheme counts too when Huginn knows it: https through a trusted proxy that says so, plain http otherwise.
+        proto = self.headers.get("X-Forwarded-Proto") if self.client_address[0] in TRUSTED_PROXIES else None
+        return proto not in ("http", "https") or u.scheme == proto
 
     def form(self, lists=None):
         try:
@@ -9215,6 +9243,19 @@ def hold_db_lock():
         sys.exit("A database restore is running. Try again when it is done.")
 
 
+ENV_FILE = os.path.join(BASE, ".env")
+ENV_CMD = ("systemd-run --quiet --wait --pipe --same-dir --uid=huginn --gid=huginn -p EnvironmentFile=%s -p UMask=0027 "
+           "/usr/bin/python3 %s" % (ENV_FILE, os.path.abspath(__file__)))
+
+
+def need_service_env():
+    # Masking, retention and the rest live in .env, which only systemd reads. Without them an import would store your own
+    # address in plain text and keep data the service would remove.
+    if os.path.exists(ENV_FILE) and not os.environ.get("INVOCATION_ID") and not os.environ.get("HUGINN_HP_HOST"):
+        sys.exit("The settings in %s are not loaded, so this would not mask or keep data the way the service does.\n"
+                 "Run it as root like this:\n  %s %s" % (ENV_FILE, ENV_CMD, " ".join(sys.argv[1:])))
+
+
 def need_service_user():
     # A file made by root would be unreadable for the service.
     if os.getuid() == 0:
@@ -9303,6 +9344,9 @@ def serve():
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
     threading.Thread(target=backup_loop, daemon=True, name="backup").start()
     srv = HuginnServer((BIND, PORT), Handler)
+    if not web_rules()[0]:
+        log("warning", "web_rules", "No web attack rules loaded from %s, web requests are not classified" % WEB_RULES_FILE,
+            error=_web["error"])
     log("info", "start", "Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), version=HUGINN_VERSION,
         metrics=bool(metrics_token(connect())), log_format=LOG_FORMAT)
     if LOG_LEVEL > 20:
@@ -9347,12 +9391,13 @@ def ingest_once():
 
 
 def import_files(paths):
-    # One-off import of whole log files (cowrie.json*, opencanary.log*). Same parsing and dedupe as the sync,
+    # One-off import of whole log files (cowrie.json*, opencanary.log*, also gzipped). Same parsing and dedupe as the sync,
     # so overlap with stored data is skipped. Reads in blocks to keep memory low.
     hold_db_lock()
     init_db()
     con = connect()
     total_rows = total_new = 0
+    failed = False
     for path in paths:
         name = os.path.basename(path)
         section = "COWRIE" if name.startswith("cowrie.json") else "CANARY" if name.startswith("opencanary.log") else None
@@ -9360,20 +9405,33 @@ def import_files(paths):
             print("skip (unknown file type): %s" % path)
             continue
         t0 = time.time()
-        n_rows = n_new = 0
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            buf = []
-            for line in fh:
-                buf.append(line.rstrip("\n"))
-                if len(buf) >= 20000:
+        n_lines = n_rows = n_new = 0
+        try:
+            with open(path, "rb") as raw:
+                packed = raw.read(2) == b"\x1f\x8b"
+            fh = gzip.open(path, "rt", encoding="utf-8", errors="replace") if packed else open(path, encoding="utf-8", errors="replace")
+            with fh:
+                buf = []
+                for line in fh:
+                    n_lines += 1
+                    buf.append(line.rstrip("\n"))
+                    if len(buf) >= 20000:
+                        rows, _ = parse_export("##%s\n" % section + "\n".join(buf), set())
+                        n_rows += len(rows); n_new += store(con, rows); buf = []
+                if buf:
                     rows, _ = parse_export("##%s\n" % section + "\n".join(buf), set())
-                    n_rows += len(rows); n_new += store(con, rows); buf = []
-            if buf:
-                rows, _ = parse_export("##%s\n" % section + "\n".join(buf), set())
-                n_rows += len(rows); n_new += store(con, rows)
-        print("%s: %d rows, %d new, %.1fs" % (name, n_rows, n_new, time.time() - t0), flush=True)
+                    n_rows += len(rows); n_new += store(con, rows)
+        except (OSError, EOFError, zlib.error) as e:
+            failed = True
+            print("%s: FAILED after %d lines (%d rows stored): %s" % (name, n_lines, n_new, e), flush=True)
+            total_rows += n_rows; total_new += n_new
+            continue
+        note = "" if n_rows or not n_lines else "  (no events recognised in %d lines: is this the right file?)" % n_lines
+        print("%s: %d rows, %d new, %.1fs%s" % (name, n_rows, n_new, time.time() - t0, note), flush=True)
         total_rows += n_rows; total_new += n_new
     print("total: %d rows, %d new" % (total_rows, total_new))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -9383,8 +9441,10 @@ if __name__ == "__main__":
     elif cmd == "set-password":
         set_password()
     elif cmd == "ingest-once":
+        need_service_env()
         ingest_once()
     elif cmd == "import" and len(sys.argv) > 2:
+        need_service_env()
         import_files(sys.argv[2:])
     elif cmd == "backups":
         list_backups()

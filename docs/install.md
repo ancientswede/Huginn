@@ -154,6 +154,7 @@ useradd --system --home-dir /opt/huginn --shell /usr/sbin/nologin huginn
 install -d -o huginn -g huginn /opt/huginn/data
 install -d -m 700 -o huginn -g huginn /opt/huginn/.ssh
 install -m 644 app.py /opt/huginn/app.py
+install -d -m 755 /opt/huginn/static && install -m 644 static/* /opt/huginn/static/   # web attack rules, map, images
 install -m 644 systemd/huginn.service /etc/systemd/system/
 cp .env.example /opt/huginn/.env && chmod 600 /opt/huginn/.env   # then edit HUGINN_HP_HOST etc.
 
@@ -181,7 +182,14 @@ runuser -u huginn -- python3 /opt/huginn/app.py set-password
 
 Open `http://huginn-host:8095` and log in. The first sync runs within two minutes.
 
-**History from before Huginn:** copy old `cowrie.json.*` and `opencanary.log*` files to the Huginn host and run `runuser -u huginn -- python3 /opt/huginn/app.py import FILE...`. Lines Huginn already has are skipped, so you can run it again at any time, for example after Huginn has been down for a while. The export only covers the latest lines, so a long gap otherwise leaves a hole.
+**History from before Huginn:** copy old `cowrie.json.*` and `opencanary.log*` files to the Huginn host and run, as root:
+
+```bash
+systemd-run --quiet --wait --pipe --same-dir --uid=huginn --gid=huginn -p EnvironmentFile=/opt/huginn/.env -p UMask=0027 \
+  /usr/bin/python3 /opt/huginn/app.py import cowrie.json.* opencanary.log*
+```
+
+That reads `.env` the way the service does, so your masking and retention apply. Gzipped files (`.gz`) are read as they are. The huginn user must be able to read the files. Lines Huginn already has are skipped, so you can run it again at any time, for example after Huginn has been down for a while. The export only covers the latest lines, so a long gap otherwise leaves a hole.
 
 ## Ports to forward
 

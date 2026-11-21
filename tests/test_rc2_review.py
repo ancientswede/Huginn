@@ -1,5 +1,5 @@
 # 1.0.0-rc2: fixes from the Codex review before 1.0 (huginn-totalgranskning-rc2).
-import http.server, os, tempfile, threading, time, unittest
+import gzip, http.server, json, os, tempfile, threading, time, unittest
 from unittest import mock
 
 from tests.helpers import app
@@ -159,6 +159,87 @@ class AddressFixes(unittest.TestCase):
         rows = [("10.0.0.%d" % i,) for i in range(50)] + [("45.10.20.30",)]
         self.assertEqual(app.first_sendable(rows, 1), ["45.10.20.30"])
 
+
+
+def cowrie_line(ip, sid):
+    return json.dumps({"eventid": "cowrie.login.failed", "src_ip": ip, "timestamp": "2026-11-01T10:00:00.000000Z",
+                       "session": sid, "username": "root", "password": "x"})
+
+
+class ImportFiles(Mem):
+    # M32: the honeypot's own rotated logs are gzipped; the import read them as text, said nothing and stored nothing.
+    def run_import(self, files):
+        d = tempfile.mkdtemp()
+        paths = []
+        for name, data in files:
+            paths.append(os.path.join(d, name))
+            with open(paths[-1], "wb") as fh:
+                fh.write(data)
+        with mock.patch.object(app, "connect", return_value=self.con), mock.patch.object(app, "hold_db_lock", lambda: None), \
+                mock.patch.object(app, "init_db", lambda: None), mock.patch("builtins.print"):
+            app.import_files(paths)
+
+    def test_gzipped_logs_are_read(self):
+        text = (cowrie_line("45.10.20.61", "im1") + "\n").encode()
+        self.run_import([("cowrie.json.2026-11-01.gz", gzip.compress(text)), ("cowrie.json.2026-11-02", (cowrie_line("45.10.20.62", "im2") + "\n").encode())])
+        self.assertEqual(sorted(r[0] for r in self.con.execute("SELECT ip FROM ips")), ["45.10.20.61", "45.10.20.62"])
+
+    def test_broken_gzip_fails(self):
+        with self.assertRaises(SystemExit):
+            self.run_import([("cowrie.json.1.gz", gzip.compress(b"x" * 1000)[:15])])
+
+
+class ServiceSettings(unittest.TestCase):
+    # M33: .env is read only by systemd; an import started by hand stored the owner's address unmasked.
+    def test_import_needs_the_env_file_settings(self):
+        f = tempfile.NamedTemporaryFile(delete=False)
+        self.addCleanup(os.unlink, f.name)
+        env = {k: v for k, v in os.environ.items() if k not in ("INVOCATION_ID", "HUGINN_HP_HOST")}
+        with mock.patch.object(app, "ENV_FILE", f.name), mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit) as e:
+                app.need_service_env()
+            self.assertIn("systemd-run", str(e.exception))
+            with mock.patch.dict(os.environ, {"INVOCATION_ID": "x"}):
+                app.need_service_env()
+        with mock.patch.object(app, "ENV_FILE", f.name + ".missing"), mock.patch.dict(os.environ, env, clear=True):
+            app.need_service_env()
+
+    def test_missing_rules_are_shown(self):
+        # M31: a manual install without static/ classified no web requests and said nothing.
+        with mock.patch.dict(app._web, {"rules": [], "sig": "", "error": "FileNotFoundError"}):
+            self.assertIn("none loaded", app.web_rules_note())
+
+
+class SmallFixes(unittest.TestCase):
+    def test_c2_exclude_any_spelling(self):
+        # M35: the feed compares the short form, the setting kept what the owner typed.
+        self.assertEqual(app._canon_ip("2001:0db8:0000:0000:0000:0000:0000:0001"), "2001:db8::1")
+        self.assertEqual(app._canon_ip("not-an-ip"), "not-an-ip")
+
+    def test_asname_must_match_the_number(self):
+        # L7: a reply for another AS number never names this one.
+        txt = ["64502 | US | arin | 2010-07-14 | OTHER-NET"]
+        self.assertIsNone(app.nb_asname(txt, "64501"))
+        self.assertEqual(app.nb_asname(txt + ["64501 | SE | ripencc | 2001-01-01 | RIGHT-NET"], "64501"), "RIGHT-NET")
+
+    def test_origin_scheme(self):
+        # L9: behind a trusted proxy that says https, an http page on the same host is another origin.
+        class H:
+            client_address = ("10.0.0.2", 1)
+
+        def check(origin, proto=None, proxy=True):
+            h = H()
+            h.headers = {"Origin": origin, "Host": "huginn.example"}
+            if proto:
+                h.headers["X-Forwarded-Proto"] = proto
+            with mock.patch.object(app, "TRUSTED_PROXIES", {"10.0.0.2"} if proxy else set()):
+                return app.Handler.same_origin(h)
+        self.assertTrue(check("https://huginn.example", "https"))
+        self.assertFalse(check("http://huginn.example", "https"))
+        self.assertTrue(check("http://huginn.example"))
+        self.assertTrue(check("https://huginn.example", "http", proxy=False))   # an untrusted proxy's header means nothing
+        self.assertFalse(check("ftp://huginn.example"))
+        self.assertFalse(check("https://evil.example", "https"))
 
 if __name__ == "__main__":
     unittest.main()

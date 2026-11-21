@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-All settings are environment variables in `/opt/huginn/.env`. See [`.env.example`](../.env.example).
+All settings are environment variables in `/opt/huginn/.env`. See [`.env.example`](../.env.example). Only systemd reads that file, so commands you run by hand need it too: see [Commands](operations.md#commands).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -10,8 +10,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_HP_PORT` | `22022` | Honeypot admin SSH port |
 | `HUGINN_PORT` / `HUGINN_BIND` | `8095` / `0.0.0.0` | Web UI |
 | `HUGINN_TZ` | `UTC` | Time zone for the UI and per-day charts |
-| `HUGINN_POLL` | `120` | Seconds between syncs |
-| `HUGINN_RETENTION_DAYS` | `180` | Days of history kept; `0` keeps everything forever |
+| `HUGINN_POLL` | `120` | Seconds between syncs, at least `30` |
+| `HUGINN_RETENTION_DAYS` | `180` | Days of history kept, at least `7` (1–6 count as 7); `0` or a negative number keeps everything forever. The Account page shows the value in use |
 | `HUGINN_DECOY_CAP` | `2000` | Decoy-service events stored per IP, service and day; the rest are only counted. `0` stores everything |
 | `HUGINN_RETURN_DAYS` | `7` | Starting value for the quiet days before an address counts as `returned`; change it under Settings |
 | `HUGINN_DB_BACKUPS` | `3` | Automatic copies of the database to keep; `0` turns them off |

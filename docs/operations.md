@@ -98,8 +98,8 @@ cd demo && python3 -m http.server 8000   # then open http://127.0.0.1:8000/
 ```
 app.py serve                 # run the web UI and the collector (what systemd runs)
 app.py set-password          # set or reset the login password (logs out every session)
-app.py ingest-once           # one sync, for testing
-app.py import FILE...        # import full cowrie.json* / opencanary.log* files
+app.py ingest-once           # one sync, for testing (needs the .env settings, see below)
+app.py import FILE...        # import full cowrie.json* / opencanary.log* files, also gzipped (needs the .env settings)
 
 ./update-huginn.sh [--rollback]          # update / go back (Huginn machine)
 ./update-honeypot.sh [--cowrie] [--opencanary]   # update the honeypot side
@@ -107,3 +107,12 @@ app.py import FILE...        # import full cowrie.json* / opencanary.log* files
 ./uninstall-huginn.sh [--purge]                  # remove Huginn (keeps the data unless --purge)
 ./uninstall-honeypot.sh [--purge] [--restore-ssh]   # remove the honeypot side
 ```
+
+`.env` is read only by systemd. Run `import` and `ingest-once` as root through `systemd-run`, so they get the same settings and user as the service:
+
+```bash
+systemd-run --quiet --wait --pipe --same-dir --uid=huginn --gid=huginn -p EnvironmentFile=/opt/huginn/.env -p UMask=0027 \
+  /usr/bin/python3 /opt/huginn/app.py import FILE...
+```
+
+In Docker the settings are already in the container: `docker compose exec huginn huginn import FILE...` (the files must be inside the container, for example under `/data`).
