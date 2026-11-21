@@ -30,6 +30,19 @@ jobs:
       - name: Demo builder
         run: python tools/make_demo.py "$RUNNER_TEMP/demo" --base /
 
+  upgrade:
+    name: Upgrade from old releases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the old releases come from the git tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Old databases open in this version
+        run: python tools/upgrade-test.py v0.9.0 v0.20.0 v0.35.0 "$(git tag --list 'v*' --sort=-v:refname | head -1)"
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
