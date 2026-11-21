@@ -5,8 +5,12 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "1.0.0-rc1"
+HUGINN_VERSION = "1.0.0-rc2"
 CHANGELOG = [
+    ('1.0.0-rc2', '2026-11-21',
+     'DNS list lookups stay on recent attackers.\n'
+     '- DroneBL, Spamhaus and Abusix only look up attackers seen in the last 30 days, like GreyNoise and http:BL\n'
+     '- Before, the weekly recheck of every address ever seen grew with the database until it used up the daily allowance'),
     ('1.0.0-rc1', '2026-11-21',
      'First release candidate for 1.0.\n'
      '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
@@ -2314,6 +2318,9 @@ def nb_lookup(con, limit=50):
 # so every round first asks for DroneBL's test address 127.0.0.2: no answer there means the resolver hides them.
 DBL_ZONE = "dnsbl.dronebl.org"
 DBL_RECHECK = 7 * 86400
+# DNS lists only ask about attackers seen in the last 30 days, like GreyNoise and http:BL: otherwise the weekly recheck of
+# every address ever seen grows with the database until it eats the daily allowance before new attackers get a turn.
+LOOKUP_ACTIVE = 30 * 86400
 DBL_CLASSES = {1: "test entry", 2: "test entry", 3: "IRC drone", 5: "bottler", 6: "spambot or drone", 7: "DDoS drone", 8: "SOCKS proxy",
                9: "HTTP proxy", 10: "proxy chain", 11: "web page proxy", 12: "open DNS resolver", 13: "brute force attacker",
                14: "open Wingate proxy", 15: "compromised router or gateway", 16: "autorooting worm",
@@ -2385,7 +2392,7 @@ def dbl_html(con, d, ip=""):
 
 
 def dbl_lookup(con, limit=40):
-    # Newest attackers first, IPv4 only, each again after a week. Stays under DBL_DAILY; pauses an hour on errors and six when
+    # Newest attackers first (active in 30 days), IPv4 only, each again after a week. Stays under DBL_DAILY; pauses an hour on errors and six when
     # the resolver drops DroneBL's answers (then every attacker would look "not listed").
     if not dbl_on(con) or not DBL_DAILY or float(get_meta(con, "dbl_wait_until", "0") or 0) > time.time():
         return 0
@@ -2394,8 +2401,8 @@ def dbl_lookup(con, limit=40):
         return 0
     now = time.time()
     ips = [r[0] for r in con.execute(
-        "SELECT i.ip FROM ips i LEFT JOIN dronebl d USING(ip) WHERE i.ip NOT LIKE '%:%' AND (d.ip IS NULL OR d.checked<?) "
-        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?", (now - DBL_RECHECK, 20 * max(1, min(limit, left - 1))))]
+        "SELECT i.ip FROM ips i LEFT JOIN dronebl d USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%:%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?", (now - LOOKUP_ACTIVE, now - DBL_RECHECK, 20 * max(1, min(limit, left - 1))))]
     ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
     if not ips:
         return 0
@@ -2550,8 +2557,8 @@ def dnslist_lookup(con, label, table, on, daily, dns, recheck, query, test, limi
         return 0, []
     now = time.time()
     ips = [r[0] for r in con.execute(
-        "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
-        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?" % table, (now - recheck, 20 * max(1, min(limit, left - 1))))]
+        "SELECT i.ip FROM ips i LEFT JOIN %s d USING(ip) WHERE i.last>=? AND i.ip NOT LIKE '%%:%%' AND (d.ip IS NULL OR d.checked<?) "
+        "ORDER BY (d.ip IS NULL) DESC, i.last DESC LIMIT ?" % table, (now - LOOKUP_ACTIVE, now - recheck, 20 * max(1, min(limit, left - 1))))]
     ips = [ip for ip in ips if sendable_ip(ip)][:min(limit, left - 1)]
     if not ips:
         return 0, []

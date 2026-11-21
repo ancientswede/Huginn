@@ -54,6 +54,14 @@ class Lookup(Mem):
         self.assertIn("brute force attacker", html)
         self.assertIn("IPv4 only", app.dbl_html(self.con, None, "2001:db8::1"))
 
+    def test_only_recent_attackers_asked(self):
+        # 1.0.0-rc2: an address last seen over 30 days ago is not looked up, so the weekly recheck does not grow for ever.
+        old = time.time() - 40 * 86400
+        with self.con:
+            self.con.execute("INSERT INTO ips(ip,first,last,score) VALUES(?,?,?,?)", ("45.10.20.40", old, old, 9))
+        self.assertEqual(self.run_lookup({}), 2)
+        self.assertIsNone(app.dbl_get(self.con, "45.10.20.40"))
+
     def test_blocked_resolver_pauses_and_says_so(self):
         self.assertEqual(self.run_lookup({PUB: [13]}, test_answer=[]), 0)
         self.assertIsNone(app.dbl_get(self.con, PUB))                     # nothing stored as "not listed"
