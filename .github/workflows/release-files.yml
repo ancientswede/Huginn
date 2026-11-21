@@ -31,7 +31,7 @@ jobs:
         run: |
           ver=$(sed -nE 's/^HUGINN_VERSION = "([^"]+)".*/\1/p' app.py | head -1)
           [ "v$ver" = "$TAG" ]
-          [ "$(dpkg-deb -f dist/huginn_all.deb Version)" = "$ver" ]
+          [ "$(dpkg-deb -f dist/huginn_all.deb Version)" = "${ver/-rc/~rc}" ]
       - name: Compose file is valid
         run: |
           cp dist/huginn.env.example dist/.env

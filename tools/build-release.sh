@@ -30,7 +30,8 @@ install -m 755 "$ROOT/packaging/deb/huginn-setup" "$ROOT/packaging/deb/huginn-ro
 install -m 644 "$ROOT/LICENSE" "$PKG/usr/share/doc/huginn/copyright"
 install -m 755 "$ROOT/packaging/deb/postinst" "$ROOT/packaging/deb/prerm" "$ROOT/packaging/deb/postrm" "$PKG/DEBIAN/"
 SIZE=$(du -sk --exclude=DEBIAN "$PKG" | cut -f1)
-sed -e "s/@VERSION@/$VER/" -e "s/@SIZE@/$SIZE/" "$ROOT/packaging/deb/control" > "$PKG/DEBIAN/control"
+DEBVER="${VER/-rc/~rc}"       # Debian: 1.0.0~rc1 sorts before 1.0.0 (a hyphen would sort after it)
+sed -e "s/@VERSION@/$DEBVER/" -e "s/@SIZE@/$SIZE/" "$ROOT/packaging/deb/control" > "$PKG/DEBIAN/control"
 dpkg-deb --root-owner-group -Zxz --build "$PKG" "$OUT/huginn_all.deb" >/dev/null
 
 # Without the repository there is nothing to build from, so the build line has to go.

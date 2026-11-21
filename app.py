@@ -5,8 +5,14 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "0.52.2"
+HUGINN_VERSION = "1.0.0-rc1"
 CHANGELOG = [
+    ('1.0.0-rc1', '2026-11-21',
+     'First release candidate for 1.0.\n'
+     '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
+     '- Tested upgrades from old releases (0.9 and later) and a restore from a real backup\n'
+     '- Release files and the Docker image are signed (gh attestation verify)\n'
+     '- Version numbers with -rc are understood, and a release candidate never shows as an update for 0.x'),
     ('0.52.2', '2026-11-19',
      'DNS lookups recover by themselves.\n'
      '- DroneBL and Spamhaus try their test question once more before pausing\n'
@@ -3759,10 +3765,11 @@ def collector_loop():
 
 
 def vtuple(v):
-    try:
-        return tuple(int(x) for x in str(v).lstrip("v").split(".")[:3])
-    except ValueError:
+    # "1.0.0-rc1" sorts before "1.0.0" and after every 0.x; anything else unreadable sorts first.
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?", str(v).strip())
+    if not m:
         return (0,)
+    return (int(m[1]), int(m[2]), int(m[3]), int(m[4]) if m[4] else 10 ** 6)
 
 
 def check_update(con):

@@ -26,7 +26,7 @@ class Release(unittest.TestCase):
         return subprocess.run(["dpkg-deb", "-f", self.deb, name], check=True, capture_output=True, text=True).stdout.strip()
 
     def test_version_comes_from_the_code(self):
-        self.assertEqual(self.field("Version"), VERSION)
+        self.assertEqual(self.field("Version"), VERSION.replace("-rc", "~rc"))
 
     def test_package_holds_exactly_the_expected_files(self):
         static = ["/usr/share/huginn/static/" + x for x in os.listdir(os.path.join(ROOT, "static"))]

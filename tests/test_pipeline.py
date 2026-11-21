@@ -116,6 +116,10 @@ class Helpers(unittest.TestCase):
     def test_vtuple(self):
         self.assertGreater(app.vtuple("0.10.0"), app.vtuple("0.9.1"))
         self.assertEqual(app.vtuple("v1.2.3"), app.vtuple("1.2.3"))
+        self.assertLess(app.vtuple("0.52.2"), app.vtuple("1.0.0-rc1"))
+        self.assertLess(app.vtuple("1.0.0-rc1"), app.vtuple("1.0.0-rc2"))
+        self.assertLess(app.vtuple("1.0.0-rc2"), app.vtuple("1.0.0"))
+        self.assertEqual(app.vtuple("nonsense"), (0,))
 
     def test_password_hash(self):
         h = app.hash_pw("correct horse battery")

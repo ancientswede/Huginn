@@ -144,12 +144,20 @@ def one(tag, work):
     return before, after, res, dup
 
 
+def vkey(t):
+    # v1.0.0-rc1 sorts before v1.0.0; tags that are not versions sort first
+    import re
+    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?", t)
+    return (int(m[1]), int(m[2]), int(m[3]), int(m[4]) if m[4] else 10 ** 6) if m else (0,)
+
+
 def main():
     tags = sys.argv[1:]
     if not tags:
         all_tags = sorted(subprocess.run(["git", "-C", ROOT, "tag", "--list", "v*"], capture_output=True, text=True).stdout.split(),
-                          key=lambda t: [int(x) for x in t[1:].split(".")])
-        tags = ["v0.20.0", "v0.35.0", all_tags[-1]]
+                          key=vkey)
+        head = set(subprocess.run(["git", "-C", ROOT, "tag", "--points-at", "HEAD"], capture_output=True, text=True).stdout.split())
+        tags = ["v0.20.0", "v0.35.0", [t for t in all_tags if t not in head][-1]]
     work = tempfile.mkdtemp(prefix="huginn-upgrade-")
     bad = 0
     for tag in tags:
