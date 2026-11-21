@@ -97,6 +97,11 @@ if [ "$ROLLBACK" = 1 ]; then
 fi
 
 # ------------------------------------------------------------------ update
+# Version order: 1.0.0-rc1 comes after every 0.x and before 1.0.0 (same rule as vtuple in app.py).
+VKEY='import re, sys
+def vkey(v):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?", v.strip())
+    return (int(m[1]), int(m[2]), int(m[3]), int(m[4]) if m[4] else 10 ** 6) if m else (0,)'
 OLD=$(ver "$DIR/app.py")
 NEW=$(ver "$HERE/app.py")
 [ -n "$NEW" ] || die "Run this from the Huginn repository folder."
@@ -104,7 +109,8 @@ if [ "$OLD" = "$NEW" ] && [ "$FORCE" != 1 ]; then
   ok "Huginn $OLD is already the newest version in this folder (did you run git pull?)"
   exit 0
 fi
-if [ "$FORCE" != 1 ] && python3 -c "import sys; a,b=[tuple(int(x) for x in v.split('.')) for v in sys.argv[1:]]; sys.exit(0 if b < a else 1)" "$OLD" "$NEW"; then
+if [ "$FORCE" != 1 ] && python3 -c "$VKEY
+a,b=[vkey(v) for v in sys.argv[1:]]; sys.exit(0 if b < a else 1)" "$OLD" "$NEW"; then
   die "This folder has $NEW, which is older than the installed $OLD. Use --rollback to go back, or --force."
 fi
 python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$HERE/app.py" || die "The new app.py does not parse — nothing was changed."
@@ -162,13 +168,14 @@ backups_newest_first | tail -n +$((KEEP + 1)) | while read -r old; do rm -rf -- 
 backups_newest_first | tail -n +2 | while read -r old; do rm -f -- "$old/huginn.db"; done
 
 say "What is new since $OLD"
-python3 - "$HERE/app.py" "$OLD" <<'PY'
+python3 - "$HERE/app.py" "$OLD" "$VKEY" <<'PY'
 import ast, sys
 tree = ast.parse(open(sys.argv[1]).read())
 log = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CHANGELOG")
-old = tuple(int(x) for x in sys.argv[2].split("."))
+exec(sys.argv[3])
+old = vkey(sys.argv[2])
 for v, d, text in log:
-    if tuple(int(x) for x in v.split(".")) > old:
+    if vkey(v) > old:
         head, *rest = text.split("\n")
         print("    %s  %s" % (v, head))
         for line in rest:
