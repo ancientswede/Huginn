@@ -59,7 +59,10 @@ done
 
 # Suricata (honeypot/setup-suricata.sh): only this when asked for. hp-export is updated first, so Huginn gets the alerts.
 if [ -n "$SURICATA" ]; then
-  cmp -s "$HERE/honeypot/hp-export" /usr/local/bin/hp-export || install -m 755 "$HERE/honeypot/hp-export" /usr/local/bin/hp-export
+  # hp-readlogs first: the new hp-export needs it, and a honeypot from before 0.50 does not have it yet.
+  for f in hp-readlogs hp-export; do
+    cmp -s "$HERE/honeypot/$f" "/usr/local/bin/$f" || install -m 755 "$HERE/honeypot/$f" "/usr/local/bin/$f"
+  done
   case "$SURICATA" in
     on) bash "$HERE/honeypot/setup-suricata.sh" on ;;
     off) bash "$HERE/honeypot/setup-suricata.sh" off ;;

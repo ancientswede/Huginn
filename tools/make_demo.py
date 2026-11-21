@@ -359,7 +359,21 @@ print("demo data: %d IPs, %d events, %d sessions" % (len(ips), con.execute("SELE
                                                      con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]))
 
 # ------------------------------------------------------------------ render to static files
-OUT = os.path.abspath(args.out)
+# Build next to the target and swap it in at the end, so a failed build leaves the old demo in place.
+# An existing target is only replaced if it is empty or an earlier demo (marker file, or the old layout without one).
+FINAL = os.path.abspath(args.out)
+MARK = ".huginn-demo"
+
+
+def _is_demo(d):
+    if not os.listdir(d) or os.path.isfile(os.path.join(d, MARK)):
+        return True
+    return all(os.path.exists(os.path.join(d, x)) for x in ("index.html", "blocklist.html", "static/world-map.json"))
+
+
+if os.path.lexists(FINAL) and not (os.path.isdir(FINAL) and not os.path.islink(FINAL) and _is_demo(FINAL)):
+    sys.exit("%s exists and is not an earlier Huginn demo: refusing to replace it. Pick an empty or new folder." % FINAL)
+OUT = FINAL + ".building"
 shutil.rmtree(OUT, ignore_errors=True)
 os.makedirs(OUT)
 pages = {}
@@ -528,5 +542,12 @@ for _ic in ("icon-32.png", "icon-180.png", "icon-192.png", "hero.jpg", "hero-lig
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(app.__file__)), "static", "world-map.json"), os.path.join(OUT, "static", "world-map.json"))
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(app.__file__)), "static", "world-map.LICENSE.md"), os.path.join(OUT, "static", "world-map.LICENSE.md"))
 save("robots.txt", "User-agent: *\nDisallow:\n")
+save(MARK, "Built by tools/make_demo.py. The whole folder is replaced on the next build.\n")
 shutil.rmtree(work, ignore_errors=True)
+if os.path.isdir(FINAL):
+    shutil.rmtree(FINAL + ".old", ignore_errors=True)
+    os.rename(FINAL, FINAL + ".old")
+os.rename(OUT, FINAL)
+shutil.rmtree(FINAL + ".old", ignore_errors=True)
+OUT = FINAL
 print("wrote %d files, %.1f MB to %s (base %s)" % (len(pages) + 2, sum(pages.values()) / 1048576 + 0.3, OUT, BASE))

@@ -6,12 +6,22 @@ set -e
 [ "$1" = configure ] || exit 0
 
 SRC=/usr/share/huginn
-if [ -f /opt/huginn/app.py ] && systemctl is-enabled --quiet huginn 2>/dev/null; then
+if [ -f /opt/huginn/app.py ]; then
   cmp -s "$SRC/app.py" /opt/huginn/app.py && exit 0
-  # A failed update has already put the old version back. Failing here too would only leave the package half-configured.
-  "$SRC/update-huginn.sh" || {
-    echo "WARNING: Huginn was not updated, see the message above. Try again with: apt install --reinstall ./huginn_all.deb" >&2
-  }
+  if ! systemctl is-enabled --quiet huginn 2>/dev/null; then
+    # Not running as a service (turned off on purpose, or a half-done setup): leave /opt/huginn alone, but say so.
+    echo "WARNING: /opt/huginn still has the old Huginn code because the huginn service is not enabled." >&2
+    echo "         If the setup never finished, run: huginn-setup" >&2
+    echo "         Otherwise enable it and update with: systemctl enable huginn && $SRC/update-huginn.sh" >&2
+    exit 0
+  fi
+  # A failed update has already put the old version back. Fail here too, so the package is not marked as
+  # configured with old code running; "dpkg --configure -a" (or the same apt install) then tries again.
+  if ! "$SRC/update-huginn.sh"; then
+    echo "ERROR: Huginn was not updated, see the message above. The old version is still running." >&2
+    echo "       Try again with: dpkg --configure -a" >&2
+    exit 1
+  fi
   exit 0
 fi
 

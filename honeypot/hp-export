@@ -92,6 +92,8 @@ readlogs() { python3 -I /usr/local/bin/hp-readlogs "$1" "$2" 0 2>/dev/null; retu
 # Attackers choose how long a logged line is: drop the absurd ones and cap each log, so they cannot make the export refused.
 keep() { LC_ALL=C awk 'length($0) <= 16384' | tail -c 50331648; }
 WARNS=()
+# Without the helper every log section comes back empty: say so instead of looking like a quiet honeypot.
+[ -r /usr/local/bin/hp-readlogs ] || WARNS+=("readlogs")
 echo "##COWRIE"
 for d in $COWRIE_DIRS; do readlogs "$d/var/log/cowrie/cowrie.json*" 30000 | keep; done
 echo "##CANARY"

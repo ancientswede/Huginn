@@ -13,7 +13,12 @@ install -d -m 750 "$D/data"
 
 [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "huginn@docker" -f "$KEY"
 
-keyline() { echo "hp-add-huginn-key '$(cat "$KEY.pub")'"; }
+keyline() {  # pasted into a root shell on the honeypot: only a checked key type and key, never other text from the volume
+  local pub
+  pub=$(head -c 1024 "$KEY.pub" | head -n 1 | awk '{print $1" "$2}')
+  [[ "$pub" =~ ^ssh-ed25519\ [A-Za-z0-9+/]{68}$ ]] || { echo "huginn: $KEY.pub is not one ed25519 key; delete $KEY and $KEY.pub and restart" >&2; return 1; }
+  echo "hp-add-huginn-key '$pub huginn'"
+}
 
 learn_hostkey() {
   # Trust on first use, like ssh itself: the fingerprint is printed so you can compare it on the honeypot with

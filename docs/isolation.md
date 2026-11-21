@@ -53,7 +53,11 @@ IN DROP -p tcp -dport 22022                           # nobody else reaches admi
 OUT DROP -dest 10.0.0.0/8                              # no private networks at all...
 OUT DROP -dest 172.16.0.0/12
 OUT DROP -dest 192.168.0.0/16                          # ...including your router's admin page
+OUT DROP -dest fc00::/7                                # the same for IPv6: private (ULA) addresses...
+OUT DROP -dest fe80::/10                               # ...and link-local, which reaches the router and the LAN
 ```
+
+**IPv6.** If your LAN has IPv6, the rules above must cover it too, or the honeypot reaches your machines over IPv6 while IPv4 is blocked. The two `OUT DROP` lines for `fc00::/7` and `fe80::/10` block private and link-local addresses. If your LAN machines also have **public IPv6 addresses** (a prefix from your ISP), add your own prefix as well (`OUT DROP -dest 2001:db8:1234::/48`, with your prefix), or turn IPv6 off in the honeypot (in Proxmox: the container's network device, IPv6 *None*). Test with an IPv6 address from your LAN too: `tools/check-isolation.sh 192.168.1.10 [fd00::10]:445`.
 
 Replies to connections that were made *to* the honeypot still work, because the firewall tracks them. Internet traffic still goes out through your router: it is the router's address as a *destination* that is blocked, not its use as gateway. Give the honeypot a **static IP address** and a public DNS server (for example `1.1.1.1`) instead of your router. With DHCP, the lease renewal to your router would be blocked too, and the honeypot would drop off the network after a while. Then run the isolation test above.
 

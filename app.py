@@ -8,9 +8,16 @@
 HUGINN_VERSION = "1.0.0-rc2"
 CHANGELOG = [
     ('1.0.0-rc2', '2026-11-21',
-     'DNS list lookups stay on recent attackers.\n'
+     'DNS list lookups stay on recent attackers, and fixes from a full review before 1.0.\n'
      '- DroneBL, Spamhaus and Abusix only look up attackers seen in the last 30 days, like GreyNoise and http:BL\n'
-     '- Before, the weekly recheck of every address ever seen grew with the database until it used up the daily allowance'),
+     '- Before, the weekly recheck of every address ever seen grew with the database until it used up the daily allowance\n'
+     '- ntfy: a redirect from the server is no longer followed, so the access token cannot end up at another host\n'
+     '- Retention also removes a gone attacker\'s lookups and session recordings; first sightings stay without the address\n'
+     '- The command to connect Huginn to the honeypot is built only from a checked key\n'
+     '- The honeypot installer checks that the real sshd has left port 22 (IPv6 too); check-isolation.sh tests IPv6 and reports untested targets\n'
+     '- Debian package: a failed upgrade is reported to dpkg instead of being marked as done\n'
+     '- update-honeypot.sh --suricata-on on an old honeypot installs hp-readlogs first; the export warns if it is missing\n'
+     '- uninstall-huginn.sh only removes a folder that holds Huginn; the demo builder never wipes a folder that is not a demo'),
     ('1.0.0-rc1', '2026-11-21',
      'First release candidate for 1.0.\n'
      '- Feeds, exports, /healthz, /metrics and env names are now a promise: see Stability promise in the README\n'
@@ -463,7 +470,9 @@ def ntfy_post(body, title, prio=3):
     if NTFY_TOKEN:
         h["Authorization"] = "Bearer " + NTFY_TOKEN
     req = urllib.request.Request(NTFY_URL, data=body.encode("utf-8"), method="POST", headers=h)
-    urllib.request.urlopen(req, timeout=10).read()
+    # No redirects: a redirect would hand the token to whatever host it points at. The reply body is not used.
+    with _api_opener.open(req, timeout=10) as r:
+        r.read(64 * 1024)
 PUBLIC_URL = os.environ.get("HUGINN_PUBLIC_URL", "")      # link in the notifications
 NOTIFY_EVERY = 3600
 # Automatic copies of the database: how many to keep (0 = off) and how often. See "Database backups" in docs/operations.md.
@@ -3360,8 +3369,33 @@ def retention(con):
         con.execute("DELETE FROM spamhaus WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM abusecontact WHERE ip NOT IN (SELECT ip FROM ips)")
         con.execute("DELETE FROM asname WHERE asn NOT IN (SELECT asn FROM netblock WHERE asn IS NOT NULL)")
+        # Codex rc2 H3: the rest of what names a removed attacker. Location, GreyNoise and http:BL answers go; first
+        # sightings stay as "this was new once", without the address, session or example that came from it.
+        for t in ("enrich", "greynoise", "httpbl"):
+            con.execute("DELETE FROM %s WHERE ip NOT IN (SELECT ip FROM ips)" % t)
+        con.execute("UPDATE seen SET ip=NULL, session=NULL, ex=NULL WHERE ip IS NOT NULL AND ip NOT IN (SELECT ip FROM ips)")
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('events_gen',?)", (str(time.time()),))   # caches start over
+    tty_prune(con)
     con.execute("PRAGMA optimize")
+
+
+def tty_prune(con):
+    # Recordings of sessions that retention removed. Only files Huginn names itself (<sha256>.gz or a plain <sha256>).
+    keep = {r[0] for r in con.execute("SELECT DISTINCT tty FROM sessions WHERE tty IS NOT NULL")}
+    try:
+        names = os.listdir(TTY_DIR)
+    except OSError:
+        return 0
+    gone = 0
+    for n in names:
+        sha = n[:-3] if n.endswith(".gz") else n
+        if re.fullmatch(r"[0-9a-f]{64}", sha) and sha not in keep:
+            try:
+                os.remove(os.path.join(TTY_DIR, n))
+                gone += 1
+            except OSError:
+                pass
+    return gone
 
 
 # ---------------------------------------------------------------- first sightings ("New" page)

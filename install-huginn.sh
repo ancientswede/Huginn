@@ -105,10 +105,15 @@ if [ -n "$NTFY" ]; then
   [ -z "$NTFY_TOKEN" ] || [[ "$NTFY_TOKEN" =~ ^[A-Za-z0-9_-]{8,128}$ ]] || die "That access token does not look right."
   if NTFY_URL="$NTFY" NTFY_TOKEN="$NTFY_TOKEN" python3 - <<'PY'
 import os, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None   # never follow: the token must not go to another host
 h = {"Title": "Huginn: test", "Tags": "honey_pot"}
 if os.environ.get("NTFY_TOKEN"):
     h["Authorization"] = "Bearer " + os.environ["NTFY_TOKEN"]
-urllib.request.urlopen(urllib.request.Request(os.environ["NTFY_URL"], data=b"Huginn is being installed. Notifications work.", headers=h, method="POST"), timeout=10).read()
+req = urllib.request.Request(os.environ["NTFY_URL"], data=b"Huginn is being installed. Notifications work.", headers=h, method="POST")
+with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as r:
+    r.read(65536)
 PY
   then ok "test notification sent — check your phone"
   else warn "could not send to $NTFY — check the URL/token; you can change HUGINN_NTFY_URL in /opt/huginn/.env later"
@@ -183,13 +188,17 @@ test_export() {
 }
 
 say "Connect Huginn to the honeypot"
+# The command below is pasted into a root shell on the honeypot. Build it only from a checked key type and key,
+# read as huginn (the file is in huginn's folder), never from whatever text the .pub file holds.
+PUB=$(runuser -u huginn -- head -c 1024 /opt/huginn/.ssh/honeypot_ro.pub | head -n 1 | awk '{print $1" "$2}')
+[[ "$PUB" =~ ^ssh-ed25519\ [A-Za-z0-9+/]{68}$ ]] || die "/opt/huginn/.ssh/honeypot_ro.pub is not one ed25519 key. Delete honeypot_ro and honeypot_ro.pub there and run this again."
 N=$(test_export)
 if [ "${N:-0}" -lt 7 ]; then
   cat <<EOF
 
     Run this ONE command on the honeypot (as root):
 
-      hp-add-huginn-key '$(cat /opt/huginn/.ssh/honeypot_ro.pub)'
+      hp-add-huginn-key '$PUB huginn'
 
     It allows this key to run the read-only log export and nothing else.
     Waiting for it (up to $WAIT_MIN minutes)...

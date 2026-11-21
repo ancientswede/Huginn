@@ -28,6 +28,21 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 [ -d "$DIR" ] || [ -f "/etc/systemd/system/$SVC.service" ] || die "Huginn is not installed here ($DIR)."
+# Only ever delete a folder that is really Huginn: an absolute path, not a system folder, with Huginn's app.py in it.
+DIR="${DIR%/}"
+case "$DIR" in
+  /*) ;;
+  *) die "HUGINN_DIR must be an absolute path ($DIR)." ;;
+esac
+case "$DIR" in
+  ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/*|/var|/var/lib|/var/log)
+    die "Refusing to remove $DIR: that is a system folder, not a Huginn install." ;;
+esac
+if [ -e "$DIR" ]; then
+  [ -d "$DIR" ] && [ ! -L "$DIR" ] || die "$DIR is not a plain folder: refusing to remove it."
+  grep -qs '^HUGINN_VERSION = ' "$DIR/app.py" || die "$DIR has no Huginn app.py: refusing to remove it. Check HUGINN_DIR."
+fi
+[ "$USR" != root ] || die "HUGINN_USER must not be root."
 
 echo
 echo "    This removes Huginn: the service, $DIR, the '$USR' service user and its SSH key."
@@ -53,7 +68,7 @@ if [ "$PURGE" != 1 ] && [ -d "$DIR/data" ]; then
 fi
 
 say "Removing files"
-rm -rf -- "$DIR"
+[ ! -e "$DIR" ] || rm -rf -- "$DIR"
 ok "removed $DIR (code, settings, SSH key, backups)"
 if id "$USR" >/dev/null 2>&1; then
   userdel "$USR" 2>/dev/null || true

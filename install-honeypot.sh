@@ -508,6 +508,16 @@ if [ -f "$ADMIN_CONF" ] && grep -qx 'Port 22' "$ADMIN_CONF"; then
     warn "could not take the real sshd off port 22: it stays on 22 and $ADMIN_PORT"
   fi
 fi
+# Codex rc2 H9: check what really listens, whatever config put it there. The redirect is IPv4 only, so an sshd that
+# still holds port 22 is the real admin login for anyone who reaches this machine over IPv6 (or if nftables fails).
+SSHD22=""
+if ss -ltnpH "sport = :22" 2>/dev/null | grep -q '"sshd'; then
+  SSHD22=$(ss -ltnpH "sport = :22" | awk '/"sshd/ {print $4}' | sort -u | tr '\n' ' ')
+  warn "the REAL sshd still listens on port 22 ($SSHD22). Remove every 'Port 22' line from /etc/ssh/sshd_config"
+  warn "and /etc/ssh/sshd_config.d/*.conf (keep 'Port $ADMIN_PORT'), run: systemctl restart ssh, and run this again."
+else
+  ok "the real sshd does not listen on port 22 (IPv4 or IPv6)"
+fi
 
 # ------------------------------------------------------------------ 5. export for Huginn
 say "Export for Huginn"
@@ -599,3 +609,6 @@ cat <<EOF
        $FWD
      (never forward $ADMIN_PORT)
 EOF
+if [ -n "$SSHD22" ]; then
+  printf '\n  \033[31mNOT READY:\033[0m the real sshd still listens on port 22 (%s). Fix that (see above) before step 4.\n' "$SSHD22"
+fi
