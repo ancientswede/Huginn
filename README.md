@@ -253,6 +253,15 @@ huginn-setup                  # asks for the honeypot address, then the same ste
 - **Remove:** `apt remove huginn` stops Huginn and keeps your settings and data in `/opt/huginn`. `apt purge huginn` deletes them too.
 - A machine installed with the scripts can switch by installing the package. Settings and data are kept.
 
+**Check a download** (optional, from 1.0): release files and the Docker image are signed by the GitHub workflow that built them, with no key of mine involved. With the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify huginn_all.deb -R ancientswede/Huginn
+gh attestation verify oci://ghcr.io/ancientswede/huginn:latest -R ancientswede/Huginn
+```
+
+It confirms the file was built from this repository by its release workflow, and not changed afterwards. `SHA256SUMS` lists the checksums too.
+
 ## Run Huginn in Docker
 
 The Huginn side also runs as a container. **The honeypot does not:** it needs its own isolated VM or LXC with port redirects, set up with `install-honeypot.sh` as above. Never run the honeypot next to your other containers.

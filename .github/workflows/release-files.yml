@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write       # signing (Sigstore, no key to keep)
+  attestations: write
 
 jobs:
   files:
@@ -40,5 +42,13 @@ jobs:
           sudo apt-get install -y ./dist/huginn_all.deb
           test -x /usr/sbin/huginn-setup
           sudo huginn-setup --help
+      - name: Sign (build provenance)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/huginn_all.deb
+            dist/docker-compose.yml
+            dist/huginn.env.example
+            dist/SHA256SUMS
       - name: Upload
         run: gh release upload "$TAG" dist/huginn_all.deb dist/docker-compose.yml dist/huginn.env.example dist/SHA256SUMS --clobber
