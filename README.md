@@ -98,6 +98,7 @@ Huginn is written with [Claude](https://claude.ai), Anthropic's AI, using Claude
 Nothing is released before it has run on my own honeypot and Huginn, and it is tested end to end on fresh test machines for the install, update, uninstall and Docker paths. Even so, this is a security tool that faces the internet, so:
 
 - **Read before you trust it.** Huginn is small on purpose: one Python file with only the standard library, a few shell scripts, 700+ tests, an upgrade test from old releases and CI on every change. The [Security model](docs/security.md) explains what can reach what.
+- **Reviewed by two AI models, not by a human auditor.** Codex (OpenAI) reviews the code as it is written. Before 1.0 it also got two separate security reviews: one by a Claude security agent and one by OpenAI Codex (GPT-6.2-Astra, max reasoning). The findings were fixed. That is not the same as a human audit, so a second pair of eyes is very welcome.
 - **Bugs and ideas** are welcome as issues. Security problems: please report them privately (see [SECURITY.md](SECURITY.md)).
 
 ## Stability promise
