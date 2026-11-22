@@ -8,7 +8,7 @@ Only open ports when **all** of this is true:
 
 - **The honeypot is truly isolated.** Use its own VLAN (best) or the hypervisor's firewall (see [How to isolate the honeypot](#how-to-isolate-the-honeypot)), so it cannot open connections to your LAN, your router's admin page, your NAS or your other VLANs. A correct port forward alone is not isolation, and neither is a different subnet. **Test it** from the honeypot. Every one of these must fail:
   ```bash
-  ping -c1 <a LAN machine>      # must time out
+  ping -c1 <a LAN machine>      # must time out (check-isolation.sh fails if it answers)
   nc -zv -w3 <your router> 80   # must fail
   nc -zv -w3 <your NAS> 445     # must fail
   ```

@@ -7,12 +7,19 @@
 # IPv6 ones if your LAN has IPv6. Every one must be BLOCKED. A name that does not resolve counts as NOT TESTED.
 # It also tests the honeypot's own gateway: routers often isolate VLANs from each other but still let every VLAN reach
 # the router itself (SSH, web admin). Only TCP connects and pings; nothing is sent beyond that. Exit code 1 if anything
-# that should be blocked answers.
+# that should be blocked answers: a LAN machine that answers ping or refuses a connection is reachable, too.
 set -u
 FAIL=0
 UNTESTED=0
 # The host and port are passed as arguments, never pasted into the shell code (a name could hold shell syntax).
 tcp() { timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' tcp "$1" "$2" 2>/dev/null; }
+# For LAN targets "refused" is not "blocked": the machine (or a firewall rule that answers with a reset) is reachable,
+# only that port is closed. Prints open, refused or blocked.
+tcp_state() {
+  local err rc
+  err=$(timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' tcp "$1" "$2" 2>&1 >/dev/null); rc=$?
+  if [ "$rc" = 0 ]; then echo open; elif [[ "$err" == *"refused"* ]]; then echo refused; else echo blocked; fi
+}
 row() { printf '  %-8s %-28s %s\n' "$1" "$2" "$3"; }
 bad() { row "OPEN" "$1" "$2  <-- should be blocked"; FAIL=1; }
 untested() { row "UNTESTED" "$1" "$2"; UNTESTED=1; }
@@ -43,8 +50,12 @@ if [ $# -gt 0 ]; then
     fi
     if ! getent ahosts "$h" >/dev/null 2>&1; then untested "$h" "the name does not resolve here, so nothing was tried"; continue; fi
     l="$h:$p"; [[ "$h" == *:* ]] && l="[$h]:$p"
-    if tcp "$h" "$p"; then bad "$l" "LAN"; else row "blocked" "$l" ""; fi
-    if ping -c1 -W2 "$h" >/dev/null 2>&1; then row "info" "$h" "answers ping"; fi
+    case "$(tcp_state "$h" "$p")" in
+      open) bad "$l" "LAN" ;;
+      refused) bad "$l" "LAN: the port is closed but the machine answered (connection refused)" ;;
+      *) row "blocked" "$l" "" ;;
+    esac
+    if ping -c1 -W2 "$h" >/dev/null 2>&1; then bad "$h" "LAN: answers ping"; fi
   done
 else
   echo; echo "  (no LAN machines given: add a few, e.g. ./tools/check-isolation.sh 192.168.1.10 192.168.1.20:445)"

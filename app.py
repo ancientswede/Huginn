@@ -14,7 +14,14 @@ CHANGELOG = [
      '- Blocklist feeds hold at most HUGINN_BL_MAX addresses (50000), highest score first\n'
      '- A deeply nested line in the Suricata alerts no longer stops every sync\n'
      '- install-huginn.sh fills in HUGINN_ALLOWED_HOSTS with this machine\'s names and addresses (stops DNS rebinding); '
-     'the "Unknown host" page says what to add'),
+     'the "Unknown host" page says what to add\n'
+     '- The C2 list follows the same never-block list and cap\n'
+     '- A service log can no longer fake the honeypot\'s protection report: hp-export drops lines that look like section markers, '
+     'and Huginn uses the last copy of each section\n'
+     '- IDS counters with non-ASCII digits no longer stop the sync\n'
+     '- A Cowrie or OpenCanary service that will not start with its sandbox or limits is left stopped, never run without them\n'
+     '- check-isolation.sh fails when a LAN machine answers ping or refuses a connection (it is reachable)\n'
+     '- HUGINN_NEVER_BLOCK understands IPv4-mapped networks; HUGINN_BL_MAX accepts values under 100'),
     ('1.0.0-rc2', '2026-11-21',
      'DNS list lookups stay on recent attackers, and fixes from a full review before 1.0.\n'
      '- DroneBL, Spamhaus and Abusix only look up attackers seen in the last 30 days, like GreyNoise and http:BL\n'
@@ -420,9 +427,13 @@ def _nets(v):
     out = []
     for x in v.split(","):
         try:
-            out.append(ipaddress.ip_network(x.strip(), strict=False))
+            n = ipaddress.ip_network(x.strip(), strict=False)
         except ValueError:
-            pass
+            continue
+        # ::ffff:a.b.c.d/120 is the IPv4 network a.b.c.d/24: stored addresses are already IPv4 (norm_ip), so compare as IPv4.
+        if n.version == 6 and n.prefixlen >= 96 and n.network_address.ipv4_mapped:
+            n = ipaddress.ip_network("%s/%d" % (n.network_address.ipv4_mapped, n.prefixlen - 96), strict=False)
+        out.append(n)
     return out
 # Never on the blocklist, whatever the score: a compromised honeypot can write fake log lines with any source address,
 # and a firewall that loads the feed would then cut off DNS or your own servers (appsec review 2026-11-22).
@@ -431,7 +442,11 @@ NEVER_BLOCK = _nets("1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208
                     "2606:4700:4700::1111,2606:4700:4700::1001,2001:4860:4860::8888,2001:4860:4860::8844,2620:fe::fe,2620:fe::9") \
     + _nets(os.environ.get("HUGINN_NEVER_BLOCK", ""))
 # At most this many addresses in the blocklist feeds (highest score kept), so fake log lines cannot grow the list without end.
-BL_MAX = max(100, int(os.environ.get("HUGINN_BL_MAX", "50000") or 50000))
+BL_MAX = max(1, int(os.environ.get("HUGINN_BL_MAX", "50000") or 50000))
+
+
+def never_block(a):
+    return any(a.version == n.version and a in n for n in NEVER_BLOCK)
 C2_MIN_SOURCES = 2      # attackers choose what they download: one attacker alone never puts an address on the C2 list
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
@@ -1244,6 +1259,14 @@ def parse_export(text, skip):
         if line.startswith("##"):
             section = line[2:].strip()
             seen.add(section)
+            # A service user can write "##STATUS" (or another marker) into its own log. hp-export drops such lines, and
+            # here the last copy of a section wins: the real ones come after the logs (appsec/Codex review 2026-11-22).
+            if section in ("FILES", "PERSONAS", "IDENTITY", "STATUS", "IDS"):
+                {"FILES": files, "PERSONAS": personas, "IDENTITY": identities, "STATUS": status, "IDS": ids_lines}[section].clear()
+                if section == "IDS":
+                    ids_meta_lines.clear()
+            elif section == "BAIT":
+                bait.clear()
             continue
         if len(line) > MAX_LINE:
             continue
@@ -1299,7 +1322,7 @@ def parse_export(text, skip):
     parse_export.mails = mails
     parse_export.ids, ids_rules = parse_ids(ids_lines[-20000:] + ids_meta_lines[-2:], skip, hashes)
     parse_export.ids = [tuple(u8(x) for x in r) for r in parse_export.ids]
-    ids_dropped = max([int(x[8:]) for x in ids_meta_lines if x.startswith("dropped ") and x[8:].isdigit() and len(x) < 20] or [0])
+    ids_dropped = max([int(x[8:]) for x in ids_meta_lines if x.startswith("dropped ") and x[8:].isascii() and x[8:].isdigit() and len(x) < 20] or [0])
     parse_export.meta = {"personas": parse_personas(personas[:50]), "bait": bait_values(bait), "identities": parse_identities(identities[-500:]),
                          "has_personas": "PERSONAS" in seen, "has_bait": "BAIT" in seen,
                          "has_ids": "IDS" in seen, "ids_rules": ids_rules, "ids_dropped": ids_dropped,
@@ -1328,7 +1351,7 @@ def parse_ids(lines, skip, hashes):
     for line in lines:
         if line.startswith("rules "):
             v = line[6:]
-            rules = int(v) if v.isdigit() and len(v) <= 11 else rules
+            rules = int(v) if v.isascii() and v.isdigit() and len(v) <= 11 else rules
             continue
         if not line.startswith("{"):
             continue
@@ -7250,7 +7273,7 @@ def blocklist_ips(con, min_score, days, research, v6, tor=None):
         if not is_public(a) or getattr(a, "scope_id", None) or (a.version == 6 and not v6):
             continue
         # Never-block wins over the score; only your own Block on the IP page wins over never-block.
-        if not manual and any(a.version == n.version and a in n for n in NEVER_BLOCK):
+        if not manual and never_block(a):
             continue
         out.append((not manual, -(score or 0), a))
     if len(out) > BL_MAX:
@@ -7278,7 +7301,7 @@ def c2_list(con):
             a = ipaddress.ip_address(host)
         except ValueError:
             return
-        if not is_public(a) or getattr(a, "scope_id", None) or str(a) in BENIGN_IOC or str(a) in C2_EXCLUDE:
+        if not is_public(a) or getattr(a, "scope_id", None) or str(a) in BENIGN_IOC or str(a) in C2_EXCLUDE or never_block(a):
             return
         out.setdefault(str(a), set()).add(why)
         sources.setdefault(str(a), set()).update(ips)
@@ -7291,7 +7314,9 @@ def c2_list(con):
             add(host_of(x), "embedded in " + r["sha"][:12], dropped.get(r["sha"], ()))
     for url, ip in con.execute("SELECT DISTINCT a, ip FROM events WHERE kind='file' AND a LIKE '%://%'"):
         add(host_of(url), "malware download host", (ip,))
-    return {k: v for k, v in out.items() if len(sources[k]) >= C2_MIN_SOURCES}
+    keep = sorted((k for k in out if len(sources[k]) >= C2_MIN_SOURCES),
+                  key=lambda k: (-len(sources[k]), ipaddress.ip_address(k).version, int(ipaddress.ip_address(k))))[:BL_MAX]
+    return {k: out[k] for k in keep}
 
 
 def bl_params(qs):

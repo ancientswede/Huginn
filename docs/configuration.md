@@ -35,8 +35,8 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_LOG_LEVEL` | `warning` / `info` | `debug`, `info`, `warning` or `error`; the default is `info` with JSON logs |
 | `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
 | `HUGINN_ALLOWED_HOSTS` | (empty; `install-huginn.sh` fills in this machine's names and addresses) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding. Behind a reverse proxy, add the name you open Huginn by |
-| `HUGINN_NEVER_BLOCK` | (empty) | Addresses or networks (CIDR) that never go on the blocklist feeds, separated by commas: your WAN address, VPS, VPN server. The big public DNS resolvers are always left out. Only Always block on an IP page overrides it |
-| `HUGINN_BL_MAX` | 50000 | Most addresses in a blocklist feed; the highest scores are kept |
+| `HUGINN_NEVER_BLOCK` | (empty) | Addresses or networks (CIDR) that never go on the blocklist feeds or the C2 list, separated by commas: your WAN address, VPS, VPN server. The big public DNS resolvers are always left out. Only Always block on an IP page overrides it |
+| `HUGINN_BL_MAX` | 50000 | Most addresses in a blocklist feed (highest scores kept) and on the C2 list (most attackers kept) |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |
 | `HUGINN_NTFY_URL` / `HUGINN_PUBLIC_URL` | – | ntfy topic URL and the link in notifications |
 | `HUGINN_NTFY_TOKEN` | – | Access token (`tk_...`) for an ntfy server with access control |

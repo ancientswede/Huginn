@@ -1,7 +1,9 @@
 #!/bin/bash
 # setup-sandbox.sh — filesystem sandbox for Cowrie and OpenCanary (part of Huginn, AGPL-3.0-or-later).
 # Run by install-honeypot.sh and update-honeypot.sh as root. Safe to run again. Someone who gets out of a fake service
-# can then only write in that service's own folder. If a service does not start this way, its drop-in is removed again.
+# can then only write in that service's own folder. If a service does not start this way it is left stopped with the
+# protection in place: someone who already controls the service's files could otherwise make it fail on purpose to get
+# the protection removed (Codex review 2026-11-22). Huginn then alerts that the service is not running.
 set -euo pipefail
 
 sandbox() {  # sandbox UNIT DIR
@@ -27,10 +29,9 @@ CapabilityBoundingSet="
   if systemctl is-active --quiet "$unit"; then
     echo "    ok $unit sandboxed"
   else
-    rm -f "$f"
-    systemctl daemon-reload
-    systemctl restart "$unit" || true
-    echo "    ! $unit did not start in the sandbox, so it runs without it"
+    systemctl stop "$unit" || true
+    echo "    ! $unit did not start in the sandbox: left STOPPED, safer than running without it."
+    echo "      Look at: journalctl -u $unit -n 50   Remove $f only if you accept running without it."
   fi
 }
 
@@ -53,10 +54,9 @@ LimitFSIZE=128M"
   if systemctl is-active --quiet "$unit"; then
     echo "    ok $unit limited (memory $mem, files 128M)"
   else
-    rm -f "$f"
-    systemctl daemon-reload
-    systemctl restart "$unit" || true
-    echo "    ! $unit did not start with the limits, so it runs without them"
+    systemctl stop "$unit" || true
+    echo "    ! $unit did not start with the limits: left STOPPED, safer than running without it."
+    echo "      Look at: journalctl -u $unit -n 50   Remove $f only if you accept running without it."
   fi
 }
 

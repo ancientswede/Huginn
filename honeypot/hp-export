@@ -90,7 +90,8 @@ esac
 # and never reads as root what a service user could redirect (H1: it drops to the folder's owner). No match: no output.
 readlogs() { python3 -I /usr/local/bin/hp-readlogs "$1" "$2" 0 2>/dev/null; return 0; }
 # Attackers choose how long a logged line is: drop the absurd ones and cap each log, so they cannot make the export refused.
-keep() { LC_ALL=C awk 'length($0) <= 16384' | tail -c 50331648; }
+# A line starting with ## would look like a section marker to Huginn (a service user could fake ##STATUS): never pass it on.
+keep() { LC_ALL=C awk 'length($0) <= 16384 && substr($0, 1, 2) != "##"' | tail -c 50331648; }
 WARNS=()
 # Without the helper every log section comes back empty: say so instead of looking like a quiet honeypot.
 [ -r /usr/local/bin/hp-readlogs ] || WARNS+=("readlogs")
