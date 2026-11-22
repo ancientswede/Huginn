@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-- **The honeypot stays isolated.** Huginn connects *to* the honeypot. The honeypot needs no route to your LAN, and the key can only run `hp-export`: it prints the logs, session recordings and captured files, and it can switch two things Huginn's Settings page controls, the logout note (`goodbye on|off`) and an already installed Suricata (`ids on|off`). It cannot run anything else. If the honeypot is ever fully compromised, the attacker gets that export and nothing else.
+- **The honeypot stays isolated.** Huginn connects *to* the honeypot. The honeypot needs no route to your LAN, and the key can only run `hp-export`: it prints the logs, session recordings and captured files, and it can switch two things Huginn's Settings page controls, the logout note (`goodbye on|off`) and an already installed Suricata (`ids on|off`). It cannot run anything else. If the honeypot is ever fully compromised, the attacker gets that export and nothing else. They could still feed Huginn fake log lines, so the blocklist feeds never hold the big public DNS resolvers or what you list in `HUGINN_NEVER_BLOCK`, and they are capped at `HUGINN_BL_MAX` addresses.
 - **Attacker data is untrusted.** Everything attackers typed is escaped. The UI has a strict Content-Security-Policy (no inline scripts).
 - **Logins:** one password (scrypt), HttpOnly SameSite=Strict cookies, at most 5 failed logins per 15 minutes per IP, same-origin checks on every form.
 - **Do not expose Huginn to the internet.** Keep it on your LAN or VPN, or behind a reverse proxy with an IP allow-list.

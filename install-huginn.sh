@@ -140,6 +140,18 @@ install -m 644 "$HERE/app.py" /opt/huginn/app.py
 install -d -m 755 /opt/huginn/static
 install -m 644 "$HERE"/static/* /opt/huginn/static/
 install -m 644 "$HERE/systemd/huginn.service" /etc/systemd/system/huginn.service
+allowed_hosts() {
+  # This machine's host names and addresses, with the port unless it is 80. IPv6 in brackets, as browsers send it.
+  local p=":$WEB_PORT" h out=""
+  [ "$WEB_PORT" = 80 ] && p=""
+  for h in localhost 127.0.0.1 "$(hostname)" "$(hostname -f 2>/dev/null)" $(hostname -I 2>/dev/null); do
+    [[ "$h" =~ ^[A-Za-z0-9._:-]+$ ]] || continue
+    [[ "$h" == *:* ]] && h="[$h]"
+    h="${h,,}$p"
+    [[ ",$out," == *",$h,"* ]] || out="${out:+$out,}$h"
+  done
+  echo "$out"
+}
 if [ ! -f /opt/huginn/.env ]; then
   cat > /opt/huginn/.env <<EOF
 # Huginn settings (read by systemd). See .env.example in the repository for all options.
@@ -147,6 +159,8 @@ HUGINN_HP_HOST=$HP_HOST
 HUGINN_HP_PORT=$HP_PORT
 HUGINN_PORT=$WEB_PORT
 HUGINN_TZ=$TZ_NAME
+# Names and addresses the web page answers to (stops DNS rebinding). Behind a reverse proxy: add its host name here.
+HUGINN_ALLOWED_HOSTS=$(allowed_hosts)
 EOF
   chmod 600 /opt/huginn/.env
   ok "wrote /opt/huginn/.env"
@@ -249,4 +263,6 @@ cat <<EOF
 
   Huginn is ready:  http://$(hostname -I | awk '{print $1}'):$WEB_PORT
   The first sync runs within two minutes. Keep this page on your LAN or VPN.
+  Opening it by another name (reverse proxy, DNS name) gives "Unknown host":
+  add that name to HUGINN_ALLOWED_HOSTS in /opt/huginn/.env and restart huginn.
 EOF

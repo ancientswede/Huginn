@@ -33,3 +33,5 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 - Research scanners (Censys, Shadowserver, BinaryEdge and others) are detected from reverse DNS and network names and left out by default. Anyone who logged in, ran commands, dropped files or tried an exploit is always blocklisted, research network or not.
 - Tor exit nodes are left out by default as well: an attack through Tor says nothing about the next person on the same exit. Include them on Settings, Lookups, or with `tor=1` on one feed. An attacker you set to Always block stays on the list.
 - "Never block" always wins.
+- Some addresses never go on the feeds, whatever their score: the big public DNS resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9 and others) and whatever you put in `HUGINN_NEVER_BLOCK`. Put your own WAN address, VPS and VPN server there. A honeypot that is ever fully taken over could write fake log lines with any source address; this keeps it from making your firewall cut off DNS or your own servers. Only Always block on an IP page overrides it.
+- A feed holds at most `HUGINN_BL_MAX` addresses (50000), the highest scores first.

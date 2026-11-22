@@ -5,8 +5,16 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "1.0.0-rc2"
+HUGINN_VERSION = "1.0.0-rc3"
 CHANGELOG = [
+    ('1.0.0-rc3', '2026-11-22',
+     'Fixes from a security review of rc2.\n'
+     '- Blocklist feeds never hold the big public DNS resolvers or the addresses in the new HUGINN_NEVER_BLOCK; '
+     'a fully compromised honeypot could otherwise put any address on them with fake log lines\n'
+     '- Blocklist feeds hold at most HUGINN_BL_MAX addresses (50000), highest score first\n'
+     '- A deeply nested line in the Suricata alerts no longer stops every sync\n'
+     '- install-huginn.sh fills in HUGINN_ALLOWED_HOSTS with this machine\'s names and addresses (stops DNS rebinding); '
+     'the "Unknown host" page says what to add'),
     ('1.0.0-rc2', '2026-11-21',
      'DNS list lookups stay on recent attackers, and fixes from a full review before 1.0.\n'
      '- DroneBL, Spamhaus and Abusix only look up attackers seen in the last 30 days, like GreyNoise and http:BL\n'
@@ -408,6 +416,22 @@ def _canon_ip(x):
     except ValueError:
         return x
 C2_EXCLUDE = {_canon_ip(x.strip()) for x in os.environ.get("HUGINN_C2_EXCLUDE", "").split(",") if x.strip()}
+def _nets(v):
+    out = []
+    for x in v.split(","):
+        try:
+            out.append(ipaddress.ip_network(x.strip(), strict=False))
+        except ValueError:
+            pass
+    return out
+# Never on the blocklist, whatever the score: a compromised honeypot can write fake log lines with any source address,
+# and a firewall that loads the feed would then cut off DNS or your own servers (appsec review 2026-11-22).
+# Big public resolvers by default; add your WAN address, VPS and other must-reach addresses with HUGINN_NEVER_BLOCK (CIDRs).
+NEVER_BLOCK = _nets("1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,4.2.2.2,"
+                    "2606:4700:4700::1111,2606:4700:4700::1001,2001:4860:4860::8888,2001:4860:4860::8844,2620:fe::fe,2620:fe::9") \
+    + _nets(os.environ.get("HUGINN_NEVER_BLOCK", ""))
+# At most this many addresses in the blocklist feeds (highest score kept), so fake log lines cannot grow the list without end.
+BL_MAX = max(100, int(os.environ.get("HUGINN_BL_MAX", "50000") or 50000))
 C2_MIN_SOURCES = 2      # attackers choose what they download: one attacker alone never puts an address on the C2 list
 TRUSTED_PROXIES = {x.strip() for x in os.environ.get("HUGINN_TRUSTED_PROXIES", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.environ.get("HUGINN_TZ", "UTC"))
@@ -1321,7 +1345,7 @@ def parse_ids(lines, skip, hashes):
             ip = norm_ip(e.get("ip"))
             sid, sev = int(e["sid"]), int(e.get("sev") or 3)
             sig, cat, proto, port = e.get("sig"), e.get("cat") or "", e.get("proto") or "", e.get("port")
-        except (ValueError, KeyError, TypeError, OverflowError):
+        except (ValueError, KeyError, TypeError, OverflowError, RecursionError):   # [[[[... from a compromised honeypot
             continue
         if not ip or not oldest <= ts <= time.time() + 86400 or not 0 < sid < 2 ** 31 or not isinstance(sig, str) or not IDS_TEXT.fullmatch(sig):
             continue
@@ -7207,14 +7231,14 @@ def blocklist_ips(con, min_score, days, research, v6, tor=None):
     tor = tor_bl(con) if tor is None else tor
     since = time.time() - days * 86400
     rows = con.execute(
-        "SELECT i.ip, (','||COALESCE(i.tags,'')||',' LIKE '%,tor,%' AND COALESCE(f.flag,'')!='block') via_tor, COALESCE(e.research,-1) rs, COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
+        "SELECT i.ip, COALESCE(f.flag,'')='block' manual, i.score, (','||COALESCE(i.tags,'')||',' LIKE '%,tor,%' AND COALESCE(f.flag,'')!='block') via_tor, COALESCE(e.research,-1) rs, COALESCE(f.flag,'')!='block' AND (i.logins_ok + i.logins_fail + i.cmds + i.files + i.exploits + i.tcpip) = 0 "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,web-exploit,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,took-bait,%' "
         "AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,read-bait,%' AND ','||COALESCE(i.tags,'')||',' NOT LIKE '%,sshole-probe,%' maybe "
         "FROM ips i LEFT JOIN enrich e USING(ip) LEFT JOIN flags f USING(ip) "
         "WHERE COALESCE(f.flag,'')!='allow' AND (f.flag='block' OR (i.last>=? AND i.score>=?))",
         (since, min_score)).fetchall()
     out = []
-    for ip, via_tor, rs, quiet in rows:
+    for ip, manual, score, via_tor, rs, quiet in rows:
         if via_tor and not tor:
             continue
         # No name/network lookup yet: GreyNoise may already know it is a benign scanner (Codex 049 M12).
@@ -7225,7 +7249,14 @@ def blocklist_ips(con, min_score, days, research, v6, tor=None):
         a = ipaddress.ip_address(ip)
         if not is_public(a) or getattr(a, "scope_id", None) or (a.version == 6 and not v6):
             continue
-        out.append(a)
+        # Never-block wins over the score; only your own Block on the IP page wins over never-block.
+        if not manual and any(a.version == n.version and a in n for n in NEVER_BLOCK):
+            continue
+        out.append((not manual, -(score or 0), a))
+    if len(out) > BL_MAX:
+        out.sort(key=lambda t: (t[0], t[1], t[2].version, int(t[2])))     # manual blocks first, then highest score
+        out = out[:BL_MAX]
+    out = [t[2] for t in out]
     out.sort(key=lambda a: (a.version, int(a)))
     return [str(a) for a in out]
 
@@ -8744,7 +8775,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
                                                              "collection_problems": problems}), "application/json")
         if not self.host_ok():
-            return self.send(421, "Unknown host", "text/plain")
+            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart Huginn.", "text/plain")
         if path == "/static/app.css":
             return self.send(200, CSS, "text/css; charset=utf-8", cache=True)
         if path == "/static/world-map.json":
@@ -8887,7 +8918,7 @@ class Handler(BaseHTTPRequestHandler):
         _local.base = base_url(self)
         path = urllib.parse.urlsplit(self.path).path
         if not self.host_ok():
-            return self.send(421, "Unknown host", "text/plain")
+            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart Huginn.", "text/plain")
         if not self.same_origin():
             return self.send(403, "Forbidden", "text/plain")
         con = db()
