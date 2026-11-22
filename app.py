@@ -5,8 +5,13 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "1.0.0-rc3"
+HUGINN_VERSION = "1.0.0-rc4"
 CHANGELOG = [
+    ('1.0.0-rc4', '2026-11-22',
+     'Fixes found by fuzzing the honeypot data path.\n'
+     '- Only real hashes are read from Cowrie: a HASSH must be 32 hex characters, a file or session recording hash 64; '
+     'other text no longer turns into file, HASSH or replay links\n'
+     '- Every link built from honeypot data is URL-encoded'),
     ('1.0.0-rc3', '2026-11-22',
      'Fixes from a security review of rc2.\n'
      '- Blocklist feeds never hold the big public DNS resolvers or the addresses in the new HUGINN_NEVER_BLOCK; '
@@ -828,6 +833,9 @@ def sane_row(r):
 PROXY_REPLIES = {"http200": "answered 200", "hold": "held, no answer"}
 
 
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def p_cowrie(line):
     if not line.startswith("{"):
         return None
@@ -846,7 +854,8 @@ def p_cowrie(line):
     elif k == "cowrie.command.input":
         kind, a = "cmd", ev.get("input")
     elif k in ("cowrie.session.file_upload", "cowrie.session.file_download"):
-        kind, a, b = "file", ev.get("url") or ev.get("filename") or ev.get("destfile"), ev.get("shasum")
+        sha = ev.get("shasum")
+        kind, a, b = "file", ev.get("url") or ev.get("filename") or ev.get("destfile"), sha if isinstance(sha, str) and HEX64.fullmatch(sha) else None
     elif k == "cowrie.session.file_download.failed":
         kind, a = "file_fail", ev.get("url")
     elif k == "cowrie.direct-tcpip.request":
@@ -875,7 +884,10 @@ def p_cowrie(line):
     elif k == "cowrie.client.version":
         kind, a = "version", ev.get("version")
     elif k == "cowrie.client.kex":
-        kind, a = "hassh", ev.get("hassh")
+        h = ev.get("hassh")
+        if not (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{32}", h)):        # HASSH is an MD5: 32 hex characters
+            return None
+        kind, a = "hassh", h
     elif k == "cowrie.client.size":
         # The terminal size the client asked for (SSH pty request). Bots that ask often use one fixed size.
         w, h = ev.get("width"), ev.get("height")
@@ -883,7 +895,7 @@ def p_cowrie(line):
             return None
         kind, a = "termsize", "%dx%d" % (w, h)
     elif k == "cowrie.log.closed":
-        if not ev.get("shasum") or not ev.get("size"):
+        if not (isinstance(ev.get("shasum"), str) and HEX64.fullmatch(ev["shasum"])) or not ev.get("size"):
             return None
         kind, a, b = "tty", ev.get("shasum"), str(ev.get("size"))
     elif k == "cowrie.session.closed":
@@ -4862,7 +4874,7 @@ def v_overview(qs=None):
         first = con.execute("SELECT a FROM events WHERE session=? AND kind='cmd' ORDER BY ts LIMIT 1", (s["session"],)).fetchone()
         srows += "<tr><td>%s</td><td>%s</td><td>%s</td><td class=num>%s</td><td class='mono trunc'>%s</td><td>%s</td></tr>" % (
             esc(ago(s["start"])), ip_link(s["ip"], "#s-" + s["session"]), cc_html(s["cc"]), s["cmds"], esc(clean(first[0] if first else "", 140)),
-            ('<a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(s["ip"])))) if s["tty"] else "")
+            ('<a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (seg(s["tty"]), esc(urllib.parse.quote(s["ip"])))) if s["tty"] else "")
     shells_html = ('<div class="card span2"><h3>Latest shell sessions</h3>%s</div>'
                    % (('<table><thead><tr><th>When</th><th>IP</th><th>CC</th><th class=num>Cmds</th><th>First command</th><th></th></tr></thead><tbody>%s</tbody></table>' % srows)
                       if srows else none_yet("No shell sessions yet")))
@@ -5472,6 +5484,11 @@ CMD_TOKEN = (r"(?:https?|ftp|tftp)://[^\s'\"<>;|&)`]+|\b\d{1,3}(?:\.\d{1,3}){3}(
 CMD_RE = re.compile(CMD_TOKEN, re.I)
 
 
+def seg(x):
+    # One path segment of a link inside Huginn, from data that came from the honeypot: URL-encoded, then HTML-escaped.
+    return esc(urllib.parse.quote(str(x or ""), safe=""))
+
+
 def session_files(events):
     # Name or URL -> hash for the files captured in one session. Very short names would match everywhere, and a name
     # that held different content during the session cannot be linked to either one.
@@ -5502,7 +5519,7 @@ def cmd_html(text, files=None):
         out.append(esc(s[pos:m.start()]))
         pos, tok = m.end(), m.group(0)
         if tok in files:
-            out.append('<a class="c-f" href="/campaign/file/%s" title="Captured file">%s</a>' % (esc(files[tok]), esc(tok)))
+            out.append('<a class="c-f" href="/campaign/file/%s" title="Captured file">%s</a>' % (seg(files[tok]), esc(tok)))
         elif "://" in tok:
             try:
                 host = urllib.parse.urlsplit(tok).hostname
@@ -5892,10 +5909,10 @@ def v_ip(ip, qs=None):
             elif k in ("login_ok", "login_fail"):
                 lines.append('<div class="ln %s"><span class=t>%s</span><span class="pr">login</span><code>%s / %s</code></div>' % ("ok" if k == "login_ok" else "fail", rel_t, esc(clean(x["a"], 100)), esc(clean(x["b"], 100))))
             elif k == "file":
-                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">file</span><code>%s · %s</code></div>' % (rel_t, cmd_html(clean(x["a"], 300), fmap), ('<a class="c-f" href="/campaign/file/%s">%s</a>' % (esc(x["b"]), esc(x["b"]))) if re.fullmatch(r"[0-9a-f]{64}", x["b"] or "") else esc(x["b"] or "")))
+                lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">file</span><code>%s · %s</code></div>' % (rel_t, cmd_html(clean(x["a"], 300), fmap), ('<a class="c-f" href="/campaign/file/%s">%s</a>' % (seg(x["b"]), esc(x["b"]))) if re.fullmatch(r"[0-9a-f]{64}", x["b"] or "") else esc(x["b"] or "")))
             elif k == "exec_sim":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">run</span><code>%s · <a class="c-f" href="/campaign/file/%s">%s</a> (simulated, nothing ran)</code></div>'
-                             % (rel_t, esc(clean(x["a"], 300)), esc(x["b"]), esc((x["b"] or "")[:16])))
+                             % (rel_t, esc(clean(x["a"], 300)), seg(x["b"]), esc((x["b"] or "")[:16])))
             elif k == "file_fail":
                 lines.append('<div class="ln warn"><span class=t>%s</span><span class="pr">fetch</span><code>%s (failed)</code></div>' % (rel_t, cmd_html(clean(x["a"], 300))))
             elif k == "goodbye":
@@ -5913,12 +5930,12 @@ def v_ip(ip, qs=None):
                                                   "%d cmds" % s["cmds"] if s["cmds"] else "", "%d files" % s["files"] if s["files"] else "",
                                                   "%d proxy" % s["tcpip"] if s["tcpip"] else ""] if x) or "connect only"),
                       esc(clean(s["version"] or "", 60)), human + (attack_chips(tech, 4) if tech else ""))
-                   + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] and s["cmds"] else ""))
+                   + ((' <a class="replay-btn" href="/replay/%s?ip=%s">▶ Replay</a>' % (seg(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] and s["cmds"] else ""))
         meta_ = '<div class="smeta">Session <span class=mono>%s</span>%s%s' % (
-            esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (esc(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
+            esc(s["session"]), (' · HASSH <a class=mono href="/campaign/hassh/%s">%s</a>' % (seg(s["hassh"]), esc(s["hassh"]))) if s["hassh"] else "",
             (' · script <a class=mono href="/campaign/script/%s">%s</a>' % (esc(s["cmdhash"]), esc(s["cmdhash"]))) if s["cmdhash"] else "") \
             + ((' · terminal <span class=mono>%s</span>' % esc(s["termsize"].replace("x", "×"))) if s["termsize"] else "") \
-            + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (esc(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] else "")
+            + ((' · <a class="replay" href="/replay/%s?ip=%s">▶ Replay</a>' % (seg(s["tty"]), esc(urllib.parse.quote(ip, safe=":")))) if s["tty"] else "")
         meta_ += "</div>"
         return ('<details class="sess" id="s-%s"><summary>%s%s</summary>%s<div class="term">%s</div></details>'
                 % (esc(s["session"]), summary, more, meta_, "".join(lines) or '<div class="ln muted">No interaction recorded.</div>'))
@@ -6653,7 +6670,7 @@ def v_search(qs):
     frows = []
     for last, sha, g, f, hit in found[:SEARCH_ROWS]:
         fam, how = file_family(f, ",".join(sorted(g["names"])))
-        link = "<a class=mono href=\"/campaign/file/%s\">%s…</a>" % (esc(sha), esc(sha[:16])) if not g.get("only_meta") else "<span class=mono>%s…</span>" % esc(sha[:16])
+        link = "<a class=mono href=\"/campaign/file/%s\">%s…</a>" % (seg(sha), esc(sha[:16])) if not g.get("only_meta") else "<span class=mono>%s…</span>" % esc(sha[:16])
         frows.append("<td>%s</td><td>%s</td><td class='mono wrap'>%s</td>%s%s" % (
             link, family_tag(fam, how) if fam else (esc(f["type"]) if f else "–"), snippet(hit if hit is not None else sha, q), n(len(g["ips"])), when(last)))
     files_ = section("Files", len(found), "<th>SHA-256</th><th>Type</th><th>Match</th><th class=num>IPs</th><th>Last</th>", frows)
@@ -6795,7 +6812,7 @@ def v_files(qs=None):
         kind = (family_tag(fam, how) if fam else "") + ('<div class="ft">%s</div>' % (esc(f["type"]) + (" · " + esc(f["arch"]) if f["arch"] else "") + (' <span class="tag t-orange">UPX</span>' if f["packed"] else "")
                 + ('' if f["src"] != "redir" else ' <span class="tag">echo-built</span>')) if f else '<span class=muted>–</span>')
         trs += ("<tr><td class=mono>%s</td><td>%s</td><td class='num nw'>%s</td><td class='mono trunc'>%s</td><td class='mono small iocs'>%s</td><td class=nw>%s</td><td class=num>%s</td><td class=nw>%s</td><td class=nw>%s · %s</td></tr>"
-                % (("<a href='/campaign/file/%s'>%s…</a>" % (esc(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
+                % (("<a href='/campaign/file/%s'>%s…</a>" % (seg(sha), esc(sha[:16]))) if e else esc(sha[:16]) + "…", kind,
                    esc("%.1f KB" % (f["size"] / 1024.0)) if f else "", esc(clean(e["names"], 200)) if e else "",
                    ioc_cell(iocs),
                    esc(ago(e["l"] if e else f["mtime"])), num(e["nip"]) if e else "", vt_html(vts.get(sha)) + (
@@ -7028,7 +7045,7 @@ def v_campaigns(qs=None):
     hs = con.execute("SELECT hassh, COUNT(*) n, COUNT(DISTINCT ip) nip, MAX(version) v, MAX(start) l FROM sessions WHERE hassh IS NOT NULL "
                      "GROUP BY hassh ORDER BY nip DESC LIMIT 40").fetchall()
     hrows = "".join("<tr><td class=mono><a href='/campaign/hassh/%s'>%s</a></td><td class='mono trunc'>%s</td><td class=num>%s</td><td class=num>%s</td><td>%s</td></tr>"
-                    % (esc(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
+                    % (seg(h["hassh"]), esc(h["hassh"]), esc(clean(h["v"] or "", 60)), num(h["nip"]), num(h["n"]), esc(ago(h["l"]))) for h in hs)
     # Web attacks by rule: how many addresses tried the same thing.
     wa = con.execute("SELECT type, MAX(cve) cve, MAX(sev) sev, MAX(level='exploit') x, COUNT(DISTINCT ip) nip, COUNT(*) n, MAX(ts) l FROM webhits "
                      "WHERE level IN ('exploit','probe') GROUP BY type ORDER BY x DESC, nip DESC, n DESC LIMIT 60").fetchall()

