@@ -215,6 +215,10 @@ class CodexRc3Small(unittest.TestCase):
                 code2, body2 = get("HUGINN.example")
                 self.assertEqual(code, code2)
                 self.assertIn("version", body2)
+                # update-huginn.sh asks 127.0.0.1:PORT: it must get the version, or every update rolls back (rc4 deploy 2026-11-23)
+                for h in ("127.0.0.1:8095", "localhost:8095", "127.0.0.1", "[::1]:8095"):
+                    self.assertIn("version", get(h)[1], h)
+                self.assertEqual(set(get("127.0.0.1.rebind.example:8095")[1]), {"ok"})
         finally:
             srv.shutdown()
             srv.server_close()

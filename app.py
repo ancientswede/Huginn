@@ -13,7 +13,7 @@ CHANGELOG = [
      'other text no longer turns into file, HASSH or replay links\n'
      '- Every link built from honeypot data is URL-encoded\n'
      '- Honeypot protection is no longer "all in place" when the report holds no sandbox or limits checks; it alerts instead\n'
-     '- /healthz on an unknown host name only says up or down, without version or problems\n'
+     '- /healthz on an unknown host name only says up or down, without version or problems (127.0.0.1 and localhost still get it all)\n'
      '- Forms work when the browser writes the host name in other letter case'),
     ('1.0.0-rc3', '2026-11-22',
      'Fixes from a security review of rc2.\n'
@@ -424,6 +424,9 @@ DEMO = os.environ.get("HUGINN_DEMO", "0") == "1"
 def is_public(a):
     return a.is_global or (DEMO and any(a in n for n in DEMO_NETS))
 ALLOWED_HOSTS = {x.strip().lower() for x in os.environ.get("HUGINN_ALLOWED_HOSTS", "").split(",") if x.strip()}  # empty = any Host
+LOOPBACK_HOSTS = {h + p for h in ("127.0.0.1", "localhost", "[::1]") for p in ("", ":%d" % PORT)}
+
+
 def _canon_ip(x):
     # "2001:0db8:0000::0001" and "2001:db8::1" are the same address; compare the short form the feeds use.
     try:
@@ -8819,7 +8822,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 problems = []
             ok = (time.time() - li) < POLL * 3 and not problems     # 503 whenever something is wrong, as the stability promise says
-            if not self.host_ok():          # a page on another name (DNS rebinding) learns only up or down, like any health check
+            # A page on another name (DNS rebinding) learns only up or down, like any health check. Loopback names always get
+            # everything: update-huginn.sh and curl on the machine ask 127.0.0.1, and a browser never sends that for a rebound name.
+            if not self.host_ok() and (self.headers.get("Host") or "").lower() not in LOOPBACK_HOSTS:
                 return self.send(200 if ok else 503, json.dumps({"ok": ok}), "application/json")
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
                                                              "collection_problems": problems}), "application/json")
