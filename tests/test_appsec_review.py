@@ -157,3 +157,64 @@ class FuzzLinks(unittest.TestCase):
     def test_seg_encodes(self):
         self.assertEqual(app.seg("a b/<c>&"), "a%20b%2F%3Cc%3E%26")
         self.assertEqual(app.seg(None), "")
+
+
+class CodexRc3Small(unittest.TestCase):
+    # Tre små rester från Codex rc3-granskningen, rättade i rc4.
+    def setUp(self):
+        self.con = app.connect()
+
+    def tearDown(self):
+        self.con.execute("DELETE FROM meta WHERE k='hp_status'")
+        self.con.commit()
+
+    def status(self, items, at=None):
+        app.set_meta(self.con, "hp_status", json.dumps({"at": at or time.time(), "items": items}))
+        self.con.commit()
+
+    def test_no_checks_is_not_all_in_place(self):
+        self.status({})
+        self.assertEqual(app.protection_missing(self.con), ["nocheck:sandbox", "nocheck:limits"])
+        note = app.protection_note(self.con)
+        self.assertNotIn("all in place", note)
+        self.assertIn("no sandbox checks reported", note)
+        self.status({"option:suricata": True, "running:suricata": True})
+        self.assertIn("nocheck:sandbox", app.protection_missing(self.con))
+        self.status({"sandbox:cowrie": True, "limits:cowrie": True})
+        self.assertEqual(app.protection_missing(self.con), [])
+        self.assertIn("all in place", app.protection_note(self.con))
+
+    def test_old_empty_report_stays_quiet(self):
+        self.status({}, time.time() - 7200)                 # the sync check covers an old report
+        self.assertEqual(app.protection_missing(self.con), [])
+
+    def test_same_origin_ignores_host_case(self):
+        class H:
+            client_address = ("127.0.0.1", 1)
+        h = H()
+        h.headers = {"Origin": "http://Huginn.Example:8095", "Host": "huginn.example:8095"}
+        self.assertTrue(app.Handler.same_origin(h))
+        h.headers = {"Origin": "http://evil.example:8095", "Host": "huginn.example:8095"}
+        self.assertFalse(app.Handler.same_origin(h))
+
+    def test_healthz_unknown_host_says_only_ok(self):
+        import http.client, threading
+        srv = app.HuginnServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(host):
+                c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+                c.request("GET", "/healthz", headers={"Host": host})
+                r = c.getresponse()
+                out = (r.status, json.loads(r.read()))
+                c.close()
+                return out
+            with mock.patch.object(app, "ALLOWED_HOSTS", {"huginn.example"}):
+                code, body = get("rebind.example")
+                self.assertEqual(set(body), {"ok"})
+                code2, body2 = get("HUGINN.example")
+                self.assertEqual(code, code2)
+                self.assertIn("version", body2)
+        finally:
+            srv.shutdown()
+            srv.server_close()

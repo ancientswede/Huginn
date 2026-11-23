@@ -7,11 +7,14 @@
 
 HUGINN_VERSION = "1.0.0-rc4"
 CHANGELOG = [
-    ('1.0.0-rc4', '2026-11-22',
-     'Fixes found by fuzzing the honeypot data path.\n'
+    ('1.0.0-rc4', '2026-11-23',
+     'Fixes found by fuzzing the honeypot data path, and three small ones left from the rc3 review.\n'
      '- Only real hashes are read from Cowrie: a HASSH must be 32 hex characters, a file or session recording hash 64; '
      'other text no longer turns into file, HASSH or replay links\n'
-     '- Every link built from honeypot data is URL-encoded'),
+     '- Every link built from honeypot data is URL-encoded\n'
+     '- Honeypot protection is no longer "all in place" when the report holds no sandbox or limits checks; it alerts instead\n'
+     '- /healthz on an unknown host name only says up or down, without version or problems\n'
+     '- Forms work when the browser writes the host name in other letter case'),
     ('1.0.0-rc3', '2026-11-22',
      'Fixes from a security review of rc2.\n'
      '- Blocklist feeds never hold the big public DNS resolvers or the addresses in the new HUGINN_NEVER_BLOCK; '
@@ -3814,14 +3817,16 @@ def cl_html(text):
 
 def protection_missing(con):
     items, at = protection_status(con)
-    if not items or time.time() - at > 3600:          # nothing reported recently: the sync check covers that
+    if items is None or time.time() - at > 3600:      # nothing reported recently: the sync check covers that
         return []
-    return sorted(k for k, ok in items.items() if not ok and not k.startswith("option:"))
+    miss = sorted(k for k, ok in items.items() if not ok and not k.startswith("option:"))
+    # A fresh report without a single sandbox or limits check proves nothing: say so instead of "all in place" (Codex rc3).
+    return miss + ["nocheck:%s" % w for w in ("sandbox", "limits") if not any(k.startswith(w + ":") for k in items)]
 
 
 def protection_label(key):
     what, _, name = key.partition(":")
-    return {"sandbox": "%s sandbox", "limits": "%s memory/file limits", "running": "%s not running", "patch": "%s patch"}.get(what, "%s") % name
+    return {"sandbox": "%s sandbox", "limits": "%s memory/file limits", "running": "%s not running", "patch": "%s patch", "nocheck": "no %s checks reported"}.get(what, "%s") % name
 
 
 def protection_note(con):
@@ -8732,7 +8737,7 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             o = ref
         u = urllib.parse.urlsplit(o)
-        if u.netloc != (self.headers.get("Host") or "") or u.scheme not in ("http", "https"):
+        if u.netloc.lower() != (self.headers.get("Host") or "").lower() or u.scheme not in ("http", "https"):
             return False
         # The scheme counts too when Huginn knows it: https through a trusted proxy that says so, plain http otherwise.
         proto = self.headers.get("X-Forwarded-Proto") if self.client_address[0] in TRUSTED_PROXIES else None
@@ -8814,6 +8819,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 problems = []
             ok = (time.time() - li) < POLL * 3 and not problems     # 503 whenever something is wrong, as the stability promise says
+            if not self.host_ok():          # a page on another name (DNS rebinding) learns only up or down, like any health check
+                return self.send(200 if ok else 503, json.dumps({"ok": ok}), "application/json")
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
                                                              "collection_problems": problems}), "application/json")
         if not self.host_ok():

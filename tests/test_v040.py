@@ -126,8 +126,8 @@ class Huginn(unittest.TestCase):
         self.assertEqual(app.board_text("goodbye", "252 s, 3 lines typed", None), "logged out and got the goodbye note (252 s, 3 lines typed)")
 
     def test_status_option_never_alerts(self):
-        items = app.parse_status(["patch:goodbye ok", "option:goodbye missing", "sandbox:cowrie ok"])
-        self.assertEqual(items, {"patch:goodbye": True, "option:goodbye": False, "sandbox:cowrie": True})
+        items = app.parse_status(["patch:goodbye ok", "option:goodbye missing", "sandbox:cowrie ok", "limits:cowrie ok"])
+        self.assertEqual(items, {"patch:goodbye": True, "option:goodbye": False, "sandbox:cowrie": True, "limits:cowrie": True})
         with self.con:
             app.set_meta(self.con, "hp_status", json.dumps({"at": time.time(), "items": items}))
         self.assertEqual(app.protection_missing(self.con), [])
