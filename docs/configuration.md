@@ -34,7 +34,7 @@ All settings are environment variables in `/opt/huginn/.env`. See [`.env.example
 | `HUGINN_LOG_FORMAT` | `text` | `json` for one JSON object per log line, for log tools such as Grafana Loki, Graylog or Elasticsearch |
 | `HUGINN_LOG_LEVEL` | `warning` / `info` | `debug`, `info`, `warning` or `error`; the default is `info` with JSON logs |
 | `HUGINN_C2_EXCLUDE` | (empty) | Addresses that never go on the C2 list, separated by commas (your DNS, VPN, ...) |
-| `HUGINN_ALLOWED_HOSTS` | (empty; `install-huginn.sh` fills in this machine's names and addresses) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding. Behind a reverse proxy, add the name you open Huginn by |
+| `HUGINN_ALLOWED_HOSTS` | (empty; `install-huginn.sh` fills in this machine's names and addresses) | Host names the web page answers to, separated by commas, with the port if it is not 80/443 (`huginn.lan:8095`). Empty = any. Stops DNS rebinding. Behind a reverse proxy, add the name you open RavenTrap by |
 | `HUGINN_NEVER_BLOCK` | (empty) | Addresses or networks (CIDR) that never go on the blocklist feeds or the C2 list, separated by commas: your WAN address, VPS, VPN server. The big public DNS resolvers are always left out. Only Always block on an IP page overrides it |
 | `HUGINN_BL_MAX` | 50000 | Most addresses in a blocklist feed (highest scores kept) and on the C2 list (most attackers kept) |
 | `HUGINN_BAIT_FILE` | `/opt/huginn/bait.json` | Extra bait values to watch for (the honeypot's own are announced) |

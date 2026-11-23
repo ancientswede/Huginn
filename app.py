@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-# Huginn — attacker intelligence for a homelab honeypot.
+# RavenTrap (called Huginn before 1.0) — attacker intelligence for a homelab honeypot.
+# Only the name people see changed: settings (HUGINN_*), paths, the service and the user still say huginn.
 # Pulls logs (Cowrie, OpenCanary, endlessh, hp-traps) over SSH with a key that is locked to
 # hp-export on the honeypot (read-only, pull-only: the honeypot never connects to Huginn),
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "1.0.0-rc4"
+HUGINN_VERSION = "1.0.0-rc5"
 CHANGELOG = [
+    ('1.0.0-rc5', '2026-11-23',
+     'Huginn is now RavenTrap. There is already a well-known project called Huginn, so the name changes before 1.0.\n'
+     '- Only the name you see changes: pages, notifications, README and docs\n'
+     '- Nothing to do when you update: settings keep their HUGINN_ names, and paths, the service, the user, '
+     'feeds and metrics stay the same\n'
+     '- A page title still set to the old default "Huginn" now shows RavenTrap\n'
+     '- The update check also looks for the repository under its new name, so it keeps working when the repository is renamed\n'
+     '- The menu fits on a 1400 px wide screen again'),
     ('1.0.0-rc4', '2026-11-23',
      'Fixes found by fuzzing the honeypot data path, and three small ones left from the rc3 review.\n'
      '- Only real hashes are read from Cowrie: a HASSH must be 32 hex characters, a file or session recording hash 64; '
@@ -471,6 +480,8 @@ MAX_TTY = 64 * 1024 * 1024
 # Update check: once a day, read the public list of version tags on GitHub (sends nothing about you). 0 = off.
 UPDATE_CHECK = os.environ.get("HUGINN_UPDATE_CHECK", "1") == "1"
 REPO = os.environ.get("HUGINN_REPO", "ancientswede/Huginn")
+# The update check follows no redirects, so a renamed repository would go quiet: ask the new name first, then the old.
+UPDATE_REPOS = [REPO] if os.environ.get("HUGINN_REPO") else ["ancientswede/RavenTrap", "ancientswede/Huginn"]
 NTFY_URL = os.environ.get("HUGINN_NTFY_URL", "")          # e.g. http://ntfy.lan:2586/huginn — empty = no notifications
 NTFY_TOKEN = os.environ.get("HUGINN_NTFY_TOKEN", "")      # access token (tk_...) for ntfy servers with access control
 # Optional: look captured files up on MalwareBazaar (abuse.ch) by SHA-256. Sends only the hash. Free key: auth.abuse.ch
@@ -2850,7 +2861,7 @@ def hp_toggle(word, on, since):
         state = line.split()[1] == "on"
         return (state, None) if state == bool(on) else (None, "the honeypot reports it is still %s" % ("on" if state else "off"))
     if line.startswith("##") or len(first) >= 64:
-        return None, "the honeypot does not know this yet: run update-honeypot.sh there once (Huginn %s or later)" % since
+        return None, "the honeypot does not know this yet: run update-honeypot.sh there once (RavenTrap %s or later)" % since
     return None, (err.decode("utf-8", "replace").strip()[:150] or "no answer from the honeypot")
 
 
@@ -3779,10 +3790,10 @@ def health_check(con, now=None):
         # Only a problem whose alert went out is marked as alerted, so a failed send is tried again next time.
         try:
             if new:
-                ntfy_post("\n".join(issues[k] for k in new), "Huginn: collection problem", 4)
+                ntfy_post("\n".join(issues[k] for k in new), "RavenTrap: collection problem", 4)
             sent.update((k, now) for k in new)
             if back:
-                ntfy_post("Back to normal: " + ", ".join(health_label(k) for k in back), "Huginn: collection is back", 2)
+                ntfy_post("Back to normal: " + ", ".join(health_label(k) for k in back), "RavenTrap: collection is back", 2)
         except Exception as e:
             log("warning", "ntfy_failed", "Could not send the collection alert: %s" % str(e)[:200])
             sent.update((k, alerted[k]) for k in back if k in alerted)   # say "back" again next time
@@ -3963,15 +3974,23 @@ def vtuple(v):
 
 
 def check_update(con):
-    if not UPDATE_CHECK or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO):
+    repos = [r for r in UPDATE_REPOS if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r)]
+    if not UPDATE_CHECK or not repos:
         return
     if time.time() - float(get_meta(con, "update_checked", "0") or 0) < 86400:
         return
     set_meta(con, "update_checked", time.time())
     try:
-        req = urllib.request.Request("https://api.github.com/repos/%s/tags?per_page=50" % REPO,
-                                     headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
-        tags = json.loads(api_urlopen(req, timeout=15).read(500000))
+        tags = None
+        for i, repo in enumerate(repos):
+            req = urllib.request.Request("https://api.github.com/repos/%s/tags?per_page=50" % repo,
+                                         headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+            try:
+                tags = json.loads(api_urlopen(req, timeout=15).read(500000))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code not in (301, 404) or i == len(repos) - 1:   # not there (yet), or moved: try the next name
+                    raise
         versions = [t.get("name", "") for t in tags if re.fullmatch(r"v?\d+\.\d+\.\d+", t.get("name", ""))]
         latest = max(versions, key=vtuple) if versions else ""
         set_meta(con, "update_latest", latest.lstrip("v"))
@@ -4089,7 +4108,7 @@ def notify(con):
     # The period counts as told only when ntfy took the message. A failure keeps it, and the next try comes after 10 minutes
     # with the same period (plus whatever happened since), so a short ntfy outage loses nothing (Codex 049 M18).
     try:
-        ntfy_post("\n".join(lines), "Huginn: honeypot activity", prio)
+        ntfy_post("\n".join(lines), "RavenTrap: honeypot activity", prio)
     except Exception as e:
         set_meta(con, "ntfy_retry_at", now + 600)
         set_meta(con, "ntfy_error", "%s %s" % (fmt_ts(now), str(e)[:120]))
@@ -4226,9 +4245,9 @@ def check_is_huginn(path):
         for table, cols in sorted(need.items()):
             have = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
             if not have:
-                return "not a Huginn database (no table %s)" % table
+                return "not a RavenTrap database (no table %s)" % table
             if not cols <= have:
-                return "not a Huginn database (table %s lacks %s)" % (table, ", ".join(sorted(cols - have)))
+                return "not a RavenTrap database (table %s lacks %s)" % (table, ", ".join(sorted(cols - have)))
         return "ok"
     finally:
         con.close()
@@ -4311,7 +4330,7 @@ def backup_once(con):
         log("error", "backup_failed", msg)
         try:
             if NTFY_URL and settings(con)["notify"]:
-                ntfy_post("Database backup failed: %s" % str(e)[:200], "Huginn: backup failed", 4)
+                ntfy_post("Database backup failed: %s" % str(e)[:200], "RavenTrap: backup failed", 4)
         except Exception as e2:
             log("warning", "ntfy_failed", repr(e2))
         return False
@@ -4698,7 +4717,7 @@ def kv(rows):
     return '<dl class="kv">' + "".join("<dt>%s</dt><dd>%s</dd>" % (esc(k), v) for k, v in rows) + "</dl>"
 
 
-SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "Huginn",
+SETTINGS_DEFAULT = {"theme": "auto", "accent": "blue", "density": "comfortable", "title": "RavenTrap",
                     "cards": ["hero", "chart", "countries", "week", "heatmap", "top", "shells", "creds", "timewasted"], "ips_days": "30",
                     "bl_min": 3, "bl_days": 30, "notify": True, "notify_events": ["bait", "files", "human", "exploit", "returned", "weekly"], "v": 4,
                     "clock": "24", "ips_cols": ["cc", "network", "first", "last", "sessions", "logins", "cmds", "files", "tags", "score"],
@@ -4709,7 +4728,7 @@ IPS_COLS = [("cc", "CC", None, ""), ("network", "Network", None, ""), ("asn", "A
             ("first", "First seen", "first", ""), ("last", "Last seen", "last", ""), ("sessions", "Sess.", "sessions", "num"),
             ("logins", "Logins", "logins", "num"), ("cmds", "Cmds", "cmds", "num"), ("files", "Files", None, "num"),
             ("tarpit", "Tarpit", None, "num"), ("tags", "Tags", None, ""), ("score", "Score", "score", "num")]
-CARDS = [("hero", "Banner (Huginn, what it has seen so far)"), ("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
+CARDS = [("hero", "Banner (RavenTrap, what it has seen so far)"), ("chart", "Unique attackers per day"), ("countries", "Countries"), ("week", "New this week"), ("heatmap", "When they attack"), ("top", "Top attackers"),
          ("shells", "Latest shell sessions"), ("creds", "Top credentials (SSH/Telnet)"), ("timewasted", "Time wasted")]
 # accent: (light accent, light tint, dark accent, dark tint)
 ACCENTS = {"blue": ("#3b6fd8", "#e9effb", "#7aa2f7", "#1d2a44"), "purple": ("#7d4fc7", "#f1ebfb", "#b394f0", "#2a2140"),
@@ -4729,6 +4748,8 @@ def settings(con=None):
         saved = {}
     out = dict(SETTINGS_DEFAULT)
     out.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULT})
+    if out.get("title") == "Huginn":                 # the old default name (rc5 rename), never a choice anyone made on purpose
+        out["title"] = "RavenTrap"
     if saved and saved.get("v", 1) < 2:
         # Settings saved before 0.14: show the new cards and the weekly summary once; the next save keeps the choice.
         out["cards"] = list(out["cards"]) + [c for c in ("week", "heatmap") if c not in out["cards"]]
@@ -4756,7 +4777,7 @@ def hidden_sql(st, alias="e"):
 def footer():
     # AGPL section 5 and 13: show copyright, license, no warranty and where the source is.
     # Modified versions may add their own notice here, but must keep this one.
-    return ("<footer class='site-foot'>Huginn %s · © 2026 Ancientswede · "
+    return ("<footer class='site-foot'>RavenTrap %s · © 2026 Ancientswede · "
             "<a href='https://www.gnu.org/licenses/agpl-3.0.html' target='_blank' rel='noopener noreferrer'>AGPL-3.0</a>, no warranty · "
             "<a href='https://github.com/%s' target='_blank' rel='noopener noreferrer'>Source on GitHub</a> · "
             "<a href='%s' target='_blank' rel='noopener noreferrer'>Buy me a coffee</a></footer>" % (HUGINN_VERSION, esc(REPO), COFFEE_URL))
@@ -5245,7 +5266,7 @@ def weekly_digest(con):
         lines.append("Top attacker: %s (%s, score %d)" % (w["top"][0]["ip"], w["top"][0]["cc"] or "?", w["top"][0]["score"]))
     if w["password"]:
         lines.append("Most tried password: %s (%s×)" % (clean(w["password"]["b"], 40), num(w["password"]["n"])))
-    ntfy_post("\n".join(lines), "Huginn: week %d" % now.isocalendar()[1], 3)
+    ntfy_post("\n".join(lines), "RavenTrap: week %d" % now.isocalendar()[1], 3)
     set_meta(con, "weekly_sent", key)
     set_meta(con, "last_notify", "%s: weekly summary %s" % (fmt_ts(end), key))
 
@@ -5294,7 +5315,7 @@ def hero_card(con, st):
             '<img class="hero-light" src="/static/hero-light.jpg" alt="" width="2000" height="500">'
             '<div class="hero-txt"><div class="hero-name">%s</div><div class="hero-tag">Attacker intelligence for a homelab honeypot</div>'
             '<div class="hero-facts">%s%s</div></div></div>'
-            % (esc(st["title"] or "Huginn"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
+            % (esc(st["title"] or "RavenTrap"), esc(" · ".join(facts)), (" · last sync " + esc(ago(li))) if li else ""))
 
 
 def week_card(con, w=None):
@@ -6557,7 +6578,7 @@ def v_help():
         row("DroneBL", "Whether DroneBL (a free DNS list, no key) has the IPv4 address as a drone, botnet member, open proxy, brute "
             "forcer or compromised router, and which. Tagged dronebl; it does not change the score. Each address again after a week. "
             "Campaigns, DroneBL counts the attackers per class."),
-        row("Tor", "Once a day Huginn downloads the Tor Project's list of exit addresses. An attacker listed there within 30 days of its "
+        row("Tor", "Once a day RavenTrap downloads the Tor Project's list of exit addresses. An attacker listed there within 30 days of its "
             "attack is tagged tor: someone using Tor, not the owner of the address. It never counts as coming back and stays off the "
             "blocklist unless chosen on Settings, Lookups (or tor=1 on a feed). On by default; nothing is sent."),
         row("Keys", "VirusTotal, MalwareBazaar and Project Honey Pot keys are pasted on Settings, Lookups. GreyNoise needs no key. Each keeps to a daily allowance."),
@@ -6580,7 +6601,7 @@ def v_help():
     overview = [
         row("Time wasted", "Attacker time spent stuck in the tarpit plus time in fake shells. <i>stuck now</i>: tarpit connections still open."),
         row("Orange line under a bar", "No sync from the honeypot during that time: missing data, not a quiet period. Hover the bar for how long."),
-        row("synced … ago", "When Huginn last pulled the honeypot's logs. Red: the last sync failed or is late. Hover it, or see Account, for the reason."),
+        row("synced … ago", "When RavenTrap last pulled the honeypot's logs. Red: the last sync failed or is late. Hover it, or see Account, for the reason."),
         row("New", "Things seen for the first time: passwords, commands, files, SSH clients, web attacks. Mark them reviewed when read."),
         row("Engagement", "Day by day, how far attackers get after the login, and before against after a release."),
     ]
@@ -6590,7 +6611,7 @@ def v_help():
         row("Always on", "Anyone you flagged <i>block</i>."),
         row("Feeds", "The Blocklist page gives links in several formats (plain text, nftables, ipset, MikroTik, CSV) and a C2 list from captured malware."),
     ]
-    body = ('<h1>Help</h1><p class=muted>What the tags, badges and numbers in Huginn mean. Hover any tag for its meaning too; press <kbd>?</kbd> for keyboard shortcuts.</p>'
+    body = ('<h1>Help</h1><p class=muted>What the tags, badges and numbers in RavenTrap mean. Hover any tag for its meaning too; press <kbd>?</kbd> for keyboard shortcuts.</p>'
             '<h2>Attacker tags</h2><div class="card">%s</div>'
             '<h2>Score</h2><div class="card"><p>Every attacker gets points for what it did. The score sorts the Attackers list and decides the blocklist.</p><p class=mono>%s</p></div>'
             '<h2>Sessions</h2><div class="card">%s</div><h2>Files</h2><div class="card">%s</div>'
@@ -6744,10 +6765,10 @@ def share_candidates(con, shas, fi, vts):
 def share_card(con, shas, fi, vts, fam=""):
     cand = share_candidates(con, shas, fi, vts)
     n_shared = con.execute("SELECT COUNT(*) FROM shared").fetchone()[0]
-    what = "VirusTotal has never seen" if vt_key() else "the honeypot captured (no VirusTotal key, so Huginn cannot tell which are new)"
+    what = "VirusTotal has never seen" if vt_key() else "the honeypot captured (no VirusTotal key, so RavenTrap cannot tell which are new)"
     intro = ('<p class="muted small">Signature projects such as %s turn new malware into virus signatures (ClamAV and others). '
              'The files stay on the honeypot: run the command there as root, it writes a zip with the password <b>infected</b> '
-             'to /root/hp-samples/. Send that zip as their contact page asks. Nothing is uploaded by Huginn.</p>' % ext(SHARE_URL, "Sanesecurity"))
+             'to /root/hp-samples/. Send that zip as their contact page asks. Nothing is uploaded by RavenTrap.</p>' % ext(SHARE_URL, "Sanesecurity"))
     if not cand:
         body = none_yet("Nothing new to share" + (" (%s shared so far)" % num(n_shared) if n_shared else ""))
     else:
@@ -6869,11 +6890,11 @@ def v_creds(qs):
              '<form class="pwcheck" id="pwcheck" data-src="/api/creds-check/" data-prefix="%d"><input type="password" id="pwc-in" autocomplete="off" '
              'placeholder="Type a password to check" aria-label="Password to check"> <button type=submit>Check</button></form>'
              '<div id="pwc-out" class="pwc-out" aria-live="polite"></div>'
-             '<p class="muted small">Checked in your browser. Only the first %d characters of its SHA-256 hash are sent to Huginn, '
+             '<p class="muted small">Checked in your browser. Only the first %d characters of its SHA-256 hash are sent to RavenTrap, '
              'never the password itself. Exact match, case-sensitive.</p></div>'
              '<div class="card"><h3>Search and export</h3><form method=get action="/creds" class="pwcheck"><input name=q value="%s" '
              'placeholder="Search usernames and passwords" aria-label="Search"><input type=hidden name=days value="%s"> <button type=submit>Search</button></form>'
-             '<p class="muted small">For words like your name, domain or company. Do not type real passwords here: the search is sent to Huginn. '
+             '<p class="muted small">For words like your name, domain or company. Do not type real passwords here: the search is sent to RavenTrap. '
              'Use the check on the left instead.</p><p class=small>Export (%s): %s</p></div></div>'
              % (CRED_PREFIX, CRED_PREFIX, esc(q), esc(days), {"1": "24h", "7": "7 days", "30": "30 days", "all": "all"}[days], exp))
     def card(title, tid, heads, rows):
@@ -7743,7 +7764,7 @@ def v_replay(sha, ip):
     return page("Replay", body, "/ips")
 
 
-SETTINGS_SECTIONS = [("appearance", "Appearance", "Make Huginn feel familiar."),
+SETTINGS_SECTIONS = [("appearance", "Appearance", "Make RavenTrap feel familiar."),
                      ("views", "Views & defaults", "Choose what appears and which ranges to use."),
                      ("notifications", "Notifications", "Pick the events you want to hear about."),
                      ("honeypot", "Honeypot", "Control the message shown at logout."),
@@ -7896,10 +7917,10 @@ def v_settings(ok="", err="", at=""):
     lookups = section("lookups", lookups_card(flash, at, err))
     metrics = section("metrics", flash("metrics") + metrics_card())
     about = section("about", (
-        '<div class="sp-panel"><div class="sp-ph"><h3>Huginn %s</h3></div>'
+        '<div class="sp-panel"><div class="sp-ph"><h3>RavenTrap %s</h3></div>'
         '<p>Free and open source (AGPL-3.0). Source, issues and releases are on '
         '<a href="https://github.com/%s" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>'
-        '<p>If Huginn is useful to you, you can <a href="%s" target="_blank" rel="noopener noreferrer">buy me a coffee</a>.</p></div>'
+        '<p>If RavenTrap is useful to you, you can <a href="%s" target="_blank" rel="noopener noreferrer">buy me a coffee</a>.</p></div>'
         % (esc(HUGINN_VERSION), esc(REPO), COFFEE_URL)))
 
     nav = "".join('<a href="#%s"><span>%02d</span>%s</a>' % (k, i, esc(t)) for i, (k, t, _d) in enumerate(SETTINGS_SECTIONS, 1))
@@ -8173,7 +8194,7 @@ def save_settings(f, lists):
             if f.get("density") in ("comfortable", "compact"):
                 st["density"] = f["density"]
             title = re.sub(r"[\x00-\x1f]", "", (f.get("title") or "").strip())[:40]
-            st["title"] = title or "Huginn"
+            st["title"] = title or "RavenTrap"
             if f.get("clock") in ("24", "12"):
                 st["clock"] = f["clock"]
         if every or scope == "views":
@@ -8262,9 +8283,9 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .mono,code{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;font-size:12.5px}
 .brand a{display:flex;align-items:center;gap:9px}.brand-ic{width:24px;height:24px;border-radius:6px;display:block}.login-ic{width:72px;height:72px;border-radius:16px;align-self:center;margin-bottom:4px}
 .muted{color:var(--muted)}.small{font-size:12px}
-header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:24px;padding:0 24px;height:52px;background:var(--panel);border-bottom:1px solid var(--line)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:16px;padding:0 24px;height:52px;background:var(--panel);border-bottom:1px solid var(--line)}
 .brand a{font-weight:650;letter-spacing:.3px;color:var(--text);font-size:16px}
-nav{display:flex;gap:4px;overflow-x:auto}nav a{padding:6px 10px;border-radius:6px;color:var(--muted);white-space:nowrap}
+nav{display:flex;gap:4px;overflow-x:auto}nav a{padding:6px 8px;border-radius:6px;color:var(--muted);white-space:nowrap}
 nav a:hover{background:var(--panel2);text-decoration:none;color:var(--text)}nav a.on{background:var(--accent2);color:var(--accent)}
 .hdr-right{margin-left:auto;display:flex;align-items:center;gap:14px;white-space:nowrap}.hdr-right form{margin:0}
 .sync{font-size:12px}.sync::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px;background:var(--green)}
@@ -8451,7 +8472,7 @@ var btn=ev.submitter||f.querySelector('button'),body=new URLSearchParams(new For
 if(btn)btn.disabled=true;box.setAttribute('aria-busy','true');
 function done(){box.removeAttribute('aria-busy');if(btn)btn.disabled=false}
 function lost(){done();var p=box.querySelector('.sp-lost');if(!p){p=document.createElement('p');p.className='sp-err sp-lost';p.setAttribute('role','alert');box.insertBefore(p,box.firstChild.nextSibling)}
-p.textContent='No answer from Huginn, so it is not known whether this was saved. Reload the page to see.';p.setAttribute('tabindex','-1');p.focus()}
+p.textContent='No answer from RavenTrap, so it is not known whether this was saved. Reload the page to see.';p.setAttribute('tabindex','-1');p.focus()}
 fetch(f.action,{method:'POST',body:body,credentials:'same-origin',redirect:'follow'}).then(function(r){
 if(r.status===401||new URL(r.url,location.href).origin!==location.origin){location.reload();return null}
 return r.text()}).then(function(t){if(t===null)return;
@@ -8829,7 +8850,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200 if ok else 503, json.dumps({"ok": ok, "version": HUGINN_VERSION, "last_ingest_age_s": int(time.time() - li) if li else None,
                                                              "collection_problems": problems}), "application/json")
         if not self.host_ok():
-            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart Huginn.", "text/plain")
+            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart RavenTrap.", "text/plain")
         if path == "/static/app.css":
             return self.send(200, CSS, "text/css; charset=utf-8", cache=True)
         if path == "/static/world-map.json":
@@ -8972,7 +8993,7 @@ class Handler(BaseHTTPRequestHandler):
         _local.base = base_url(self)
         path = urllib.parse.urlsplit(self.path).path
         if not self.host_ok():
-            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart Huginn.", "text/plain")
+            return self.send(421, "Unknown host. Add this name to HUGINN_ALLOWED_HOSTS and restart RavenTrap.", "text/plain")
         if not self.same_origin():
             return self.send(403, "Forbidden", "text/plain")
         con = db()
@@ -9230,7 +9251,7 @@ class Handler(BaseHTTPRequestHandler):
             if not NTFY_URL:
                 return self.send(400, v_settings(at="notifications", err="HUGINN_NTFY_URL is not set."))
             try:
-                ntfy_post("Test from Huginn. Notifications work.", "Huginn: test")
+                ntfy_post("Test from RavenTrap. Notifications work.", "RavenTrap: test")
             except Exception as e:
                 return self.send(502, v_settings(at="notifications", err="Sending failed: %s" % str(e)[:150]))
             return self.redirect(settings_url("test"))
@@ -9379,7 +9400,7 @@ def need_service_env():
 def need_service_user():
     # A file made by root would be unreadable for the service.
     if os.getuid() == 0:
-        sys.exit("Run this as Huginn's own user: runuser -u huginn -- python3 %s ..." % os.path.abspath(__file__))
+        sys.exit("Run this as RavenTrap's own user: runuser -u huginn -- python3 %s ..." % os.path.abspath(__file__))
 
 
 def list_backups():
@@ -9413,7 +9434,7 @@ def restore_db(name):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        sys.exit("Huginn is running. Stop it first: systemctl stop huginn")
+        sys.exit("RavenTrap is running. Stop it first: systemctl stop huginn")
     path = name if os.sep in name else os.path.join(BACKUP_DIR, name)
     if not os.path.isfile(path):
         sys.exit("No such backup: %s (see: app.py backups)" % name)
@@ -9436,7 +9457,7 @@ def restore_db(name):
     remove_quietly(tmp + "-wal", tmp + "-shm")
     if result != "ok":
         remove_quietly(tmp)
-        sys.exit("That backup is damaged or not Huginn's, nothing was changed: %s" % str(result)[:200])
+        sys.exit("That backup is damaged or not RavenTrap's, nothing was changed: %s" % str(result)[:200])
     kept = DB_PATH + ".before-restore-" + stamp
     # Fold the write-ahead log into the old database first: then there is nothing left to lose when the files change. A real
     # copy goes aside (a hard link would let a later start change it). Only after that is the database swapped, in one step.
@@ -9453,7 +9474,7 @@ def restore_db(name):
     remove_quietly(DB_PATH + "-wal", DB_PATH + "-shm")
     print("Restored %s." % os.path.basename(path))
     print("The database you had is kept as %s. Delete it when you are happy." % kept)
-    print("Start Huginn again. Newer events still in the honeypot's export come back at the next sync.")
+    print("Start RavenTrap again. Newer events still in the honeypot's export come back at the next sync.")
 
 
 def serve():
@@ -9467,17 +9488,17 @@ def serve():
     if not web_rules()[0]:
         log("warning", "web_rules", "No web attack rules loaded from %s, web requests are not classified" % WEB_RULES_FILE,
             error=_web["error"])
-    log("info", "start", "Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), version=HUGINN_VERSION,
+    log("info", "start", "RavenTrap %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), version=HUGINN_VERSION,
         metrics=bool(metrics_token(connect())), log_format=LOG_FORMAT)
     if LOG_LEVEL > 20:
-        print("Huginn %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
+        print("RavenTrap %s listening on %s:%d" % (HUGINN_VERSION, BIND, PORT), flush=True)
     srv.serve_forever()
 
 
 def set_password():
     hold_db_lock()
     init_db()
-    p1 = getpass.getpass("New Huginn password: ")
+    p1 = getpass.getpass("New RavenTrap password: ")
     if len(p1) < 10:
         sys.exit("Too short (min 10 characters).")
     if getpass.getpass("Repeat: ") != p1:

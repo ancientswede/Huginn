@@ -208,7 +208,7 @@ class Rest(unittest.TestCase):
             p = os.path.join(d, "x.db")
             sqlite3.connect(p).execute("CREATE TABLE other(a)").connection.commit()
             self.assertEqual(app.check_copy(p), "ok")
-            self.assertIn("not a Huginn database", app.check_is_huginn(p))
+            self.assertIn("not a RavenTrap database", app.check_is_huginn(p))
             q = os.path.join(d, "y.db")
             c = sqlite3.connect(q)
             c.executescript(app.SCHEMA)

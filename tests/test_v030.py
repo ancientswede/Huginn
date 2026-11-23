@@ -91,7 +91,7 @@ class Protection(unittest.TestCase):
             self.assertEqual(len(sent), 2)
             self.export(good)
             app.health_check(self.con)
-            self.assertEqual(sent[-1][0], "Huginn: collection is back")
+            self.assertEqual(sent[-1][0], "RavenTrap: collection is back")
         self.assertIn("all in place", app.protection_note(self.con))
         self.export(None)                                                     # an older honeypot: the last report stays
         self.assertIn("all in place", app.protection_note(self.con))

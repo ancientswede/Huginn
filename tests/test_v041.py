@@ -92,7 +92,7 @@ class ScopedSave(unittest.TestCase):
     def test_appearance_keeps_views_and_notifications(self):
         self.assertTrue(app.save_settings({"scope": "appearance", "theme": "dark", "title": "", "notify": "0"}, {}))
         st = app.settings()
-        self.assertEqual((st["theme"], st["title"]), ("dark", "Huginn"))        # empty title -> default, as before
+        self.assertEqual((st["theme"], st["title"]), ("dark", "RavenTrap"))        # empty title -> default, as before
         self.assertEqual((st["cards"], st["notify"], st["notify_events"], st["overview"]), (["hero", "top"], True, ["bait"], "board"))
 
     def test_views_empty_lists_only_touch_views(self):

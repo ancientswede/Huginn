@@ -222,3 +222,44 @@ class CodexRc3Small(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class RenameRc5(unittest.TestCase):
+    # rc5: Huginn heter RavenTrap. Bara synligt namn; gamla standardtiteln visas som det nya namnet, egna titlar behålls.
+    def setUp(self):
+        self.con = app.connect()
+
+    def tearDown(self):
+        self.con.execute("DELETE FROM meta WHERE k='settings'")
+        self.con.commit()
+
+    def test_old_default_title_shows_new_name(self):
+        for saved, shown in (("Huginn", "RavenTrap"), ("My honeypot", "My honeypot")):
+            app.set_meta(self.con, "settings", json.dumps({"v": 9, "title": saved}))
+            self.con.commit()
+            self.assertEqual(app.settings(self.con)["title"], shown)
+
+    def test_update_check_tries_new_then_old_repo(self):
+        import urllib.error
+        asked = []
+
+        def fake(req, timeout=20):
+            asked.append(req.full_url)
+            if "RavenTrap" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+            class R:
+                def read(self, n):
+                    return json.dumps([{"name": "v1.0.0"}]).encode()
+            return R()
+        self.con.execute("DELETE FROM meta WHERE k IN ('update_checked','update_latest','update_error')")
+        with mock.patch.object(app, "UPDATE_CHECK", True), mock.patch.object(app, "api_urlopen", fake), \
+                mock.patch.object(app, "UPDATE_REPOS", ["ancientswede/RavenTrap", "ancientswede/Huginn"]):
+            app.check_update(self.con)
+        self.assertEqual([u.split("/")[5] for u in asked], ["RavenTrap", "Huginn"])
+        self.assertEqual(app.get_meta(self.con, "update_latest"), "1.0.0")
+        self.assertEqual(app.get_meta(self.con, "update_error"), "")
+
+    def test_interfaces_keep_the_old_name(self):
+        # Feeds, metrics, env names and the service stay "huginn": firewalls and dashboards must not break.
+        self.assertIn('HUGINN_ALLOWED_HOSTS', open(app.__file__).read())
+        self.assertIn("list=huginn", open(app.__file__).read())

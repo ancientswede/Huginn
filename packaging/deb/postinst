@@ -10,7 +10,7 @@ if [ -f /opt/huginn/app.py ]; then
   cmp -s "$SRC/app.py" /opt/huginn/app.py && exit 0
   if ! systemctl is-enabled --quiet huginn 2>/dev/null; then
     # Not running as a service (turned off on purpose, or a half-done setup): leave /opt/huginn alone, but say so.
-    echo "WARNING: /opt/huginn still has the old Huginn code because the huginn service is not enabled." >&2
+    echo "WARNING: /opt/huginn still has the old RavenTrap code because the huginn service is not enabled." >&2
     echo "         If the setup never finished, run: huginn-setup" >&2
     echo "         Otherwise enable it and update with: systemctl enable huginn && $SRC/update-huginn.sh" >&2
     exit 0
@@ -18,7 +18,7 @@ if [ -f /opt/huginn/app.py ]; then
   # A failed update has already put the old version back. Fail here too, so the package is not marked as
   # configured with old code running; "dpkg --configure -a" (or the same apt install) then tries again.
   if ! "$SRC/update-huginn.sh"; then
-    echo "ERROR: Huginn was not updated, see the message above. The old version is still running." >&2
+    echo "ERROR: RavenTrap was not updated, see the message above. The old version is still running." >&2
     echo "       Try again with: dpkg --configure -a" >&2
     exit 1
   fi
@@ -27,7 +27,7 @@ fi
 
 cat <<'MSG'
 
-  Huginn is unpacked. Connect it to your honeypot with:
+  RavenTrap is unpacked. Connect it to your honeypot with:
 
     huginn-setup
 

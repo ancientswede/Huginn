@@ -103,7 +103,7 @@ class Weekly(unittest.TestCase):
         finally:
             app.NTFY_URL, app.ntfy_post, app.datetime = orig
         self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0][0], "Huginn: week 45")
+        self.assertEqual(sent[0][0], "RavenTrap: week 45")
         self.assertIn("attackers", sent[0][1])
         self.assertIn("Mozi", sent[0][1])
 

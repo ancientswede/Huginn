@@ -136,7 +136,7 @@ class Guards(unittest.TestCase):
 
     def test_js_never_resubmits(self):
         self.assertNotIn("f.submit()", app.JS.split("// Settings: save a form")[1])
-        self.assertIn("No answer from Huginn", app.JS)
+        self.assertIn("No answer from RavenTrap", app.JS)
 
 
 if __name__ == "__main__":

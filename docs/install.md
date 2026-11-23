@@ -4,9 +4,9 @@
 
 ## Requirements
 
-You need **two machines**, VMs or LXC containers. That is on purpose: the honeypot will be broken into sooner or later. If Huginn, with your history and your blocklists, ran on the same machine, an attacker who escaped the fake shell would get both.
+You need **two machines**, VMs or LXC containers. That is on purpose: the honeypot will be broken into sooner or later. If RavenTrap, with your history and your blocklists, ran on the same machine, an attacker who escaped the fake shell would get both.
 
-| | Honeypot | Huginn |
+| | Honeypot | RavenTrap |
 |---|---|---|
 | OS | Debian 12 or 13 | Debian 12 or 13 |
 | CPU / RAM / disk | 1 core, 1–2 GB (2 GB with Suricata), 8 GB | 1 core, 512 MB–1 GB, 8 GB |
@@ -38,7 +38,7 @@ The script asks before each optional part: OpenCanary, the endlessh tarpit, hp-t
 
 From now on, log in with `ssh -p <your admin port> root@honeypot`.
 
-**2. On the Huginn machine** (or use the [Debian package](#install-with-the-debian-package) or [Docker](#run-huginn-in-docker), neither needs a clone)
+**2. On the RavenTrap machine** (or use the [Debian package](#install-with-the-debian-package) or [Docker](#run-raventrap-in-docker), neither needs a clone)
 
 ```bash
 apt-get install -y git && git clone https://github.com/ancientswede/Huginn.git && cd Huginn
@@ -51,15 +51,15 @@ The script:
    ```bash
    hp-add-huginn-key 'ssh-ed25519 AAAA... huginn@...'
    ```
-3. Waits until the honeypot accepts the key, starts Huginn and asks for the password for the web page.
+3. Waits until the honeypot accepts the key, starts RavenTrap and asks for the password for the web page.
 
 **3. Forward the ports**, but only after you have read [Read this before you open any ports](isolation.md) and **tested the isolation**. Forward the ports in [Ports to forward](#ports-to-forward) (also listed at the end of step 1) from the internet to the honeypot. Never forward the admin port. Then open `http://<huginn IP>:8095`. The first data shows up within two minutes, after the first sync.
 
-**Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in Huginn. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
+**Test it before you open the ports.** Add `HUGINN_ALLOW_PRIVATE=1` to `/opt/huginn/.env` and run `systemctl restart huginn`. Then attack the honeypot from your own LAN: `ssh root@<honeypot>` and try a few passwords, the fake shell lets you in after 2–5 tries. Your session shows up in RavenTrap. Remove the line again afterwards, so your own addresses are never recorded. LAN addresses never end up in the blocklists, even in test mode.
 
 ## Install with the Debian package
 
-Every [release](https://github.com/ancientswede/Huginn/releases) has a package for the Huginn side, on Debian 12/13 and derivatives. The honeypot is still set up with `install-honeypot.sh`, because each install has to get its own random identity.
+Every [release](https://github.com/ancientswede/Huginn/releases) has a package for the RavenTrap side, on Debian 12/13 and derivatives. The honeypot is still set up with `install-honeypot.sh`, because each install has to get its own random identity.
 
 ```bash
 wget https://github.com/ancientswede/Huginn/releases/latest/download/huginn_all.deb
@@ -69,7 +69,7 @@ huginn-setup                  # asks for the honeypot address, then the same ste
 
 - **Update:** download the new package and run `apt install ./huginn_all.deb` again. It backs up first and goes back to the old version by itself if the new one does not start.
 - **Go back:** `huginn-rollback`.
-- **Remove:** `apt remove huginn` stops Huginn and keeps your settings and data in `/opt/huginn`. `apt purge huginn` deletes them too.
+- **Remove:** `apt remove huginn` stops RavenTrap and keeps your settings and data in `/opt/huginn`. `apt purge huginn` deletes them too.
 - A machine installed with the scripts can switch by installing the package. Settings and data are kept.
 
 **Check a download** (optional, from 1.0): release files and the Docker image are signed by the GitHub workflow that built them, with no key of mine involved. With the [GitHub CLI](https://cli.github.com):
@@ -81,9 +81,9 @@ gh attestation verify oci://ghcr.io/ancientswede/huginn:latest -R ancientswede/H
 
 It confirms the file was built from this repository by its release workflow, and not changed afterwards. `SHA256SUMS` lists the checksums too.
 
-## Run Huginn in Docker
+## Run RavenTrap in Docker
 
-The Huginn side also runs as a container. **The honeypot does not:** it needs its own isolated VM or LXC with port redirects, set up with `install-honeypot.sh` as above. Never run the honeypot next to your other containers.
+The RavenTrap side also runs as a container. **The honeypot does not:** it needs its own isolated VM or LXC with port redirects, set up with `install-honeypot.sh` as above. Never run the honeypot next to your other containers.
 
 ```bash
 mkdir huginn && cd huginn
@@ -99,7 +99,7 @@ docker compose logs huginn           # shows the honeypot's key fingerprint and 
 3. Set the login password: `docker compose exec -it huginn huginn set-password`
 4. Open `http://<docker host>:8095`. The first data shows up within two minutes.
 
-Everything Huginn keeps lives in the `huginn-data` volume: the database, session recordings, its SSH key and the honeypot's host key. The container runs as an unprivileged user with a read-only file system and no capabilities.
+Everything RavenTrap keeps lives in the `huginn-data` volume: the database, session recordings, its SSH key and the honeypot's host key. The container runs as an unprivileged user with a read-only file system and no capabilities.
 
 - **Image:** `ghcr.io/ancientswede/huginn` for amd64 and arm64, built from each release. To build it yourself, clone the repository, use its `docker-compose.yml` and run `docker compose up -d --build`. Pin a version with `HUGINN_TAG=1.0.0` in `.env`. The files of a release candidate run that candidate's image, not `latest`.
 - **Update:** `docker compose pull && docker compose up -d`. The volume is kept.
@@ -147,7 +147,7 @@ systemctl daemon-reload && systemctl enable --now hp-traps
 
 **Your admin SSH must not use port 22**, because that is Cowrie's port. Move sshd to another port (for example 22022) before redirecting 22 to Cowrie. On Debian 13, sshd is started through `ssh.socket`, so set the port with a drop-in for `ssh.socket` (`ListenStream=`).
 
-### 2. On the Huginn host
+### 2. On the RavenTrap host
 
 ```bash
 useradd --system --home-dir /opt/huginn --shell /usr/sbin/nologin huginn
@@ -171,7 +171,7 @@ Add **one line** to `/root/.ssh/authorized_keys` on the honeypot. `restrict` tur
 restrict,command="/usr/local/bin/hp-export" ssh-ed25519 AAAA...your-key... huginn
 ```
 
-Then accept the honeypot's host key once and start Huginn:
+Then accept the honeypot's host key once and start RavenTrap:
 
 ```bash
 runuser -u huginn -- ssh -i /opt/huginn/.ssh/honeypot_ro -p 22022 \
@@ -182,14 +182,14 @@ runuser -u huginn -- python3 /opt/huginn/app.py set-password
 
 Open `http://huginn-host:8095` and log in. The first sync runs within two minutes.
 
-**History from before Huginn:** copy old `cowrie.json.*` and `opencanary.log*` files to the Huginn host and run, as root:
+**History from before RavenTrap:** copy old `cowrie.json.*` and `opencanary.log*` files to the RavenTrap host and run, as root:
 
 ```bash
 systemd-run --quiet --wait --pipe --same-dir --uid=huginn --gid=huginn -p EnvironmentFile=/opt/huginn/.env -p UMask=0027 \
   /usr/bin/python3 /opt/huginn/app.py import cowrie.json.* opencanary.log*
 ```
 
-That reads `.env` the way the service does, so your masking and retention apply. Gzipped files (`.gz`) are read as they are. The huginn user must be able to read the files. Lines Huginn already has are skipped, so you can run it again at any time, for example after Huginn has been down for a while. The export only covers the latest lines, so a long gap otherwise leaves a hole.
+That reads `.env` the way the service does, so your masking and retention apply. Gzipped files (`.gz`) are read as they are. The huginn user must be able to read the files. Lines RavenTrap already has are skipped, so you can run it again at any time, for example after RavenTrap has been down for a while. The export only covers the latest lines, so a long gap otherwise leaves a hole.
 
 ## Ports to forward
 
@@ -214,7 +214,7 @@ Forward these **TCP** ports from the internet to the honeypot, and only the rows
 | 5432 | PostgreSQL | hp-traps | 5432 |
 | 1080 | SOCKS5 proxy (always refuses) | hp-traps | 1080 |
 
-**Never forward** the honeypot's admin SSH port (22022 by default), and never forward anything to Huginn. Forward a port to the same port number on the honeypot (22 → 22, not 22 → 2225): the redirects inside take care of the rest. Some providers block port 25; the rest still works. All of this is TCP; UDP is not needed.
+**Never forward** the honeypot's admin SSH port (22022 by default), and never forward anything to RavenTrap. Forward a port to the same port number on the honeypot (22 → 22, not 22 → 2225): the redirects inside take care of the rest. Some providers block port 25; the rest still works. All of this is TCP; UDP is not needed.
 
 ### Router security features can hide the attacks
 
@@ -228,4 +228,4 @@ Many routers and firewalls inspect incoming traffic and silently drop what looks
 
 Some routers also have a **built-in honeypot**. It is unrelated to this one and only watches your own networks. Leave it as it is; it does not need to be on the honeypot's VLAN.
 
-To test from outside: turn off Wi-Fi and VPN on your phone and open `http://<your public IP>/`. You should see the fake NAS login page, and the visit shows up in Huginn within two minutes. Then mark your phone's address as "never block" on its Huginn page.
+To test from outside: turn off Wi-Fi and VPN on your phone and open `http://<your public IP>/`. You should see the fake NAS login page, and the visit shows up in RavenTrap within two minutes. Then mark your phone's address as "never block" on its RavenTrap page.

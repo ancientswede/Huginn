@@ -375,7 +375,7 @@ def _is_demo(d):
 
 
 if os.path.lexists(FINAL) and not (os.path.isdir(FINAL) and not os.path.islink(FINAL) and _is_demo(FINAL)):
-    sys.exit("%s exists and is not an earlier Huginn demo: refusing to replace it. Pick an empty or new folder." % FINAL)
+    sys.exit("%s exists and is not an earlier RavenTrap demo: refusing to replace it. Pick an empty or new folder." % FINAL)
 OUT = FINAL + ".building"
 shutil.rmtree(OUT, ignore_errors=True)
 os.makedirs(OUT)
@@ -436,7 +436,7 @@ def link(m):
     return "%s=%s%s%s%s" % (attr, q, P(target), frag, q)
 
 
-BANNER = ('<div class="demo-banner">Demo with made-up data &middot; Huginn turns a homelab honeypot into a page per attacker and firewall '
+BANNER = ('<div class="demo-banner">Demo with made-up data &middot; RavenTrap turns a homelab honeypot into a page per attacker and firewall '
           'blocklists &middot; <a href="%s" target="_blank" rel="noopener">Get it on GitHub</a></div>' % args.github)
 
 
@@ -498,7 +498,7 @@ for n in app.ENG_RANGES:
 # The password check works in the demo too: one static answer per hash prefix (missing prefix = not found).
 creds = fix(app.v_creds({"days": "7"}))
 creds = re.sub(r'<div class="card"><h3>Search and export</h3>.*?</div></div>',
-               '<div class="card"><h3>Search and export</h3><p class="muted">In your own Huginn: search every username and password, '
+               '<div class="card"><h3>Search and export</h3><p class="muted">In your own RavenTrap: search every username and password, '
                'and export them as word lists or CSV.</p><p class="muted small">Try the check on the left with a common password like '
                '<span class=mono>123456</span> or <span class=mono>admin</span>.</p></div></div>', creds, count=1, flags=re.S)
 save("creds.html", creds)
@@ -530,7 +530,7 @@ var cur='auto';try{cur=localStorage.getItem('hgDemoTheme')||'auto'}catch(e){}app
 var note=null;function toast(m){if(!note){note=document.createElement('div');note.className='demo-toast';document.body.appendChild(note)}note.textContent=m;note.classList.add('on');clearTimeout(note._t);note._t=setTimeout(function(){note.classList.remove('on')},2400)}
 document.addEventListener('submit',function(e){e.preventDefault();if(e.target.id==='pwcheck')return;var a=e.target.getAttribute('action')||'';
 if(a.indexOf('theme')>=0||e.target.querySelector('.theme-btn')){cur=order[(order.indexOf(cur)+1)%3];apply(cur);try{localStorage.setItem('hgDemoTheme',cur)}catch(x){}return}
-toast('This is a read-only demo — install Huginn to use filters and settings.')},true);
+toast('This is a read-only demo — install RavenTrap to use filters and settings.')},true);
 document.addEventListener('click',function(e){var a=e.target.closest('a');if(a&&a.getAttribute('href')==='#'){e.preventDefault();toast('Not available in the demo.')}})})();
 """
 css = app.CSS + (".demo-banner{background:#2f5bb7;color:#fff;text-align:center;padding:7px 16px;font-size:13px}"

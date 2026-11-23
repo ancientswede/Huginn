@@ -30,7 +30,7 @@ warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
-[ -f "$DIR/app.py" ] || die "Huginn is not installed in $DIR — run install-huginn.sh first."
+[ -f "$DIR/app.py" ] || die "RavenTrap is not installed in $DIR — run install-huginn.sh first."
 
 # Backups are folders named <version>-<YYYYmmdd-HHMMSS>: sort by that name, never by file times (which change
 # when an old backup's database copy is removed).
@@ -57,7 +57,7 @@ except Exception:
 PY
 }
 
-wait_for() {  # wait_for VERSION -> 0 when Huginn answers with that version
+wait_for() {  # wait_for VERSION -> 0 when RavenTrap answers with that version
   for _ in $(seq 1 20); do
     [ "$(running_version)" = "$1" ] && return 0
     sleep 2
@@ -90,7 +90,7 @@ if [ "$ROLLBACK" = 1 ]; then
   OLDV=$(ver "$LAST/app.py")
   say "Rolling back to $OLDV"
   restore "$LAST"
-  wait_for "$OLDV" || die "Huginn did not come up as $OLDV — see: journalctl -u $SVC -n 30"
+  wait_for "$OLDV" || die "RavenTrap did not come up as $OLDV — see: journalctl -u $SVC -n 30"
   ok "running $OLDV again"
   echo "    The database was not touched. Its copy from before the update is $LAST/huginn.db if you ever need it."
   exit 0
@@ -106,7 +106,7 @@ OLD=$(ver "$DIR/app.py")
 NEW=$(ver "$HERE/app.py")
 [ -n "$NEW" ] || die "Run this from the Huginn repository folder."
 if [ "$OLD" = "$NEW" ] && [ "$FORCE" != 1 ]; then
-  ok "Huginn $OLD is already the newest version in this folder (did you run git pull?)"
+  ok "RavenTrap $OLD is already the newest version in this folder (did you run git pull?)"
   exit 0
 fi
 if [ "$FORCE" != 1 ] && python3 -c "$VKEY
@@ -129,7 +129,7 @@ if [ -f "$DIR/data/huginn.db" ]; then
   runuser -u "$OWNER" -- python3 -I - "$DIR/data/huginn.db" "$T/huginn.db" <<'PY'
 import sqlite3, sys
 src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2])
-src.backup(dst)          # consistent copy while Huginn keeps running
+src.backup(dst)          # consistent copy while RavenTrap keeps running
 dst.close(); src.close()
 PY
   runuser -u "$OWNER" -- cat "$T/huginn.db" > "$B/huginn.db"
@@ -152,9 +152,9 @@ install_new() {  # everything that can leave a half-finished update: any failure
   systemctl restart "$SVC" || return 1
 }
 if install_new && wait_for "$NEW"; then
-  ok "Huginn $NEW is running"
+  ok "RavenTrap $NEW is running"
 else
-  warn "Huginn $NEW did not come up — rolling back to $OLD"
+  warn "RavenTrap $NEW did not come up — rolling back to $OLD"
   journalctl -u "$SVC" -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/      /' || true
   restore "$B" || warn "the rollback had errors, see above"
   if wait_for "$OLD"; then

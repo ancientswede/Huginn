@@ -26,7 +26,7 @@ usage() {
 Usage: $0 --honeypot HOST [options]
   --honeypot HOST       honeypot address (required)
   --honeypot-port N     the honeypot's admin SSH port chosen in install-honeypot.sh (asked if not given; default 22022)
-  --port N              Huginn web port (default $WEB_PORT)
+  --port N              RavenTrap web port (default $WEB_PORT)
   --tz ZONE             time zone, e.g. Europe/Stockholm (default: this machine's)
   --ntfy URL            ntfy topic URL for alerts, e.g. http://ntfy.lan:2586/huginn (asked if not given)
   --ntfy-token TOKEN    access token for an ntfy server with access control (tk_...)
@@ -87,7 +87,7 @@ fi
 # ------------------------------------------------------------------ notifications (optional)
 if [ -z "$NTFY" ] && [ "$YES" != 1 ] && [ "$NO_NTFY" != 1 ] && ! grep -q "^HUGINN_NTFY_URL=." /opt/huginn/.env 2>/dev/null; then
   echo
-  echo "    Huginn can push a short summary to ntfy (phone app) when something notable happens:"
+  echo "    RavenTrap can push a short summary to ntfy (phone app) when something notable happens:"
   echo "    bait taken, new malware, a human-like session, an exploit. At most one message per hour."
   if ask "Set up ntfy notifications?" no; then
     SUGGEST="huginn-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d " \n")"
@@ -108,10 +108,10 @@ import os, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
         return None   # never follow: the token must not go to another host
-h = {"Title": "Huginn: test", "Tags": "honey_pot"}
+h = {"Title": "RavenTrap: test", "Tags": "honey_pot"}
 if os.environ.get("NTFY_TOKEN"):
     h["Authorization"] = "Bearer " + os.environ["NTFY_TOKEN"]
-req = urllib.request.Request(os.environ["NTFY_URL"], data=b"Huginn is being installed. Notifications work.", headers=h, method="POST")
+req = urllib.request.Request(os.environ["NTFY_URL"], data=b"RavenTrap is being installed. Notifications work.", headers=h, method="POST")
 with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as r:
     r.read(65536)
 PY
@@ -131,7 +131,7 @@ fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || die "Python 3.10 or newer is required."
 ok "python $(python3 -V | cut -d' ' -f2)"
 
-say "Huginn files"
+say "RavenTrap files"
 id huginn >/dev/null 2>&1 || useradd --system --home-dir /opt/huginn --shell /usr/sbin/nologin huginn
 install -d -m 755 /opt/huginn
 install -d -m 750 -o huginn -g huginn /opt/huginn/data
@@ -187,7 +187,7 @@ PYEOF2
   } >> /opt/huginn/.env
   ok "ntfy notifications on (HUGINN_NTFY_URL in /opt/huginn/.env)"
   grep -q "^HUGINN_PUBLIC_URL=." /opt/huginn/.env || \
-    warn "the messages carry no link to Huginn, so your own address never reaches $NTFY; to add one, set HUGINN_PUBLIC_URL in /opt/huginn/.env"
+    warn "the messages carry no link to RavenTrap, so your own address never reaches $NTFY; to add one, set HUGINN_PUBLIC_URL in /opt/huginn/.env"
 fi
 if [ ! -f /opt/huginn/.ssh/honeypot_ro ]; then
   runuser -u huginn -- ssh-keygen -q -t ed25519 -N "" -C "huginn@$(hostname)" -f /opt/huginn/.ssh/honeypot_ro
@@ -215,7 +215,7 @@ test_export() {
     | grep -c '^##' || true
 }
 
-say "Connect Huginn to the honeypot"
+say "Connect RavenTrap to the honeypot"
 # The command below is pasted into a root shell on the honeypot. Build it only from a checked key type and key,
 # read as huginn (the file is in huginn's folder), never from whatever text the .pub file holds.
 PUB=$(runuser -u huginn -- head -c 1024 /opt/huginn/.ssh/honeypot_ro.pub | head -n 1 | awk '{print $1" "$2}')
@@ -241,7 +241,7 @@ EOF
 fi
 ok "the honeypot export answers ($N sections)"
 
-say "Starting Huginn"
+say "Starting RavenTrap"
 systemctl daemon-reload
 systemctl enable huginn >/dev/null 2>&1
 systemctl restart huginn
@@ -261,7 +261,7 @@ fi
 
 cat <<EOF
 
-  Huginn is ready:  http://$(hostname -I | awk '{print $1}'):$WEB_PORT
+  RavenTrap is ready:  http://$(hostname -I | awk '{print $1}'):$WEB_PORT
   The first sync runs within two minutes. Keep this page on your LAN or VPN.
   Opening it by another name (reverse proxy, DNS name) gives "Unknown host":
   add that name to HUGINN_ALLOWED_HOSTS in /opt/huginn/.env and restart huginn.

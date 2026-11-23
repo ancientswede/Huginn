@@ -175,7 +175,7 @@ class Huginn(unittest.TestCase):
             with self.con:
                 app.set_meta(self.con, "last_success", repr(now))
             app.health_check(self.con, now + 120)
-            self.assertEqual(sent[-1][0], "Huginn: collection is back")
+            self.assertEqual(sent[-1][0], "RavenTrap: collection is back")
             self.assertIn("Honeypot sync", sent[-1][1])
             # A source silent for longer than its own limit (limits are cached per day; set them directly here).
             app.store(self.con, [(hashlib.sha1(b"t1").hexdigest(), now - 5 * 3600, IP, "traps", "canary", None, "smtp", "")])
@@ -185,7 +185,7 @@ class Huginn(unittest.TestCase):
             self.assertEqual(list(issues), ["traps"])
             self.assertIn("hp-traps quiet for 5h", issues["traps"])
         self.assertIn("hp-traps quiet for", app.health_note(self.con))
-        self.assertEqual(sent[-1][0], "Huginn: collection problem")
+        self.assertEqual(sent[-1][0], "RavenTrap: collection problem")
 
     def test_limits_from_last_week(self):
         now = time.time()

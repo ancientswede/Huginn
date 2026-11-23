@@ -27,7 +27,7 @@ ok()   { printf '    \033[32mok\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
-[ -d "$DIR" ] || [ -f "/etc/systemd/system/$SVC.service" ] || die "Huginn is not installed here ($DIR)."
+[ -d "$DIR" ] || [ -f "/etc/systemd/system/$SVC.service" ] || die "RavenTrap is not installed here ($DIR)."
 # Only ever delete a folder that is really Huginn: an absolute path, not a system folder, with Huginn's app.py in it.
 DIR="${DIR%/}"
 case "$DIR" in
@@ -36,16 +36,16 @@ case "$DIR" in
 esac
 case "$DIR" in
   ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/*|/var|/var/lib|/var/log)
-    die "Refusing to remove $DIR: that is a system folder, not a Huginn install." ;;
+    die "Refusing to remove $DIR: that is a system folder, not a RavenTrap install." ;;
 esac
 if [ -e "$DIR" ]; then
   [ -d "$DIR" ] && [ ! -L "$DIR" ] || die "$DIR is not a plain folder: refusing to remove it."
-  grep -qs '^HUGINN_VERSION = ' "$DIR/app.py" || die "$DIR has no Huginn app.py: refusing to remove it. Check HUGINN_DIR."
+  grep -qs '^HUGINN_VERSION = ' "$DIR/app.py" || die "$DIR has no RavenTrap app.py: refusing to remove it. Check HUGINN_DIR."
 fi
 [ "$USR" != root ] || die "HUGINN_USER must not be root."
 
 echo
-echo "    This removes Huginn: the service, $DIR, the '$USR' service user and its SSH key."
+echo "    This removes RavenTrap: the service, $DIR, the '$USR' service user and its SSH key."
 if [ "$PURGE" = 1 ]; then echo "    --purge: the collected attacker data is deleted as well."
 else echo "    The collected data (database) is kept in /root/huginn-data-<date>."; fi
 if [ "$YES" != 1 ]; then
@@ -53,7 +53,7 @@ if [ "$YES" != 1 ]; then
   [ "$a" = remove ] || { echo "    Nothing was changed."; exit 0; }
 fi
 
-say "Stopping Huginn"
+say "Stopping RavenTrap"
 systemctl disable --now "$SVC" >/dev/null 2>&1 || true
 rm -f "/etc/systemd/system/$SVC.service"
 rm -rf "/etc/systemd/system/$SVC.service.d"
@@ -76,6 +76,6 @@ if id "$USR" >/dev/null 2>&1; then
 fi
 
 say "Done"
-echo "    Remember Huginn's key on the honeypot: uninstall-honeypot.sh removes it, or delete the"
+echo "    Remember RavenTrap's key on the honeypot: uninstall-honeypot.sh removes it, or delete the"
 echo "    line with command=\"/usr/local/bin/hp-export\" in the honeypot's /root/.ssh/authorized_keys."
-echo "    Firewalls that fetch Huginn's blocklist feeds will keep their last copy: remove those jobs too."
+echo "    Firewalls that fetch RavenTrap's blocklist feeds will keep their last copy: remove those jobs too."

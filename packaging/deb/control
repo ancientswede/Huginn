@@ -8,7 +8,7 @@ Section: net
 Priority: optional
 Homepage: https://github.com/ancientswede/Huginn
 Description: attacker intelligence and blocklists from your own honeypot
- Huginn pulls the logs from a Cowrie honeypot on an isolated machine and shows
+ RavenTrap pulls the logs from a Cowrie honeypot on an isolated machine and shows
  who attacks it, what they try and which files they drop, with a page per
  attacker, campaigns and firewall blocklists.
  .

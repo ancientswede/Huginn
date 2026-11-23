@@ -3,7 +3,7 @@
 #   docker compose up -d          (see docker-compose.yml and "Run Huginn in Docker" in docs/install.md)
 FROM python:3.13-slim
 
-LABEL org.opencontainers.image.title="Huginn" \
+LABEL org.opencontainers.image.title="RavenTrap" \
       org.opencontainers.image.description="Attacker intelligence for a homelab honeypot" \
       org.opencontainers.image.source="https://github.com/ancientswede/Huginn" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"

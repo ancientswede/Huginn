@@ -12,10 +12,10 @@ Only open ports when **all** of this is true:
   nc -zv -w3 <your router> 80   # must fail
   nc -zv -w3 <your NAS> 445     # must fail
   ```
-- **You forward only to the honeypot**, and only the ports in [Ports to forward](install.md#ports-to-forward). Never forward its admin SSH port. Never forward anything to Huginn: Huginn stays on your LAN or VPN.
+- **You forward only to the honeypot**, and only the ports in [Ports to forward](install.md#ports-to-forward). Never forward its admin SSH port. Never forward anything to RavenTrap: RavenTrap stays on your LAN or VPN.
 - **You keep it up to date.** Patch the honeypot (`apt upgrade`) and Cowrie (`git pull`). Rebuild it if anything looks wrong. Consider blocking its outbound internet once it is installed.
 - **You are allowed to.** Some internet providers forbid running servers or block port 25. In many countries, IP addresses are personal data (GDPR), so keep the retention short.
-- **You accept the risk.** Huginn comes with **no warranty** (see sections 15–16 of the [license](../LICENSE)). You are responsible for your own network.
+- **You accept the risk.** RavenTrap comes with **no warranty** (see sections 15–16 of the [license](../LICENSE)). You are responsible for your own network.
 
 ### How to isolate the honeypot
 
@@ -23,7 +23,7 @@ Getting the port forward right in your router only controls what comes **in**. I
 
 | | How | Verdict |
 |---|---|---|
-| **1. Own VLAN** | Put the honeypot on its own VLAN (UniFi, OPNsense, pfSense, MikroTik, most managed switches). Add firewall rules: honeypot VLAN → LAN/other VLANs **and the router itself** = **block**, LAN → honeypot = allow only Huginn to the admin port. | **Best.** The network itself keeps it apart. |
+| **1. Own VLAN** | Put the honeypot on its own VLAN (UniFi, OPNsense, pfSense, MikroTik, most managed switches). Add firewall rules: honeypot VLAN → LAN/other VLANs **and the router itself** = **block**, LAN → honeypot = allow only RavenTrap to the admin port. | **Best.** The network itself keeps it apart. |
 | **2. Hypervisor firewall** | No VLAN-capable gear? Keep the honeypot on your normal network, but block it from your LAN with the firewall of the *host* it runs on (Proxmox example below). Rules inside the honeypot itself do not count: an attacker with root just turns them off. | **Acceptable.** It is still on your LAN segment, so get the rules right and test them. |
 | **3. Nothing** | Honeypot on the same network as everything else, only a port forward. | **Don't.** One escape from the fake shell and the attacker is inside your home network. |
 
@@ -39,7 +39,7 @@ cd Huginn && ./tools/check-isolation.sh 192.168.1.10 192.168.1.20:445 192.168.1.
 - **Exclude the honeypot from Threat Management (IPS)**, or it silently drops the attacks. See [Router security features can hide the attacks](install.md#router-security-features-can-hide-the-attacks).
 - Run `tools/check-isolation.sh` again after every change.
 
-**Proxmox firewall example (option 2).** Turn on the firewall under Datacenter → Firewall, and on the container's network device (`firewall=1`). Then create `/etc/pve/firewall/<CTID>.fw` on the Proxmox host. Replace `192.168.1.0/24` with your LAN, `192.168.1.50` with Huginn's address and `22022` with your admin port:
+**Proxmox firewall example (option 2).** Turn on the firewall under Datacenter → Firewall, and on the container's network device (`firewall=1`). Then create `/etc/pve/firewall/<CTID>.fw` on the Proxmox host. Replace `192.168.1.0/24` with your LAN, `192.168.1.50` with RavenTrap's address and `22022` with your admin port:
 
 ```
 [OPTIONS]
@@ -48,7 +48,7 @@ policy_in: ACCEPT
 policy_out: ACCEPT
 
 [RULES]
-IN ACCEPT -source 192.168.1.50 -p tcp -dport 22022   # Huginn may pull the export
+IN ACCEPT -source 192.168.1.50 -p tcp -dport 22022   # RavenTrap may pull the export
 IN DROP -p tcp -dport 22022                           # nobody else reaches admin SSH
 OUT DROP -dest 10.0.0.0/8                              # no private networks at all...
 OUT DROP -dest 172.16.0.0/12
