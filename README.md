@@ -5,7 +5,7 @@
 
 **Attacker intelligence for a homelab honeypot.** RavenTrap pulls the logs from your honeypot, keeps the history, shows everything about every attacker IP on its own page, and turns it into blocklists your firewalls can fetch.
 
-**[See the live demo →](https://ancientswede.se/huginn/)** (made-up data, read-only)
+**[See the live demo →](https://ancientswede.se/raventrap/)** (made-up data, read-only)
 
 *Built with Claude (AI) and run every day on my own honeypot — see [How RavenTrap is made](#how-raventrap-is-made).*
 
@@ -89,7 +89,7 @@ RavenTrap also comes as a **Debian package** and a **Docker image**. All of it, 
 | [Security model](docs/security.md) | What can reach what, what is sent where, privacy |
 | [Stability promise](docs/stability.md) | What stays the same through all 1.x releases |
 
-**Try it first:** the [live demo](https://ancientswede.se/huginn/) runs on made-up data, or build it yourself with `tools/make_demo.py` (see [Running RavenTrap](docs/operations.md#try-it-without-a-honeypot)).
+**Try it first:** the [live demo](https://ancientswede.se/raventrap/) runs on made-up data, or build it yourself with `tools/make_demo.py` (see [Running RavenTrap](docs/operations.md#try-it-without-a-honeypot)).
 
 ## How RavenTrap is made
 
