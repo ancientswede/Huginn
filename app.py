@@ -6,8 +6,13 @@
 # keeps history in SQLite, shows a page per attacker IP and serves firewall blocklists.
 # Python standard library only. Copyright (C) 2026 Ancientswede. License: AGPL-3.0-or-later (see LICENSE).
 
-HUGINN_VERSION = "1.0.0-rc5"
+HUGINN_VERSION = "1.0.0-rc6"
 CHANGELOG = [
+    ('1.0.0-rc6', '2026-11-24',
+     'Small fixes to updating.\n'
+     '- update-huginn.sh no longer prints an empty "What is new" list after going back to an older version with --force\n'
+     '- The upgrade test also serves the upgraded database with a Host list, the way installs from before rc3 run, and reads the version '
+     'the way update-huginn.sh does (this would have caught the rc4 problem before release)'),
     ('1.0.0-rc5', '2026-11-23',
      'Huginn is now RavenTrap. There is already a well-known project called Huginn, so the name changes before 1.0.\n'
      '- Only the name you see changes: pages, notifications, README and docs\n'

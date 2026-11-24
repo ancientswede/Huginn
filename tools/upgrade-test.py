@@ -7,10 +7,13 @@
 For each tag: the old app.py (from git) imports made-up Cowrie and OpenCanary logs into a fresh home, the way an
 old install would have collected them. Then this checkout opens the same database and imports one more day, and
 the test checks that nothing was lost, the database is intact, and the pages, feeds, exports and /metrics still
-work. All addresses are from the documentation ranges (RFC 5737). Nothing goes to the network.
+work. Then the upgraded database is served the way a real install runs it, with HUGINN_ALLOWED_HOSTS set to names
+that do not include 127.0.0.1 (as on installs from before rc3): update-huginn.sh must still read the version
+(rc4 rolled back without it), and other Host names must get 421. All addresses are from the documentation
+ranges (RFC 5737). Nothing leaves the machine.
 Exit code 0 = every tag passed.
 """
-import json, os, random, sqlite3, subprocess, sys, tempfile, time, traceback
+import json, os, random, re, socket, sqlite3, subprocess, sys, tempfile, time, traceback, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -141,7 +144,48 @@ def one(tag, work):
     # Importing the old logs again must not store them twice (same dedupe across versions).
     again = run([sys.executable, os.path.join(ROOT, "app.py"), "import", os.path.join(logs, "cowrie.json"), os.path.join(logs, "opencanary.log")], env)
     dup = sum(int(l.split(",")[1].split()[0]) for l in again.splitlines() if " new," in l)
+    res["served"] = serve_check(env)
     return before, after, res, dup
+
+
+def serve_check(env):
+    """Serve the upgraded database with a Host list and ask it the way update-huginn.sh does."""
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        port = so.getsockname()[1]
+    env = dict(env, HUGINN_PORT=str(port), HUGINN_BIND="127.0.0.1", HUGINN_ALLOWED_HOSTS="huginn.example,192.0.2.1:%d" % port)
+    want = re.search(r'^HUGINN_VERSION = "([^"]+)"', open(os.path.join(ROOT, "app.py")).read(), re.M)[1]
+    # The exact Python that update-huginn.sh runs to read the running version
+    snippet = re.search(r"running_version\(\) \{\n  python3 - \"\$PORT\" <<'PY'\n(.*?)\nPY\n", open(os.path.join(ROOT, "update-huginn.sh")).read(), re.S)[1]
+    srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        got = ""
+        for _ in range(60):
+            got = subprocess.run([sys.executable, "-c", snippet, str(port)], capture_output=True, text=True, timeout=30).stdout.strip()
+            if got or srv.poll() is not None:
+                break
+            time.sleep(0.5)
+        if got != want:
+            raise RuntimeError("update-huginn.sh reads version %r, expected %r (server: %s)" % (got, want, srv.poll() is None and "running" or srv.stderr.read()[-400:]))
+
+        def get(path, host):
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), headers={"Host": host})
+            try:
+                r = urllib.request.urlopen(req, timeout=10)
+                return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        if get("/login", "evil.example")[0] != 421:
+            raise RuntimeError("another Host name was not refused with 421")
+        if get("/login", "huginn.example")[0] == 421:
+            raise RuntimeError("an allowed Host name was refused")
+        code, body = get("/healthz", "evil.example")
+        if set(json.loads(body)) != {"ok"}:
+            raise RuntimeError("/healthz told an unknown Host name more than up or down")
+    finally:
+        srv.terminate()
+        srv.wait(10)
+    return want
 
 
 def vkey(t):
@@ -164,8 +208,8 @@ def main():
         try:
             before, after, res, dup = one(tag, work)
             print("PASS %-8s old: %d IPs, %d sessions, %d events -> now: %d IPs, %d sessions, %d events; %d feed lines; "
-                  "re-import stored %d twice" % (tag, before["ips"], before["sessions"], before["events"],
-                                                after["ips"], after["sessions"], after["events"], res["feed_lines"], dup))
+                  "re-import stored %d twice; served %s with a Host list" % (tag, before["ips"], before["sessions"], before["events"],
+                                                after["ips"], after["sessions"], after["events"], res["feed_lines"], dup, res["served"]))
             if dup:
                 print("     note: the dedupe key changed since %s, so importing its old log files again stores them twice" % tag)
         except Exception as e:

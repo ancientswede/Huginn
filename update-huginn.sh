@@ -167,8 +167,8 @@ fi
 backups_newest_first | tail -n +$((KEEP + 1)) | while read -r old; do rm -rf -- "$old"; done
 backups_newest_first | tail -n +2 | while read -r old; do rm -f -- "$old/huginn.db"; done
 
-say "What is new since $OLD"
-python3 - "$HERE/app.py" "$OLD" "$VKEY" <<'PY'
+# Only when going up: after --force to an older version there is nothing new to list.
+NEWS=$(python3 - "$HERE/app.py" "$OLD" "$VKEY" <<'PY'
 import ast, sys
 tree = ast.parse(open(sys.argv[1]).read())
 log = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CHANGELOG")
@@ -181,4 +181,8 @@ for v, d, text in log:
         for line in rest:
             print("            %s" % line)
 PY
-echo
+)
+if [ -n "$NEWS" ]; then
+  say "What is new since $OLD"
+  printf '%s\n\n' "$NEWS"
+fi
