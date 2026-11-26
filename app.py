@@ -8,11 +8,21 @@
 
 HUGINN_VERSION = "1.0.0-rc6"
 CHANGELOG = [
-    ('1.0.0-rc6', '2026-11-24',
-     'Small fixes to updating.\n'
-     '- update-huginn.sh no longer prints an empty "What is new" list after going back to an older version with --force\n'
-     '- The upgrade test also serves the upgraded database with a Host list, the way installs from before rc3 run, and reads the version '
-     'the way update-huginn.sh does (this would have caught the rc4 problem before release)'),
+    ('1.0.0-rc6', '2026-11-26',
+     'Safer updates, and the last fixes from the rc2 review that were left for later.\n'
+     '- A failed update puts back the database copy from just before it, not only the old code. '
+     '--rollback --with-db does the same by hand; restore-db reads both compressed and plain copies\n'
+     '- update-huginn.sh and the Docker health check ask the address RavenTrap listens on (HUGINN_BIND), so a '
+     'server bound to one address is no longer rolled back after a good update. HUGINN_BIND=:: (IPv6) works\n'
+     '- No empty "What is new" list after going back to an older version with --force\n'
+     '- Honeypot: a new file with the same name as an earlier one, captured within a second, no longer gets the earlier '
+     'one\'s SHA-256; the log reader no longer drops a line and fills it from an older rotated file\n'
+     '- Honeypot: hp-identity takes at most 4 MB from OpenCanary and only the start of a web answer\n'
+     '- A country while ipwho.is pauses: the registry country of the netblock (Team Cymru) until ipwho.is answers\n'
+     '- /metrics: service labels only from a fixed list\n'
+     '- Blocklist help: download the ipset and MikroTik feeds to a file and import only a complete one\n'
+     '- The upgrade test compares every old row before new data comes in, fails on re-imported duplicates, and also '
+     'serves on one address and on IPv6'),
     ('1.0.0-rc5', '2026-11-23',
      'Huginn is now RavenTrap. There is already a well-known project called Huginn, so the name changes before 1.0.\n'
      '- Only the name you see changes: pages, notifications, README and docs\n'
@@ -2457,6 +2467,12 @@ def nb_lookup(con, limit=50):
             with con:
                 con.execute("INSERT OR REPLACE INTO netblock VALUES(?,?,?,?,?,?,?)", (ip, time.time(), n.get("prefix"), n.get("asn"),
                             n.get("cc"), n.get("registry"), n.get("allocated")))
+                cc = n.get("cc")
+                if isinstance(cc, str) and re.fullmatch(r"[A-Z]{2}", cc):
+                    # Country until ipwho.is answers (it pauses for an hour when its free allowance is used up): the
+                    # registry's country for the netblock. ipwho.is overwrites it when it gets there.
+                    con.execute("UPDATE enrich SET cc=? WHERE ip=? AND (cc IS NULL OR cc='')", (cc, ip))
+                    con.execute("INSERT OR IGNORE INTO enrich(ip, fetched, ok, cc) VALUES(?,0,0,?)", (ip, cc))
             done += 1
             time.sleep(0.1)
         left, _t, _u = day_budget(con, "nb_day", NB_DAILY)
@@ -3304,13 +3320,16 @@ def store(con, rows):
 
 
 METRIC_SVC_RE = re.compile(r"[a-z0-9_-]{1,20}")
+# Prometheus labels only from a fixed list: a damaged or remapped source cannot invent new time series (Codex rc2 M24).
+METRIC_SVCS = {"ftp", "http", "https", "mysql", "redis", "vnc", "ssh", "telnet", "imap", "pop3", "postgres", "smtp",
+               "socks5", "submission", "mssql", "rdp", "sip", "snmp", "ntp", "tftp", "git", "portscan"}
 
 
 def metric_svc(src, a):
     # The decoy service of an OpenCanary or trap row (vnc, http, smtp...); nothing for Cowrie. Odd values become "other".
     if src not in ("canary", "traps"):
         return ""
-    return a if isinstance(a, str) and METRIC_SVC_RE.fullmatch(a) else "other"
+    return a if isinstance(a, str) and a in METRIC_SVCS else "other"
 
 
 def count_events(con, top):
@@ -4394,6 +4413,10 @@ def enrich_loop():
                         for k, v in zip(("cc", "country", "city", "asn", "org", "isp"), old):
                             if d[k] is None:
                                 d[k] = v
+                    if not d["cc"]:                         # still none: the netblock's registry country (Team Cymru)
+                        nb = con.execute("SELECT cc FROM netblock WHERE ip=?", (ip,)).fetchone()
+                        if nb and isinstance(nb[0], str) and re.fullmatch(r"[A-Z]{2}", nb[0]):
+                            d["cc"] = nb[0]
                 research = research_now(con, ip, research)       # keep a benign GreyNoise answer
                 fetched = time.time() if ok else time.time() - ENRICH_TTL + 86400  # failed: retry in a day
                 with con:
@@ -7436,8 +7459,8 @@ def render_feed(fmt, ips, with_v6=True):
 
 FEEDS = [("txt", "Plain list", "One IP per line. OPNsense/pfSense URL Table alias, pfBlockerNG, CrowdSec (cscli decisions import --format values), Pi-hole-style tools."),
          ("nft", "nftables", "Complete table with sets and drop rules. Cron: curl -fsS URL -o /etc/huginn.nft && nft -f /etc/huginn.nft"),
-         ("ipset", "ipset", "Sets huginn4/huginn6. Cron: curl -fsS URL | ipset restore -exist — then iptables -I INPUT -m set --match-set huginn4 src -j DROP"),
-         ("mikrotik", "MikroTik", "RouterOS script for address-list 'huginn': /tool fetch url=URL dst-path=huginn.rsc; /import huginn.rsc"),
+         ("ipset", "ipset", "Sets huginn4/huginn6. Cron: curl -fsS URL -o /tmp/huginn.ipset && ipset restore -exist < /tmp/huginn.ipset — then iptables -I INPUT -m set --match-set huginn4 src -j DROP"),
+         ("mikrotik", "MikroTik", "RouterOS script for address-list 'huginn': /tool fetch url=URL dst-path=huginn.rsc, then /import huginn.rsc only if the fetch worked"),
          ("csv", "CSV", "IP with score, last seen, country and tags. CrowdSec: cscli decisions import -i huginn.csv")]
 
 
@@ -9451,8 +9474,10 @@ def restore_db(name):
     tmp = os.path.join(DATA, ".restore-%s.db" % stamp)
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-        with os.fdopen(fd, "wb") as out, gzip.open(path, "rb") as gz:
-            shutil.copyfileobj(gz, out, 1 << 20)
+        with open(path, "rb") as f:
+            packed = f.read(2) == b"\x1f\x8b"      # the daily copies are gzip; update-huginn.sh's older ones were plain SQLite
+        with os.fdopen(fd, "wb") as out, (gzip.open(path, "rb") if packed else open(path, "rb")) as src:
+            shutil.copyfileobj(src, out, 1 << 20)
         result = check_copy(tmp)
         if result == "ok":
             result = check_is_huginn(tmp)
@@ -9489,6 +9514,8 @@ def serve():
     if ENRICH:
         threading.Thread(target=enrich_loop, daemon=True, name="enrich").start()
     threading.Thread(target=backup_loop, daemon=True, name="backup").start()
+    if ":" in BIND:                     # HUGINN_BIND=:: or an IPv6 address (Codex rc2 M19)
+        HuginnServer.address_family = socket.AF_INET6
     srv = HuginnServer((BIND, PORT), Handler)
     if not web_rules()[0]:
         log("warning", "web_rules", "No web attack rules loaded from %s, web requests are not classified" % WEB_RULES_FILE,

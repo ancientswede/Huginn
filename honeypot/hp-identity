@@ -123,9 +123,40 @@ def build_skin(ident, model, root=SKINS):
     return final
 
 
+OUT_CAP = 4 << 20     # most bytes root takes from a command run as OpenCanary (its settings file is a few KB)
+
+
 def as_canary(*cmd, stdin=None):
-    # OpenCanary's home belongs to an internet-facing service: root must not write or follow anything in it.
-    return subprocess.run(["runuser", "-u", OC_USER, "--"] + list(cmd), input=stdin, capture_output=True, text=True, timeout=120)
+    # OpenCanary's home belongs to an internet-facing service: root must not write or follow anything in it. What it
+    # prints is capped, so a broken or hostile OpenCanary cannot fill this root process's memory (Codex rc2 M22).
+    p = subprocess.Popen(["runuser", "-u", OC_USER, "--"] + list(cmd), stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    box = {}
+    def grab(name, f):
+        box[name] = f.read(OUT_CAP + 1)
+        if len(box[name]) > OUT_CAP:
+            p.kill()
+    import threading
+    ts = [threading.Thread(target=grab, args=(k, f), daemon=True) for k, f in (("out", p.stdout), ("err", p.stderr))]
+    for t in ts:
+        t.start()
+    if stdin is not None:
+        try:
+            p.stdin.write(stdin.encode())
+            p.stdin.close()
+        except OSError:
+            pass
+    try:
+        p.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+    for t in ts:
+        t.join(5)
+    out, err = box.get("out", b""), box.get("err", b"")
+    big = len(out) > OUT_CAP or len(err) > OUT_CAP
+    return subprocess.CompletedProcess(p.args, 1 if big else p.returncode, out[:OUT_CAP].decode("utf-8", "replace"),
+                                       ("output too large; " if big else "") + err[:OUT_CAP].decode("utf-8", "replace"))
 
 
 CONF_EDIT = r"""
@@ -181,7 +212,7 @@ def serving(banner, port, secs=45):
             c.request("GET", "/index.html", headers={"User-Agent": "hp-identity"})
             r = c.getresponse()
             got = r.getheader("Server")
-            r.read()
+            r.read(65536)                       # only status and banner matter: never take the whole body (Codex rc2 M22)
             c.close()
             if r.status == 200 and (banner is None or got == banner):      # None: any answer, for a setup without a banner of its own
                 return True

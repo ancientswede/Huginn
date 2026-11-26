@@ -2,6 +2,8 @@
 
 [← Back to the README](../README.md)
 
+The ipset and MikroTik feeds start by clearing the list and then add every address. Always download to a file first and import only when the download finished (as in the table): piping straight into `ipset restore` can leave the firewall with an empty or half list if the transfer breaks off.
+
 The ipset and MikroTik feeds also clear the IPv6 list, so an address that left the blocklist is removed. A firewall without IPv6 support should fetch the feed with `v6=0`. Addresses an earlier feed added to an IPv6 list then have to be removed by hand.
 
 The **Blocklist** page builds feed URLs from your filters (minimum score, how recently seen, include research scanners or not, include Tor exit nodes or not). The feed URLs contain a secret token instead of a login, so firewalls can fetch them. Keep them on your LAN. You can rotate the token on the page.
@@ -10,8 +12,8 @@ The **Blocklist** page builds feed URLs from your filters (minimum score, how re
 |---|---|
 | `txt` | OPNsense/pfSense URL Table alias, pfBlockerNG, `cscli decisions import --format values` (CrowdSec) |
 | `nft` | `curl -fsS URL -o /etc/huginn.nft && nft -f /etc/huginn.nft` (complete table with drop rules) |
-| `ipset` | `curl -fsS URL \| ipset restore -exist`, then `iptables -I INPUT -m set --match-set huginn4 src -j DROP` |
-| `mikrotik` | `/tool fetch url=URL dst-path=huginn.rsc; /import huginn.rsc` |
+| `ipset` | `curl -fsS URL -o /tmp/huginn.ipset && ipset restore -exist < /tmp/huginn.ipset`, then `iptables -I INPUT -m set --match-set huginn4 src -j DROP` |
+| `mikrotik` | `/tool fetch url=URL dst-path=huginn.rsc` and, only if that worked, `/import huginn.rsc` (a script stops at the failed fetch) |
 | `csv` | IP with score, last seen, country and tags (CrowdSec `cscli decisions import -i`) |
 | `c2` | Malware download hosts and addresses embedded in captured malware, seen from at least 2 attackers. Attackers can choose these addresses, so use it as advice, not as an automatic block |
 

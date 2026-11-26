@@ -74,6 +74,26 @@ def make_logs(d, start, days, seed):
     return paths
 
 
+def fingerprint(db, cols=None):
+    """Every stored row of the main tables as a multiset of hashes, over the columns the old version had (Codex rc2 M23).
+    cols=None: take them from this database (the old one) and return them too."""
+    import collections, hashlib
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if cols is None:
+        cols = {t: [r[1] for r in c.execute("PRAGMA table_info(%s)" % t)] for t in ("ips", "sessions", "events", "files") if t in tables}
+    out = {}
+    for t, cl in cols.items():
+        have = {r[1] for r in c.execute("PRAGMA table_info(%s)" % t)} if t in tables else set()
+        missing = [x for x in cl if x not in have]
+        if missing:
+            raise RuntimeError("columns gone after the upgrade: %s.%s" % (t, ",".join(missing)))
+        out[t] = collections.Counter(hashlib.sha1(repr(r).encode()).hexdigest()
+                                     for r in c.execute("SELECT %s FROM %s" % (",".join('"%s"' % x for x in cl), t)))
+    c.close()
+    return out, cols
+
+
 def counts(db):
     c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -131,6 +151,14 @@ def one(tag, work):
     before = counts(db)
     if not before.get("events"):
         raise RuntimeError("the old version stored nothing")
+    # Open it with this checkout WITHOUT new data first: the old rows must all still be there, unchanged.
+    fp_old, cols = fingerprint(db)
+    run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import app; app.init_db()", ROOT], env)
+    fp_new, _ = fingerprint(db, cols)
+    for t in fp_old:
+        lost = fp_old[t] - fp_new[t]
+        if lost:
+            raise RuntimeError("the upgrade changed or lost %d %s rows (compared on the old columns)" % (sum(lost.values()), t))
     # This checkout opens the old database (migrations run in init_db) and adds one more day.
     new_logs = os.path.join(logs, "new")
     os.makedirs(new_logs)
@@ -144,24 +172,41 @@ def one(tag, work):
     # Importing the old logs again must not store them twice (same dedupe across versions).
     again = run([sys.executable, os.path.join(ROOT, "app.py"), "import", os.path.join(logs, "cowrie.json"), os.path.join(logs, "opencanary.log")], env)
     dup = sum(int(l.split(",")[1].split()[0]) for l in again.splitlines() if " new," in l)
+    if dup:
+        raise RuntimeError("importing the old logs again stored %d of them twice (the dedupe key changed)" % dup)
     res["served"] = serve_check(env)
+    serve_check(env, "127.0.0.2")                         # bound to one address (Codex rc2 M19)
+    if socket.has_ipv6:
+        try:
+            with socket.socket(socket.AF_INET6) as so:
+                so.bind(("::1", 0))
+            serve_check(env, "::1")
+        except OSError:
+            pass                                          # no IPv6 loopback here
     return before, after, res, dup
 
 
-def serve_check(env):
-    """Serve the upgraded database with a Host list and ask it the way update-huginn.sh does."""
+def serve_check(env, bind=""):
+    """Serve the upgraded database with a Host list and ask it the way update-huginn.sh does (also bound to one address)."""
     with socket.socket() as so:
         so.bind(("127.0.0.1", 0))
         port = so.getsockname()[1]
-    env = dict(env, HUGINN_PORT=str(port), HUGINN_BIND="127.0.0.1", HUGINN_ALLOWED_HOSTS="huginn.example,192.0.2.1:%d" % port)
+    env = dict(env, HUGINN_PORT=str(port), HUGINN_BIND=bind or "0.0.0.0", HUGINN_ALLOWED_HOSTS="huginn.example,192.0.2.1:%d" % port)
+    if bind:   # free the port on that address too
+        fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        with socket.socket(fam) as so:
+            so.bind((bind, 0))
+            port = so.getsockname()[1]
+        env["HUGINN_PORT"] = str(port)
+    at = ("[%s]" % bind if ":" in bind else bind) if bind else "127.0.0.1"
     want = re.search(r'^HUGINN_VERSION = "([^"]+)"', open(os.path.join(ROOT, "app.py")).read(), re.M)[1]
     # The exact Python that update-huginn.sh runs to read the running version
-    snippet = re.search(r"running_version\(\) \{\n  python3 - \"\$PORT\" <<'PY'\n(.*?)\nPY\n", open(os.path.join(ROOT, "update-huginn.sh")).read(), re.S)[1]
+    snippet = re.search(r"running_version\(\) \{\n  python3 - \"\$PORT\"[^\n]*<<'PY'\n(.*?)\nPY\n", open(os.path.join(ROOT, "update-huginn.sh")).read(), re.S)[1]
     srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         got = ""
         for _ in range(60):
-            got = subprocess.run([sys.executable, "-c", snippet, str(port)], capture_output=True, text=True, timeout=30).stdout.strip()
+            got = subprocess.run([sys.executable, "-c", snippet, str(port), bind], capture_output=True, text=True, timeout=30).stdout.strip()
             if got or srv.poll() is not None:
                 break
             time.sleep(0.5)
@@ -169,7 +214,7 @@ def serve_check(env):
             raise RuntimeError("update-huginn.sh reads version %r, expected %r (server: %s)" % (got, want, srv.poll() is None and "running" or srv.stderr.read()[-400:]))
 
         def get(path, host):
-            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), headers={"Host": host})
+            req = urllib.request.Request("http://%s:%d%s" % (at, port, path), headers={"Host": host})
             try:
                 r = urllib.request.urlopen(req, timeout=10)
                 return r.status, r.read()
@@ -210,8 +255,6 @@ def main():
             print("PASS %-8s old: %d IPs, %d sessions, %d events -> now: %d IPs, %d sessions, %d events; %d feed lines; "
                   "re-import stored %d twice; served %s with a Host list" % (tag, before["ips"], before["sessions"], before["events"],
                                                 after["ips"], after["sessions"], after["events"], res["feed_lines"], dup, res["served"]))
-            if dup:
-                print("     note: the dedupe key changed since %s, so importing its old log files again stores them twice" % tag)
         except Exception as e:
             bad += 1
             print("FAIL %-8s %s" % (tag, e))

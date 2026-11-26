@@ -269,7 +269,10 @@ class Scripts(unittest.TestCase):
             self.assertNotIn("$PY_P txtcmds", s, name)
             self.assertNotIn("$PATCH", s, name)
             self.assertIn("setup-sandbox.sh", s, name)
-        self.assertNotIn("chown", self.read("update-huginn.sh").replace('chown "$OWNER" "$T"', ""))
+        # The only ownership changes: the backup's temp folder (root's mktemp) and, for restore-db, one file root just
+        # copied into a folder only root can change, never following a link (rc6, Codex rc2 M18).
+        s = self.read("update-huginn.sh").replace('chown "$OWNER" "$T"', "").replace('chown -h "$owner" "$t/copy.db"', "")
+        self.assertNotIn("chown", s.replace("chown -h never follows", ""))
 
     def catfiles(self):
         s = self.read("honeypot/hp-export")

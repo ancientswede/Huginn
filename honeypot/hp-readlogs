@@ -41,7 +41,10 @@ def expected_owner(path, depth=0):
 def tail_lines(fd, size, want, budget):
     # The last `want` lines of an open file (all when want is 0), reading backwards in blocks, never more than budget bytes.
     lines, buf, pos, used = [], b"", size, 0
-    while pos > 0 and used < budget and (not want or len(lines) < want):
+    # The empty piece after the file's last newline is not a line: counting it stopped one line early, and an older
+    # rotated file filled the gap (Codex rc2 M21).
+    have = lambda: len(lines) - (1 if lines and lines[-1] == b"" else 0)
+    while pos > 0 and used < budget and (not want or have() < want):
         n = min(1 << 20, pos, budget - used)
         pos -= n
         used += n
@@ -75,28 +78,35 @@ def main():
         os.setgroups([])
         os.setgid(st.st_gid)
         os.setuid(st.st_uid)
-    files = []
+    # Sort by time without opening anything, then open only the files that are needed, newest first: opening them all
+    # first could hit the open-file limit and skip later files without a word (Codex rc2 M21).
+    names = []
     for n in os.listdir(dfd):
         if n.endswith(".gz") or not fnmatch.fnmatchcase(n, name_pat):
             continue
         try:
+            ls = os.stat(n, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(ls.st_mode):
+            names.append((ls.st_mtime, n, ls.st_ino))
+    out, used = [], 0
+    for _m, n, ino in sorted(names, reverse=True):          # newest first
+        if (want and len(out) >= want) or used >= budget:
+            break
+        try:
             fd = os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError:
             continue
-        fs = os.fstat(fd)
-        if not stat.S_ISREG(fs.st_mode) or fs.st_nlink != 1:
+        try:
+            fs = os.fstat(fd)
+            if not stat.S_ISREG(fs.st_mode) or fs.st_nlink != 1 or fs.st_ino != ino:
+                continue
+            got, u = tail_lines(fd, fs.st_size, want - len(out) if want else 0, budget - used)
+        finally:
             os.close(fd)
-            continue
-        files.append((fs.st_mtime, n, fd, fs.st_size))
-    out, used = [], 0
-    for _m, _n, fd, size in sorted(files, reverse=True):          # newest first
-        if (want and len(out) >= want) or used >= budget:
-            break
-        got, u = tail_lines(fd, size, want - len(out) if want else 0, budget - used)
         out[:0] = got
         used += u
-    for _m, _n, fd, _s in files:
-        os.close(fd)
     w = sys.stdout.buffer
     for line in out:
         w.write(line + b"\n")

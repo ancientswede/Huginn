@@ -128,7 +128,7 @@ def main():
         except OSError:
             listed_all = False
             continue
-        present.update(names)
+        present.update(os.path.join(d, n) for n in names)
         for n in names:
             if not (re.fullmatch(r"[0-9a-f]{64}", n) or re.fullmatch(r"(redir|tmp)_?[A-Za-z0-9_]{4,80}", n)):
                 continue
@@ -139,14 +139,19 @@ def main():
                 continue
             if not os.path.isfile(p) or os.path.islink(p):
                 continue
-            c = cache.get(n)
-            if c and c.get("size") == st.st_size and c.get("v") in (4, 5) and (c.get("v") == 4 or c.get("mtime") == int(st.st_mtime)) \
-                    and (st.st_size <= MAXREAD or c.get("v") == 5):
+            # Cache key = folder + name, and the entry must be this very file: same inode, size and nanosecond times.
+            # Name + size + whole-second mtime gave a second file with the same name the first one's SHA (Codex rc2 M17).
+            ident = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+            c = cache.get(p)
+            if c and c.get("v") == 6 and c.get("ident") == ident:
                 continue
             if time.monotonic() - started > TIME_BUDGET:     # keep what is done; the next export carries on
                 continue
             try:
                 with open(p, "rb") as fh:
+                    fs = os.fstat(fh.fileno())
+                    if [fs.st_dev, fs.st_ino, fs.st_size, fs.st_mtime_ns, fs.st_ctime_ns] != ident:
+                        continue                          # changed or replaced since it was looked at: next export
                     b = fh.read(MAXREAD)
                     h = hashlib.sha256(b)
                     left = MAXHASH - len(b)
@@ -164,10 +169,13 @@ def main():
             except Exception:                 # one odd file must not cost the results of all the others
                 continue
             sha = h.hexdigest()                       # also for hash-named files: the content decides, not the name
-            cache[n] = {"sha": sha, "src": "redir" if n.startswith("redir") else "download", "size": st.st_size, "mtime": int(st.st_mtime), "type": typ, "arch": arch,
+            cache[p] = {"sha": sha, "src": "redir" if n.startswith("redir") else "download", "size": st.st_size, "mtime": int(st.st_mtime), "type": typ, "arch": arch,
                         "packed": b"UPX!" in b[:4096] or b"UPX!" in b[-4096:], "iocs": found_iocs,
-                        "family": found_family, "v": 5}
+                        "family": found_family, "v": 6, "ident": ident}
             changed = True
+    for k in [k for k, v in cache.items() if v.get("v") != 6]:    # entries from before v6 (keyed by bare name)
+        del cache[k]
+        changed = True
     if changed:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         tmp = CACHE + ".tmp"
@@ -178,9 +186,10 @@ def main():
     for n, v in cache.items():
         if v.get("sha") in seen or not v.get("size"):
             continue
+        out = {k: x for k, x in v.items() if k != "ident"}     # the export keeps its old fields
         if listed_all and n not in present:       # deleted from the honeypot: Huginn keeps its history, but it is no longer here
             continue
         seen.add(v.get("sha"))
-        sys.stdout.write(json.dumps(v, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
 
 main()

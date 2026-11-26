@@ -22,15 +22,24 @@ jobs:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Before any code from that ref runs with this job's write token: a version tag with a published release, checked
+      # out as that exact tag, never a branch of the same name (Codex rc2 M8).
+      - name: The tag is a released version
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName | grep -qx "$TAG"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
-      - name: Build
-        run: tools/build-release.sh dist
+          ref: refs/tags/${{ env.TAG }}
       - name: The tag and the code agree
         run: |
           ver=$(sed -nE 's/^HUGINN_VERSION = "([^"]+)".*/\1/p' app.py | head -1)
           [ "v$ver" = "$TAG" ]
+      - name: Build
+        run: tools/build-release.sh dist
+      - name: The package has that version
+        run: |
+          ver=${TAG#v}
           [ "$(dpkg-deb -f dist/huginn_all.deb Version)" = "${ver/-rc/~rc}" ]
       - name: Compose file is valid
         run: |

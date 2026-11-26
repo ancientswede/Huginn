@@ -20,7 +20,9 @@ cd Huginn && git pull
 ./update-honeypot.sh --suricata-on            # optional Suricata IDS (see Suricata IDS); --suricata-off turns it off
 ```
 
-- `update-huginn.sh` keeps the last three backups (code + a consistent copy of the database) in `/opt/huginn/backups/`, and lists what is new since your version.
+- `update-huginn.sh` keeps the code of the last three versions in `/opt/huginn/backups/`, and a compressed copy of the database from just before the newest update. It lists what is new since your version.
+- If the new version does not start, the update puts back both the old code and that database copy by itself. Events from the minute in between come back at the next sync while the honeypot's export still holds them.
+- `./update-huginn.sh --rollback` goes back to the code before the last update and keeps the current database. Add `--with-db` to also put back the database copy from before that update (the one it replaces is kept next to it as `huginn.db.before-restore-...`).
 - RavenTrap checks GitHub's public list of version tags once a day and shows **update x.y.z** in the header when there is a newer one. Nothing about you is sent. Turn it off with `HUGINN_UPDATE_CHECK=0`.
 - Running the install scripts again also works. They keep everything that is already set up, but they make no backup and do not roll back on failure.
 
