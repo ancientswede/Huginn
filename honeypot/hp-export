@@ -182,7 +182,7 @@ if [ -d "$src" ]; then
     echo "patch:free ok"; else mark free "$src/commands/free.py" "Huginn patch"; fi
   mark proxy "$src/ssh/forwarding.py" "Huginn proxyreply"
   mark ping "$src/commands/ping.py" "Huginn ping v1"
-  mark upload "$src/shell/server.py" "Huginn upload v1"
+  mark upload "$src/shell/fs.py" "Huginn upload v1"     # fs.py is patched on every Cowrie (server.py only before #40792)
   mark wget "$src/commands/wget.py" "Huginn wget v1"
   mark exec "$src/shell/protocol.py" "Huginn exec v1"
   # Two files, one patch: the note (bash.py) and the line counter (protocol.py) must both be there.

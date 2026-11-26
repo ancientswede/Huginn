@@ -18,6 +18,7 @@ CHANGELOG = [
      '- Honeypot: a new file with the same name as an earlier one, captured within a second, no longer gets the earlier '
      'one\'s SHA-256; the log reader no longer drops a line and fills it from an older rotated file\n'
      '- Honeypot: hp-identity takes at most 4 MB from OpenCanary and only the start of a web answer\n'
+     '- Honeypot: the upload patch fits the newest Cowrie, which now keeps uploaded files for the whole connection itself\n'
      '- A country while ipwho.is pauses: the registry country of the netblock (Team Cymru) until ipwho.is answers\n'
      '- /metrics: service labels only from a fixed list\n'
      '- Blocklist help: download the ipset and MikroTik feeds to a file and import only a complete one\n'

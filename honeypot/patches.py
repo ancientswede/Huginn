@@ -437,6 +437,17 @@ def cowrie_ping(path):
     return patch_once(path, "Huginn ping v1", [(PING_OLD, PING_NEW)])
 
 
+# Cowrie took parts of this patch in on 2026-11-25/26 (#40791 scp -t TARGET, #40792 one file system per connection).
+# Where a file already has upstream's version, only what upstream still lacks is applied (nothing, or for scp the check
+# of the file name). Older Cowrie gets the whole patch as before.
+SCP_NAME_CHECK = UPLOAD["commands/scp.py"][1]
+UPLOAD_UPSTREAM = {
+    "shell/server.py": ("        if self.fs is not None:\n            return\n        self.fs = fs.HoneyPotFilesystem(self.arch, home)\n", []),
+    "shell/session.py": ("if self.avatar.temporary and not self.server.fs.exists(self.avatar.home):", []),
+    "commands/scp.py": ("self.target_file = args[0]", [SCP_NAME_CHECK]),
+}
+
+
 def cowrie_upload(srcdir):
     # All files or none: build and compile every new file first, then swap them in together.
     import os
@@ -449,6 +460,11 @@ def cowrie_upload(srcdir):
             return 1
         if "Huginn upload v1" in s:
             continue
+        sign, rest = UPLOAD_UPSTREAM.get(rel, (None, None))
+        if sign and sign in s:
+            pairs = rest
+            if not pairs:
+                continue                                   # upstream does it already
         new = patched(s, pairs)
         if new is None:
             return 1

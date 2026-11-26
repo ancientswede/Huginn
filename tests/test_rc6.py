@@ -141,3 +141,39 @@ class Docs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadPatchUpstream(unittest.TestCase):
+    # Cowrie took the per-connection file system and scp -t TARGET in on 2026-11-25/26: the upload patch must then
+    # skip those parts, still add the name check and the fs/filetransfer fixes, and stay whole on older Cowrie.
+    def make(self, d, upstream):
+        import patches
+        files = {}
+        for rel, pairs in patches.UPLOAD.items():
+            body = "".join(old for old, _new in pairs)
+            if upstream and rel in patches.UPLOAD_UPSTREAM:
+                sign, rest = patches.UPLOAD_UPSTREAM[rel]
+                body = sign + "\n" + "".join(old for old, _new in rest)
+            files[rel] = body          # just the anchors: compile() is mocked below
+        for rel, body in files.items():
+            p = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(body)
+
+    def test_new_and_old_cowrie(self):
+        import patches
+        for upstream in (False, True):
+            with tempfile.TemporaryDirectory() as d:
+                self.make(d, upstream)
+                with mock.patch.object(patches, "compile", create=True), mock.patch("builtins.compile"):
+                    self.assertEqual(patches.cowrie_upload(d), 0, upstream)
+                    self.assertEqual(patches.cowrie_upload(d), 3, upstream)
+                server = open(os.path.join(d, "shell/server.py")).read()
+                self.assertEqual("Huginn upload v1" in server, not upstream)
+                scp = open(os.path.join(d, "commands/scp.py")).read()
+                self.assertIn("unexpected filename", scp)
+                self.assertEqual("hp_target" in scp, not upstream)
+                self.assertIn("Huginn upload v1", open(os.path.join(d, "shell/fs.py")).read())
+
+    def test_status_looks_where_every_cowrie_is_patched(self):
+        self.assertIn('mark upload "$src/shell/fs.py"', open(os.path.join(ROOT, "honeypot", "hp-export")).read())
