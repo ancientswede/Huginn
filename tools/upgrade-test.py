@@ -74,6 +74,11 @@ def make_logs(d, start, days, seed):
     return paths
 
 
+# Columns a documented migration recomputes from the other data on purpose, so they may differ after an upgrade:
+#   sessions.cmdhash - 0.19 groups script campaigns by the shape of the commands (meta cmdhash_shapes, app.py init_db)
+DERIVED = {"sessions": ("cmdhash",)}
+
+
 def fingerprint(db, cols=None):
     """Every stored row of the main tables as a multiset of hashes, over the columns the old version had (Codex rc2 M23).
     cols=None: take them from this database (the old one) and return them too."""
@@ -81,7 +86,8 @@ def fingerprint(db, cols=None):
     c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if cols is None:
-        cols = {t: [r[1] for r in c.execute("PRAGMA table_info(%s)" % t)] for t in ("ips", "sessions", "events", "files") if t in tables}
+        cols = {t: [r[1] for r in c.execute("PRAGMA table_info(%s)" % t) if r[1] not in DERIVED.get(t, ())]
+                for t in ("ips", "sessions", "events", "files") if t in tables}
     out = {}
     for t, cl in cols.items():
         have = {r[1] for r in c.execute("PRAGMA table_info(%s)" % t)} if t in tables else set()
