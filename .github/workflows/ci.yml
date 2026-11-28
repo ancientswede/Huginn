@@ -19,8 +19,8 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
@@ -34,10 +34,10 @@ jobs:
     name: Upgrade from old releases
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # the old releases come from the git tags
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: Old databases open in this version
@@ -46,7 +46,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ShellCheck
         run: shellcheck -S warning *.sh tools/*.sh honeypot/*.sh honeypot/hp-export honeypot/hp-logclean packaging/deb/huginn-* packaging/deb/post* packaging/deb/prerm
 
@@ -54,7 +54,7 @@ jobs:
     name: Docker image builds and starts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: docker build -t huginn-ci .
       - name: Start and wait until healthy
@@ -74,8 +74,8 @@ jobs:
     name: Patches fit the newest Cowrie and OpenCanary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - run: tools/check-upstream-patches.sh

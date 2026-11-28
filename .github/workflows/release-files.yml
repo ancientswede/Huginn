@@ -28,7 +28,7 @@ jobs:
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName | grep -qx "$TAG"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: refs/tags/${{ env.TAG }}
       - name: The tag and the code agree
